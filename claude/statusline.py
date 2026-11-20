@@ -27,10 +27,21 @@ out = []
 def emit(codes, text):
     out.append(f"\x1b[{codes}m{text}\x1b[0m" if codes else text)
 
-def bar(pct, width=20):
+# Context thresholds (tokens) and their colours; marked as separators in the bar.
+LIMITS = [(100_000, '38;5;226'), (200_000, '38;5;214'), (500_000, '38;5;167')]
+
+def bar(pct, color, width=20):
+    """Bar with a separator at each limit that falls inside the context window."""
     p = min(100.0, max(0.0, num(pct)))
     n = round(p * width / 100)
-    return '█' * n + '░' * (width - n)
+    cells = [(color, '█') if k < n else ('', '░') for k in range(width)]
+    size = num(f('context_window.context_window_size'))
+    if size > 0:
+        for limit, lc in LIMITS:
+            pos = round(limit * width / size)
+            if 0 < pos < width:
+                cells[pos] = ('1;' + lc, '│')
+    return ''.join(f"[{c}m{t}[0m" if c else t for c, t in cells)
 
 def tok(v):
     n = i(v)
@@ -73,7 +84,7 @@ if f('thinking.enabled') == 'true':
 emit('', ' | ')
 used = num(f('context_window.total_input_tokens'))
 color = '38;5;167' if used > 500000 else '38;5;214' if used > 200000 else '38;5;226' if used > 100000 else '38;5;114'
-emit(color, bar(f('context_window.used_percentage')))
+emit('', bar(f('context_window.used_percentage'), color))
 emit('', ' | ')
 emit('', f"{tok(f('context_window.total_input_tokens'))}/{tok(f('context_window.context_window_size'))} ({i(f('context_window.used_percentage'))}%)")
 emit('', ' | '); emit('', dur(f('cost.total_duration_ms')))

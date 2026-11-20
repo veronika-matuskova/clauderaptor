@@ -7,3 +7,6 @@ repos/*
 !repos/.gitkeep
 tasks/*
 !tasks/.gitkeep
+
+# Skills synced from claude.ai (written by Claude Code via the skills symlink)
+claude/skills/synced/

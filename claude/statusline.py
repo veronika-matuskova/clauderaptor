@@ -42,7 +42,7 @@ def bar(pct, color, width=20):
             pos = round(limit * width / size)
             if 0 < pos < width:
                 cells[pos] = ('1;' + lc, '│')
-    return ''.join(f"[{c}m{t}[0m" if c else t for c, t in cells)
+    return ''.join(f"\x1b[{c}m{t}\x1b[0m" if c else t for c, t in cells)
 
 def tok(v):
     n = i(v)
@@ -73,8 +73,9 @@ def git(*args):
     cwd = f('workspace.current_dir') or f('cwd')
     if not cwd: return ''
     try:
-        return subprocess.run(['git', '-C', cwd, *args], capture_output=True,
-                              text=True, timeout=2).stdout.strip()
+        # GIT_OPTIONAL_LOCKS=0: don't take index.lock, so we never block Claude's own git commands
+        return subprocess.run(['git', '-C', cwd, *args], capture_output=True, text=True, timeout=2,
+                              env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0'}).stdout.strip()
     except Exception:
         return ''
 
@@ -114,7 +115,7 @@ def limit(label, key):
     left = max(0, 100 - round(num(used)))
     color = '38;5;114' if left > 50 else '38;5;226' if left > 20 else '38;5;167'
     reset = until(f(f'rate_limits.{key}.resets_at'))
-    return f"{label} [{color}m{left}%[0m" + (f" - {reset}" if reset else '')
+    return f"{label} \x1b[{color}m{left}%\x1b[0m" + (f" - {reset}" if reset else '')
 
 out.append(limit('7d:', 'seven_day') + ' | ' + limit('5h:', 'five_hour'))
 

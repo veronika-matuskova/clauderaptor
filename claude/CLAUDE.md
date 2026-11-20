@@ -1,3 +1,3 @@
 # Global instructions (applies to every repo)
 
-@rules/general.md
+Rule files in `rules/` are loaded automatically; add global notes that are not rules here.

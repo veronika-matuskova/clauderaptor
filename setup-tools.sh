@@ -18,6 +18,14 @@ else
   echo "gh already installed: $(gh --version | head -1)"
 fi
 
+# --- shellcheck (lints this repo's *.sh scripts) ---
+if ! command -v shellcheck >/dev/null 2>&1; then
+  echo "installing shellcheck..."
+  sudo apt-get install -y shellcheck
+else
+  echo "shellcheck already installed"
+fi
+
 # --- Authenticate (interactive, browser/device-code flow) ---
 if ! gh auth status >/dev/null 2>&1; then
   gh auth login --hostname github.com --git-protocol https --web

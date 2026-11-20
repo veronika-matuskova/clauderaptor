@@ -1,3 +1,9 @@
 .credentials.json
 settings.local.json
 *.bak.*
+
+# Local work: cloned repos and task folders are never committed
+repos/*
+!repos/.gitkeep
+tasks/*
+!tasks/.gitkeep

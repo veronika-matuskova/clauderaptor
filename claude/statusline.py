@@ -2,8 +2,9 @@
 """Claude Code statusline (ported from statusline-community Fvv6W_hatC.ps1)."""
 import json, math, os, subprocess, sys, time
 
+RAW = sys.stdin.read()
 try:
-    j = json.load(sys.stdin)
+    j = json.loads(RAW)
 except Exception:
     j = {}
 
@@ -99,10 +100,22 @@ emit('', ' | ')
 emit('1;38;2;206;73;73', '✗') if git('status', '--porcelain') else emit('1;38;2;37;153;56', '✓')
 out.append('\n')
 
-# Line 3: rate limits
-emit('', f('rate_limits.seven_day.used_percentage')); emit('', rel(f('rate_limits.seven_day.resets_at')))
-emit('', ' | ')
-emit('', f('rate_limits.five_hour.used_percentage')); emit('', rel(f('rate_limits.five_hour.resets_at')))
-emit('', ' | ')
+# Line 3: rate limits as "label left% - time until reset"
+def until(v):
+    if not v: return ''
+    t = math.floor(num(v) - time.time())
+    if t <= 0: return ''
+    d, t = divmod(t, 86400); h, t = divmod(t, 3600); m = t // 60
+    return ' '.join(x for x in (f"{d}d" if d else '', f"{h}h" if d or h else '', f"{m}m") if x)
+
+def limit(label, key):
+    used = f(f'rate_limits.{key}.used_percentage')
+    if used == '': return f"{label} --"
+    left = max(0, 100 - round(num(used)))
+    color = '38;5;114' if left > 50 else '38;5;226' if left > 20 else '38;5;167'
+    reset = until(f(f'rate_limits.{key}.resets_at'))
+    return f"{label} [{color}m{left}%[0m" + (f" - {reset}" if reset else '')
+
+out.append(limit('7d', 'seven_day') + ' | ' + limit('5h', 'five_hour'))
 
 sys.stdout.write(''.join(out))

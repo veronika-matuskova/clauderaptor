@@ -19,7 +19,7 @@ Symlinks everything into `~/.claude`, so edits here take effect immediately. Exi
 Per-repo overrides still go in each repo's own `CLAUDE.md` / `.claude/`.
 
 ## Workspace (not committed)
-- `repos/` – clone the repos you work on here (`git clone <url> repos/<name>`). Each keeps its own git history and remote.
+- `repos/` – clone the repos you work on here (`git clone <url> repos/<name>`). Each keeps its own git history and remote. Run `./check-repos.sh` to see each repo's status with push/pull suggestions (it asks what to clone if `repos/` is empty).
 - `tasks/` – one folder per task (notes, scratch files, plans).
 
 Both are gitignored; only the Claude config is tracked.

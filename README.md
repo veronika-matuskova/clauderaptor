@@ -9,6 +9,7 @@ Shared Claude Code CLI config (global instructions, rules, skills, agents, slash
 - `claude/agents/*.md` – subagents
 - `claude/commands/*.md` – slash commands
 - `claude/settings.json` – user settings
+- `claude/statusline.py` – status line script
 
 ## Install
     ./install.sh

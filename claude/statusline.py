@@ -116,6 +116,6 @@ def limit(label, key):
     reset = until(f(f'rate_limits.{key}.resets_at'))
     return f"{label} [{color}m{left}%[0m" + (f" - {reset}" if reset else '')
 
-out.append(limit('7d', 'seven_day') + ' | ' + limit('5h', 'five_hour'))
+out.append(limit('7d:', 'seven_day') + ' | ' + limit('5h:', 'five_hour'))
 
 sys.stdout.write(''.join(out))

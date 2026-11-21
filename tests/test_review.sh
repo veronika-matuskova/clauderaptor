@@ -105,6 +105,35 @@ assert_contains "hung review stopped"     "$out" "took longer than 1s"
 assert_contains "hung review -> exit 2"   "$out" "exit=2"
 rm "$STUB/hook"
 
+# A kill (TERM, as pr-queue.sh sends) or a Ctrl-C (INT to the whole process group) of review.sh stops its
+# claude -p session too, which runs in timeout's own process group, and removes the temp files.
+# with_sigint <command...>: runs it in a process group of its own, with SIGINT on (a background job's is off).
+with_sigint() { exec python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"; }
+# shellcheck disable=SC2329  # called through assert
+gone() { ! kill -0 "$1" 2>/dev/null; }
+# stop_review <TERM|INT> <label>: starts a test review whose session hangs, stops it, waits for the session to end.
+stop_review() {
+  rm -rf "$TMP/tmpdir" "$STUB/session"; mkdir "$TMP/tmpdir"; commit "$2"
+  # shellcheck disable=SC2016  # expands in the hook
+  echo 'echo "$PPID" > "$STUB/session"; sleep 30' > "$STUB/hook"
+  PATH="$TMP/bin:$PATH" TMPDIR="$TMP/tmpdir" with_sigint bash "$ROOT/scripts/review.sh" --tests "$W" >"$TMP/stopped.out" 2>&1 &
+  local rpid=$! _
+  for _ in $(seq 100); do [ -s "$STUB/session" ] && break; sleep 0.1; done
+  if [ "$1" = INT ]; then kill -INT -- "-$rpid"; else kill -TERM "$rpid"; fi
+  wait "$rpid"; stopped_rc=$?
+  for _ in $(seq 50); do gone "$(cat "$STUB/session")" && break; sleep 0.1; done
+  rm "$STUB/hook"
+}
+stop_review TERM 10b
+assert "killed: exit 2"                   test "$stopped_rc" = 2
+assert_contains "killed: says so"         "$(cat "$TMP/stopped.out")" "stopped, and so was the claude -p session"
+assert "killed: the session stopped too"  gone "$(cat "$STUB/session")"
+assert "killed: temp files removed"       test -z "$(ls -A "$TMP/tmpdir")"
+stop_review INT 10c
+assert "Ctrl-C: exit 2"                   test "$stopped_rc" = 2
+assert "Ctrl-C: the session stopped too"  gone "$(cat "$STUB/session")"
+assert "Ctrl-C: temp files removed"       test -z "$(ls -A "$TMP/tmpdir")"
+
 # A review longer than one command-line argument may be (128 KiB) is still read.
 commit 11; python3 -I -c 'print("x" * 200000); print("Verdict: ready")' > "$STUB/result"
 assert_contains "long review read"        "$(rv "$W")" "exit=0"
@@ -199,6 +228,10 @@ assert_contains "suite: a moved HEAD is fine" "$out" "exit=0"
 assert_contains "suite: a moved HEAD is noted" "$out" "moved during the audit; the audit is of $msha"
 rm "$STUB/hook"; printf '**Suite audit:** repo.\n**Counts**: mutation 0, missing 2\n' > "$STUB/result"
 assert_contains "suite: markdown labels"      "$(rv --suite "$M")" "**Counts**: mutation 0, missing 2"
+printf -- '- Suite audit: repo.\n- Counts: mutation 3\n' > "$STUB/result"
+assert_contains "suite: a list item"          "$(rv --suite "$M")" "- Counts: mutation 3"
+printf '1. **Counts:** mutation 4\n' > "$STUB/result"
+assert_contains "suite: a numbered list item" "$(rv --suite "$M")" "1. **Counts:** mutation 4"
 printf 'I looked around.\n' > "$STUB/result"
 out="$(rv --suite "$M")"
 assert_contains "suite: no Counts line -> exit 2" "$out" "exit=2"

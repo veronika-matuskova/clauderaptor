@@ -76,6 +76,7 @@ EOF
 # claude -p (run by review.sh): logs "code <prompt>" for a code review, "tests <first line>" for a test review,
 # and reports the verdict in $TQ/verdict or $TQ/tests_verdict (default ready). $TQ/claude_fail makes both fail.
 # With $TQ/sync, each session waits up to 5 s for the other one to start, and logs in sync.log if it did.
+# With $TQ/hang, each session logs its pid in $TQ/hung and hangs for 30 s.
 cat > "$TQ/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 if [[ "$2" == *"code-review skill"* ]]; then
@@ -84,6 +85,7 @@ else
   kind=tests other=code; echo "tests ${2%%$'\n'*}" >> "$TQ/claude.log"; v="$(cat "$TQ/tests_verdict" 2>/dev/null || echo ready)"
 fi
 [ -f "$TQ/claude_fail" ] && exit 1
+if [ -f "$TQ/hang" ]; then echo "$$" >> "$TQ/hung"; sleep 30; fi
 if [ -f "$TQ/sync" ]; then
   touch "$TQ/started-$kind"
   for _ in $(seq 50); do
@@ -226,7 +228,7 @@ assert_contains "review: --review none says so" "$out" "not reviewed (queued wit
 assert_contains "review: --review none merged" "$out" "MERGED fix/none"
 out="$(Q add --review max "$TMP/wt-skip" fix x)"; assert_contains "add: bad review level refused" "$out" "--review takes none, low, medium, high or xhigh"
 out="$(Q add --review)";                     assert_contains "add: --review needs a level" "$out" "pr-queue.sh add"
-out="$(PR_QUEUE_REVIEW=off Q run)";         assert_contains "run: bad PR_QUEUE_REVIEW refused" "$out" "PR_QUEUE_REVIEW must be 0 (no reviews), low"
+out="$(PR_QUEUE_REVIEW=off Q run)";         assert_contains "run: bad PR_QUEUE_REVIEW refused" "$out" "PR_QUEUE_REVIEW must be 0 (no code reviews), low"
 
 # --- the test review: at the same time as the code review; either one's "needs changes" fails the job ---
 reset_pr; touch "$TQ/sync"; mkwt both
@@ -399,6 +401,27 @@ Q add "$TMP/wt-open" fix "Open" >/dev/null; out="$(PR_QUEUE_MERGE=0 Q run)"
 assert_contains "no-merge: ready"            "$out" "READY fix/open: #7 passed, left open"
 assert "no-merge: PR still open"             test "$(cat "$TQ/pr_state")" = OPEN
 assert "no-merge: worktree kept"             test -d "$TMP/wt-open"
+
+# --- a Ctrl-C of the runner during the reviews stops both claude -p sessions and leaves no temp files ---
+# Like a terminal's Ctrl-C: SIGINT to the runner's whole process group. python gives the runner a group of its
+# own, with SIGINT on (a background job's is off).
+# shellcheck disable=SC2329  # called through assert
+gone() { ! kill -0 "$1" 2>/dev/null; }
+reset_pr; rm -f "$TQ/hung"; touch "$TQ/hang"; mkwt ctrlc; mkdir -p "$TQ/tmp"
+Q add "$TMP/wt-ctrlc" fix "Ctrl-C" >/dev/null
+PATH="$TQ/bin:$PATH" TMPDIR="$TQ/tmp" python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+  bash "$ROOT/scripts/pr-queue.sh" run </dev/null >/dev/null 2>&1 &
+rpid=$!
+for _ in $(seq 100); do [ "$(wc -l 2>/dev/null < "$TQ/hung")" = 2 ] && break; sleep 0.1; done
+assert "Ctrl-C: both sessions started"       test "$(wc -l < "$TQ/hung")" = 2
+start=$SECONDS; kill -INT -- "-$rpid"; wait "$rpid"
+assert "Ctrl-C: stops at once, not after the sessions' 30 s" test $((SECONDS - start)) -lt 10
+for _ in $(seq 50); do alive=""; while read -r p; do gone "$p" || alive=1; done < "$TQ/hung"; [ -z "$alive" ] && break; sleep 0.1; done
+assert "Ctrl-C: both claude -p sessions stopped" test -z "$alive"
+assert "Ctrl-C: no temp files left"          test -z "$(ls -A "$TQ/tmp")"
+assert "Ctrl-C: the runner stopped"          gone "$rpid"
+assert "Ctrl-C: the job stopped where it was" test -n "$(find "$PR_QUEUE_DIR/running" -name '*ctrlc.job')"
+rm -f "$TQ/hang" "$PR_QUEUE_DIR"/running/*
 
 # --- a job left in running/ by a dead runner goes to failed/ ---
 printf 'worktree=/x\nbranch=fix/dead\n' > "$PR_QUEUE_DIR/running/1-fix-dead.job"

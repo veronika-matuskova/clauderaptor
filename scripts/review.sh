@@ -12,7 +12,7 @@
 # A test review or audit gets a scratch folder, removed afterwards: it runs the tests in a copy of the
 # commit there, with the code broken on purpose, and e2e tests only under `pr-queue.sh lock`.
 # It is stopped after $REVIEW_TIMEOUT seconds (1800 for the code, 3600 for the tests: e2e runs wait for the
-# lock), and killed 30 s later if it is still running.
+# lock), and killed 30 s later if it is still running. A Ctrl-C or kill of review.sh stops the session too.
 # REVIEW_SKIP_TESTS=1 tells /code-review to leave the quality of tests to the test review.
 # Reviews are saved to $REVIEW_DIR (default $PR_QUEUE_DIR/reviews, the folder pr-queue.sh uses) as
 # <branch>-<sha>-<level>.md (<level>-notests.md with REVIEW_SKIP_TESTS=1) or <branch>-<sha>-tests.md.
@@ -102,10 +102,12 @@ otherwise \"Verdict: ready\". If the skill is not available, print \"Verdict: fa
     title="Test suite audit of $name at $sha ("
     ;;
 esac
+json="$(mktemp)" || die "can't create a temp file"
+trap 'rm -rf "$json" ${scratch:+"$scratch"}' EXIT
+scratch=""
 if [ "$mode" != code ]; then
   [ -f "$HERE/review-tests.md" ] || die "missing $HERE/review-tests.md"
   scratch="$(mktemp -d)" || die "can't create a scratch folder"
-  trap 'rm -rf "$scratch"' EXIT
   prompt="$task
 - Scratch folder (yours, removed afterwards): $scratch
 - e2e lock command: $HERE/pr-queue.sh lock <command>
@@ -117,9 +119,14 @@ before="$(state)"
 limit="${REVIEW_TIMEOUT:-1800}"
 if [ "$mode" != code ]; then limit="${REVIEW_TIMEOUT:-3600}"; fi
 cd "$wt" || die "can't enter $wt"
-json="$(timeout -k 30 "$limit" claude -p "$prompt" --output-format json --permission-mode auto \
-  --disallowed-tools "Edit,Write,NotebookEdit" </dev/null)"
-rc=$?
+# In the background, so that a Ctrl-C or kill stops the session too: timeout runs it in a process group of
+# its own, which neither signal reaches by itself.
+timeout -k 30 "$limit" claude -p "$prompt" --output-format json --permission-mode auto \
+  --disallowed-tools "Edit,Write,NotebookEdit" </dev/null >"$json" &
+session=$!
+trap 'kill "$session" 2>/dev/null; die "stopped, and so was the claude -p session"' INT TERM
+wait "$session"; rc=$?
+trap - INT TERM
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then die "the review took longer than ${limit}s (REVIEW_TIMEOUT) and was stopped"; fi
 [ "$rc" -eq 0 ] || die "claude -p failed (exit $rc)"
 note=""
@@ -128,20 +135,21 @@ if [ "$(state)" != "$before" ]; then
   note="note: $wt or the main checkout $main moved during the audit; the audit is of $sha"
 fi
 
-review="$(printf '%s' "$json" | python3 -I -c '
+review="$(python3 -I -c '
 import json, sys
 d = json.load(sys.stdin)
 print("cost $%.2f, %.0f s" % (d.get("total_cost_usd") or 0, (d.get("duration_ms") or 0) / 1000))
 print(d.get("result") or "")
-')" || die "couldn't read claude's output"
+' <"$json")" || die "couldn't read claude's output"
 body=""
 if [[ "$review" == *$'\n'* ]]; then body="${review#*$'\n'}"; fi
 printf '# %s%s)\n\n%s\n' "$title" "${review%%$'\n'*}" "$body" > "$out"
 
 if [ "$mode" = suite ]; then
-  md="[[:space:]*_\`]*"   # markdown around a label: **Counts**: or **Counts:**
-  summary="$(grep -iE "^$md(suite audit|counts|not checked)$md:" "$out")"
-  grep -qiE "^${md}counts$md:" <<<"$summary" || die "no Counts line in the audit (saved to $out)"
+  # A label line, with markdown around the label (**Counts**:, **Counts:**) or as a list item (- Counts:, 1. Counts:)
+  md="[[:space:]*_\`]*"; lead="^[[:space:]>+-]*([0-9]+[.)])?$md"
+  summary="$(grep -iE "$lead(suite audit|counts|not checked)$md:" "$out")"
+  grep -qiE "${lead}counts$md:" <<<"$summary" || die "no Counts line in the audit (saved to $out)"
   head -1 "$out"; echo "$summary"
   if [ -n "$note" ]; then echo "$note"; fi
   echo "(saved to $out)"

@@ -7,15 +7,19 @@
 #   review.sh --suite <checkout>                   an audit of the checkout's whole test suite (same file)
 # The session runs in the worktree, so it reads the branch's own files and its CLAUDE.md and rules (a change
 # to those is part of the diff it reviews). It has no Edit or Write tools and no stdin, and the review fails
-# if the worktree's files or either checkout's HEAD or branch changed meanwhile (an audit checks only the
-# HEADs and branches). A test review or audit gets a scratch folder, removed afterwards: it runs the tests in
-# a copy of the commit there, with the code broken on purpose, and e2e tests only under `pr-queue.sh lock`.
-# It is stopped after $REVIEW_TIMEOUT seconds (1800, or 3600 for an audit), and killed 30 s later if it is
-# still running. REVIEW_SKIP_TESTS=1 tells /code-review to leave the quality of tests to the test review.
+# if the worktree's files or either checkout's HEAD or branch changed meanwhile. (An audit reads only its
+# pinned commit, so it may run in a checkout someone works in: a moved HEAD or branch only adds a note.)
+# A test review or audit gets a scratch folder, removed afterwards: it runs the tests in a copy of the
+# commit there, with the code broken on purpose, and e2e tests only under `pr-queue.sh lock`.
+# It is stopped after $REVIEW_TIMEOUT seconds (1800 for the code, 3600 for the tests: e2e runs wait for the
+# lock), and killed 30 s later if it is still running.
+# REVIEW_SKIP_TESTS=1 tells /code-review to leave the quality of tests to the test review.
 # Reviews are saved to $REVIEW_DIR (default $PR_QUEUE_DIR/reviews, the folder pr-queue.sh uses) as
-# <branch>-<sha>-<level>.md or <branch>-<sha>-tests.md. A commit already reviewed as ready (for the code: at
-# that level or a higher one) isn't reviewed again. Prints the findings and a last line "Verdict: ready" or
-# "Verdict: needs changes", then "(saved to <file>)". Exit 0 = ready, 1 = needs changes, 2 = didn't run.
+# <branch>-<sha>-<level>.md (<level>-notests.md with REVIEW_SKIP_TESTS=1) or <branch>-<sha>-tests.md.
+# A commit already reviewed as ready isn't reviewed again: for the code, at that level or a higher one, and
+# a review that left out the tests counts only for another one that does. Prints the findings and a last
+# line "Verdict: ready" or "Verdict: needs changes", then "(saved to <file>)".
+# Exit 0 = ready, 1 = needs changes, 2 = the review didn't run.
 # An audit is saved as <repo>-suite-<sha>.md with every finding. It prints only its summary and the file,
 # and exits 0, or 2 if it didn't run.
 set -uo pipefail
@@ -55,15 +59,20 @@ base="$dir/${branch//\//-}-$sha"
 
 case "$mode" in
   code)
-    out="$base-$level.md"; higher=""
+    kinds=".md"; suffix=""
+    if [ "${REVIEW_SKIP_TESTS:-}" = 1 ]; then kinds=".md -notests.md"; suffix="-notests"; fi
+    out="$base-$level$suffix.md"; higher=""
     for l in low medium high xhigh; do
       if [ "$l" = "$level" ]; then higher=1; fi
-      if [ -n "$higher" ] && [ "$(verdict "$base-$l.md")" = ready ]; then
-        cat "$base-$l.md"; echo "already reviewed as ready"; echo "(saved to $base-$l.md)"; exit 0
-      fi
+      [ -n "$higher" ] || continue
+      for k in $kinds; do
+        if [ "$(verdict "$base-$l$k")" = ready ]; then
+          cat "$base-$l$k"; echo "already reviewed as ready"; echo "(saved to $base-$l$k)"; exit 0
+        fi
+      done
     done
     skip=""
-    if [ "${REVIEW_SKIP_TESTS:-}" = 1 ]; then
+    if [ -n "$suffix" ]; then
       skip=" Leave out findings that are only about the quality of tests (missing, weak, duplicate or \
 non-atomic tests): a separate test review covers them. Keep findings that break a repo rule."
     fi
@@ -80,6 +89,7 @@ otherwise \"Verdict: ready\". If the skill is not available, print \"Verdict: fa
     fi
     against=origin/main
     git -C "$wt" rev-parse -q --verify "$against^{commit}" >/dev/null || against=main
+    git -C "$wt" rev-parse -q --verify "$against^{commit}" >/dev/null || die "no origin/main or main to compare $branch with"
     mb="$(git -C "$wt" merge-base "$against" HEAD 2>/dev/null)" || die "$branch has no common history with $against"
     task="Review the tests of one change, following the instructions below (a change review).
 - Repo: $wt, branch $branch. The change: git diff ${mb:0:12} $sha (against $against). Review exactly commit $sha."
@@ -105,14 +115,18 @@ fi
 
 before="$(state)"
 limit="${REVIEW_TIMEOUT:-1800}"
-if [ "$mode" = suite ]; then limit="${REVIEW_TIMEOUT:-3600}"; fi
+if [ "$mode" != code ]; then limit="${REVIEW_TIMEOUT:-3600}"; fi
 cd "$wt" || die "can't enter $wt"
 json="$(timeout -k 30 "$limit" claude -p "$prompt" --output-format json --permission-mode auto \
   --disallowed-tools "Edit,Write,NotebookEdit" </dev/null)"
 rc=$?
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then die "the review took longer than ${limit}s (REVIEW_TIMEOUT) and was stopped"; fi
 [ "$rc" -eq 0 ] || die "claude -p failed (exit $rc)"
-[ "$(state)" = "$before" ] || die "$wt or the main checkout $main moved or changed during the review; check them and queue it again"
+note=""
+if [ "$(state)" != "$before" ]; then
+  [ "$mode" = suite ] || die "$wt or the main checkout $main moved or changed during the review; check them and queue it again"
+  note="note: $wt or the main checkout $main moved during the audit; the audit is of $sha"
+fi
 
 review="$(printf '%s' "$json" | python3 -I -c '
 import json, sys
@@ -125,9 +139,12 @@ if [[ "$review" == *$'\n'* ]]; then body="${review#*$'\n'}"; fi
 printf '# %s%s)\n\n%s\n' "$title" "${review%%$'\n'*}" "$body" > "$out"
 
 if [ "$mode" = suite ]; then
-  summary="$(grep -iE '^[[:space:]*_`]*(suite audit|counts|not checked):' "$out")"
-  grep -qiE '^[[:space:]*_`]*counts:' <<<"$summary" || die "no Counts line in the audit (saved to $out)"
-  head -1 "$out"; echo "$summary"; echo "(saved to $out)"
+  md="[[:space:]*_\`]*"   # markdown around a label: **Counts**: or **Counts:**
+  summary="$(grep -iE "^$md(suite audit|counts|not checked)$md:" "$out")"
+  grep -qiE "^${md}counts$md:" <<<"$summary" || die "no Counts line in the audit (saved to $out)"
+  head -1 "$out"; echo "$summary"
+  if [ -n "$note" ]; then echo "$note"; fi
+  echo "(saved to $out)"
   exit 0
 fi
 cat "$out"

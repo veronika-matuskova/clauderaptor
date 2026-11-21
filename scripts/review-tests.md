@@ -30,7 +30,8 @@ In a change review: the tests the change adds or changes, and the existing tests
      Skip a mutation that doesn't change behaviour.
    - Run only the tests that cover that code. Fast tests (unit tests, the repo's shell tests) run as they are.
    - If only e2e tests (e.g. Playwright specs) cover the code, run just the affected specs on the mutated copy,
-     under the lock: `timeout 900 <lock command> <e2e command for those specs>`. Do at most 3 such runs. The lock
+     under the lock: `timeout 900 <lock command> <e2e command for those specs>`. Do at most 2 such runs: the
+     whole review is stopped after an hour, and the wait for the lock counts in those 900 s. The lock
      guards the shared test infrastructure (a local database stack, a mail catcher, fixed ports): let the repo's
      e2e setup start what it needs, under the lock, and nothing else. If it can't run from the copy, or the run
      times out, list it under "Not checked".

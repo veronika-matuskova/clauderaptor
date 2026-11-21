@@ -152,7 +152,7 @@ out="$(Q run)"
 assert_contains "happy: merged main in"      "$out" "merged origin/main"
 assert_contains "happy: reviewed at medium"  "$out" "(/code-review medium)"
 assert_contains "happy: fresh claude -p review" "$(cat "$TQ/claude.log")" 'args "medium fix/happy"'
-assert "happy: review saved"                 test -n "$(find "$PR_QUEUE_DIR/reviews" -name 'fix-happy-*-medium.md')"
+assert "happy: review saved, without the tests" test -n "$(find "$PR_QUEUE_DIR/reviews" -name 'fix-happy-*-medium-notests.md')"
 assert_contains "happy: tests reviewed too"  "$out" "reviewing the tests of"
 assert_contains "happy: a test review session" "$(test_reviews)" "Review the tests of one change"
 assert "happy: test review saved"            test -n "$(find "$PR_QUEUE_DIR/reviews" -name 'fix-happy-*-tests.md')"
@@ -244,7 +244,7 @@ assert "tests: no PR opened"                 test ! -s "$TQ/created.log"
 reset_pr; echo "needs changes" > "$TQ/verdict"; echo "needs changes" > "$TQ/tests_verdict"; mkwt worse
 Q add "$TMP/wt-worse" fix "Worse" >/dev/null; out="$(Q run)"
 assert_contains "tests: both need changes, both named" "$out" \
-  "-medium.md); the test review found changes to make (test review: $PR_QUEUE_DIR/reviews/fix-worse-"
+  "-medium-notests.md); the test review found changes to make (test review: $PR_QUEUE_DIR/reviews/fix-worse-"
 
 # --- the test review's own switches: --tests none|on (kept on a re-queue), PR_QUEUE_TEST_REVIEW=0 ---
 reset_pr; echo "needs changes" > "$TQ/verdict"; mkwt notests
@@ -253,6 +253,7 @@ assert_contains "--tests none: says so"      "$out" "tests not reviewed (queued 
 assert "--tests none: no test review"        test -z "$(test_reviews)"
 assert_contains "--tests none: options in any order" "$(code_reviews)" 'args "high fix/notests"'
 assert_not_contains "--tests none: the code review keeps the tests" "$(code_reviews)" "a separate test review"
+assert "--tests none: saved as a full code review" test -n "$(find "$PR_QUEUE_DIR/reviews" -name 'fix-notests-*-high.md')"
 rm -f "$TQ/verdict"; : > "$TQ/claude.log"
 out="$(Q add "$TMP/wt-notests" fix "No tests")"; assert_contains "re-queue keeps --tests" "$out" "keeping --tests none"
 out="$(Q run)"

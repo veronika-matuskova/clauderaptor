@@ -45,6 +45,7 @@ assert_contains "asks for the level and branch" "$args" 'args "high feat/notes"'
 assert_contains "headless JSON"           "$args" "--output-format"
 assert_contains "no edit tools"           "$args" "Edit,Write,NotebookEdit"
 assert_not_contains "loads the repo's CLAUDE.md (default setting sources)" "$args" "--setting-sources"
+assert_contains "stopped after 1800 s"    "$(cat "$STUB/timeout")" "-k 30 1800"
 echo x | rv "$W" high >/dev/null
 assert_contains "no stdin, even from a pipe" "$(cat "$STUB/stdin")" "/dev/null"
 assert "saves the review"                 grep -q "the save is not awaited" "$REVIEW_DIR/feat-notes-$sha-high.md"
@@ -132,7 +133,7 @@ assert_contains "tests: gives the lock command" "$args" "$ROOT/scripts/pr-queue.
 assert_contains "tests: no edit tools"        "$args" "Edit,Write,NotebookEdit"
 assert "tests: got a scratch folder"          test -s "$STUB/scratch"
 assert "tests: scratch folder removed after"  test ! -e "$(cat "$STUB/scratch")"
-assert_contains "tests: stopped after 1800 s" "$(cat "$STUB/timeout")" "-k 30 1800"
+assert_contains "tests: stopped after 3600 s" "$(cat "$STUB/timeout")" "-k 30 3600"
 rm "$STUB/hook"; printf 'No findings.\nVerdict: ready\n' > "$STUB/result"
 assert_contains "tests: ready -> exit 0"      "$(rv --tests "$W")" "exit=0"
 assert "tests: needs changes is reviewed again" test -f "$STUB/args"
@@ -158,12 +159,21 @@ out="$(rv --tests "$TMP/repo")"
 assert_contains "tests: no common history with main" "$out" "lonely has no common history with main"
 assert_contains "tests: no common history -> exit 2" "$out" "exit=2"
 git -C "$TMP/repo" checkout -q main
+git init -q -b master "$TMP/master"; git -C "$TMP/master" commit -q --allow-empty -m one
+git -C "$TMP/master" checkout -q -b feat
+assert_contains "tests: no main to compare with" "$(rv --tests "$TMP/master")" "no origin/main or main to compare feat with"
 
 # The code review leaves the quality of tests to the test review only when asked to.
-commit 17; REVIEW_SKIP_TESTS=1 rv "$W" >/dev/null
+# A review that left the tests out is saved apart, and it counts only for another one that does.
+commit 17; out="$(REVIEW_SKIP_TESTS=1 rv "$W")"
 assert_contains "REVIEW_SKIP_TESTS=1: tests left out" "$(cat "$STUB/args")" "a separate test review covers them"
+assert_contains "REVIEW_SKIP_TESTS=1: saved apart" "$out" "(saved to $REVIEW_DIR/feat-notes-$sha-medium-notests.md)"
+rv "$W" >/dev/null
+assert "it doesn't count for a full review"   test -f "$STUB/args"
 commit 18; rv "$W" >/dev/null
 assert_not_contains "by default: tests kept"  "$(cat "$STUB/args")" "a separate test review"
+REVIEW_SKIP_TESTS=1 rv "$W" >/dev/null
+assert "a full review counts for one without the tests" test ! -f "$STUB/args"
 
 # --- the suite audit (--suite): any checkout; the whole report saved, the summary printed ---
 M="$TMP/repo"; msha="$(git -C "$M" rev-parse --short=12 HEAD)"
@@ -184,8 +194,12 @@ assert_contains "suite: the instructions"     "$(cat "$STUB/args")" "## Suite au
 assert_contains "suite: stopped after 3600 s" "$(cat "$STUB/timeout")" "-k 30 3600"
 git -C "$M" checkout -q -- tracked.txt
 echo "git -C '$M' commit -q --allow-empty -m moved" > "$STUB/hook"
-assert_contains "suite: a moved HEAD -> exit 2" "$(rv --suite "$M")" "moved or changed during the review"
-rm "$STUB/hook"; printf 'I looked around.\n' > "$STUB/result"
+out="$(rv --suite "$M")"
+assert_contains "suite: a moved HEAD is fine" "$out" "exit=0"
+assert_contains "suite: a moved HEAD is noted" "$out" "moved during the audit; the audit is of $msha"
+rm "$STUB/hook"; printf '**Suite audit:** repo.\n**Counts**: mutation 0, missing 2\n' > "$STUB/result"
+assert_contains "suite: markdown labels"      "$(rv --suite "$M")" "**Counts**: mutation 0, missing 2"
+printf 'I looked around.\n' > "$STUB/result"
 out="$(rv --suite "$M")"
 assert_contains "suite: no Counts line -> exit 2" "$out" "exit=2"
 assert_contains "suite: says why"             "$out" "no Counts line in the audit"

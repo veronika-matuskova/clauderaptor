@@ -2,9 +2,10 @@
 # Reviews a worktree's branch with Claude Code's built-in /code-review, in a new headless session every time,
 # so the review never carries the calling session's context:
 #   review.sh <worktree> [low|medium|high|xhigh]     (default medium; use high for migrations, auth or RLS)
-# The session runs in the repo's main checkout, so the base branch's CLAUDE.md, rules and settings apply, not
-# the ones the reviewed branch may change. It has no Edit or Write tools, and the review fails if the worktree's
-# files or either checkout's HEAD or branch changed meanwhile. It is stopped after $REVIEW_TIMEOUT seconds (1800).
+# The session runs in the worktree, so it reads the branch's own files, but loads only user settings: the
+# branch's .claude/settings.json (hooks, permissions) can't change how it is reviewed. It has no Edit or Write
+# tools, and the review fails if the worktree's files or either checkout's HEAD or branch changed meanwhile.
+# It is stopped after $REVIEW_TIMEOUT seconds (1800).
 # The review is saved to $REVIEW_DIR (default $PR_QUEUE_DIR/reviews, the folder pr-queue.sh uses) as
 # <branch>-<sha>-<level>.md. A commit already reviewed as ready at that level or a higher one isn't reviewed again.
 # Prints the findings and a last line "Verdict: ready" or "Verdict: needs changes" (an important finding
@@ -16,8 +17,8 @@ verdict() {
   grep -oiE 'verdict:[[:space:]*_`]*(ready|needs changes|failed)' "$1" 2>/dev/null | tail -1 \
     | grep -oiE 'ready|needs changes|failed' | tr '[:upper:]' '[:lower:]'
 }
-# state: what must not change during a review: the worktree's HEAD and files, and where the main checkout is.
-# (Its files may change: someone may be working there.)
+# state: what must not change during a review: the worktree's HEAD and files, and where the main checkout is
+# (its files may change: someone may be working there).
 state() {
   git -C "$wt" rev-parse HEAD; git -C "$wt" status --porcelain
   git -C "$main" rev-parse HEAD; git -C "$main" branch --show-current
@@ -48,7 +49,8 @@ finding as plain text (severity, file:line, summary, failure scenario). Then end
 otherwise \"Verdict: ready\". If the skill is not available, print \"Verdict: failed\" and stop without reviewing."
 before="$(state)"
 limit="${REVIEW_TIMEOUT:-1800}"
-json="$(cd "$main" && timeout "$limit" claude -p "$prompt" --output-format json --permission-mode auto \
+cd "$wt" || die "can't enter $wt"
+json="$(timeout "$limit" claude -p "$prompt" --output-format json --permission-mode auto --setting-sources user \
   --disallowed-tools "Edit,Write,NotebookEdit")"
 rc=$?
 if [ "$rc" -eq 124 ]; then die "the review took longer than ${limit}s (REVIEW_TIMEOUT) and was stopped"; fi
@@ -61,8 +63,9 @@ d = json.load(sys.stdin)
 print("cost $%.2f, %.0f s" % (d.get("total_cost_usd") or 0, (d.get("duration_ms") or 0) / 1000))
 print(d.get("result") or "")
 ')" || die "couldn't read claude's output"
-printf '# Review of %s at %s (/code-review %s, %s)\n\n%s\n' "$branch" "$sha" "$level" "${review%%$'\n'*}" \
-  "${review#*$'\n'}" > "$out"
+body=""
+if [[ "$review" == *$'\n'* ]]; then body="${review#*$'\n'}"; fi
+printf '# Review of %s at %s (/code-review %s, %s)\n\n%s\n' "$branch" "$sha" "$level" "${review%%$'\n'*}" "$body" > "$out"
 cat "$out"
 echo "(saved to $out)"
 case "$(verdict "$out")" in

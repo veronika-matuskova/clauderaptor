@@ -4,6 +4,7 @@
 source "$(dirname "$0")/lib.sh"
 
 export TQ="$TMP/t" PR_QUEUE_DIR="$TMP/state" PR_QUEUE_CHECKS_WAIT=0
+unset REVIEW_DIR REVIEW_TIMEOUT PR_QUEUE_REVIEW   # reviews go to $PR_QUEUE_DIR/reviews, not a real folder
 mkdir -p "$TQ/bin" "$TQ/passed"
 Q() { PATH="$TQ/bin:$PATH" bash "$ROOT/scripts/pr-queue.sh" "$@" </dev/null 2>&1; }
 
@@ -191,6 +192,9 @@ reset_pr; mkwt skip
 Q add "$TMP/wt-skip" fix "Skip" >/dev/null; out="$(PR_QUEUE_REVIEW=0 Q run)"
 assert "review: PR_QUEUE_REVIEW=0 skips it"  test ! -s "$TQ/claude.log"
 assert_contains "review: skipped, still merged" "$out" "MERGED fix/skip"
+reset_pr; mkwt skip2
+Q add --review high "$TMP/wt-skip2" fix "Skip 2" >/dev/null; out="$(PR_QUEUE_REVIEW=0 Q run)"
+assert_contains "review: --review high still reviewed with PR_QUEUE_REVIEW=0" "$(cat "$TQ/claude.log")" 'args "high fix/skip2"'
 out="$(Q add --review max "$TMP/wt-skip" fix x)"; assert_contains "add: bad review level refused" "$out" "--review takes low, medium, high or xhigh"
 out="$(Q add --review)";                     assert_contains "add: --review needs a level" "$out" "pr-queue.sh add"
 out="$(PR_QUEUE_REVIEW=off Q run)";         assert_contains "run: bad PR_QUEUE_REVIEW refused" "$out" "PR_QUEUE_REVIEW must be 0 (no reviews), low"

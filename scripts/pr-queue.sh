@@ -12,7 +12,8 @@
 #   2. review it with scripts/review.sh: the built-in /code-review in a fresh `claude -p` session, at the job's
 #      level (add --review low|medium|high|xhigh, else $PR_QUEUE_REVIEW, else medium). "Needs changes" fails the
 #      job; the review is saved in $REVIEW_DIR (default $PR_QUEUE_DIR/reviews). A commit already reviewed as
-#      ready at that level isn't reviewed again. PR_QUEUE_REVIEW=0 skips this step;
+#      ready at that level isn't reviewed again. PR_QUEUE_REVIEW=0 skips this step, except for jobs queued
+#      with --review;
 #   3. if the repo has scripts/e2e-gate.mjs and the commit has no local pass: `npm run test:e2e:full`, under the lock;
 #   4. open the PR (scripts/create-pr.sh <type> "<description>" if the repo has it, else gh pr create), or push to
 #      the open one; the body is the body file (else the current one) with a "Local end-to-end run" section for
@@ -115,8 +116,9 @@ process() {
   fi
 
   # 2. Review, in a fresh session, before the e2e run is spent on it.
-  if [ "${PR_QUEUE_REVIEW:-}" != 0 ]; then
-    level="$(field review "$1")"; level="${level:-${PR_QUEUE_REVIEW:-medium}}"
+  level="$(field review "$1")"
+  if [ "${PR_QUEUE_REVIEW:-}" != 0 ] || [ -n "$level" ]; then
+    level="${level:-${PR_QUEUE_REVIEW:-medium}}"
     reviewed="$(git rev-parse HEAD)"
     echo "   reviewing $(git rev-parse --short HEAD) (/code-review $level)" | tee -a "$LOG"
     review="$(REVIEW_DIR="$REVIEWS" "$HERE/review.sh" "$wt" "$level" 2>&1)"; review_rc=$?

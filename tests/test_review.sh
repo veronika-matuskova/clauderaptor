@@ -16,7 +16,14 @@ pwd > "$STUB/cwd"; printf '%s\n' "$@" > "$STUB/args"; readlink /proc/$$/fd/0 > "
 [ -f "$STUB/hook" ] && bash "$STUB/hook"
 python3 -I -c 'import json, sys; print(json.dumps({"result": open(sys.argv[1]).read(), "total_cost_usd": 0.42, "duration_ms": 61000}))' "$STUB/result"
 EOF
-chmod +x "$TMP/bin/claude"
+# timeout: logs the limit it was given ($STUB/timeout), then runs the real one.
+REAL_TIMEOUT="$(command -v timeout)"; export REAL_TIMEOUT
+cat > "$TMP/bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+echo "$1 $2 $3" > "$STUB/timeout"
+exec "$REAL_TIMEOUT" "$@"
+EOF
+chmod +x "$TMP/bin/claude" "$TMP/bin/timeout"
 rv() { rm -f "$STUB/args"; PATH="$TMP/bin:$PATH" bash "$ROOT/scripts/review.sh" "$@" 2>&1; echo "exit=$?"; }
 # commit: a new commit on the worktree's branch, so the next review isn't a cached one
 commit() { git -C "$W" commit -q --allow-empty -m "change $1"; sha="$(git -C "$W" rev-parse --short=12 HEAD)"; }
@@ -125,8 +132,10 @@ assert_contains "tests: gives the lock command" "$args" "$ROOT/scripts/pr-queue.
 assert_contains "tests: no edit tools"        "$args" "Edit,Write,NotebookEdit"
 assert "tests: got a scratch folder"          test -s "$STUB/scratch"
 assert "tests: scratch folder removed after"  test ! -e "$(cat "$STUB/scratch")"
+assert_contains "tests: stopped after 1800 s" "$(cat "$STUB/timeout")" "-k 30 1800"
 rm "$STUB/hook"; printf 'No findings.\nVerdict: ready\n' > "$STUB/result"
 assert_contains "tests: ready -> exit 0"      "$(rv --tests "$W")" "exit=0"
+assert "tests: needs changes is reviewed again" test -f "$STUB/args"
 out="$(rv --tests "$W")"
 assert_contains "tests: ready commit not reviewed again" "$out" "already reviewed as ready"
 assert "tests: no second session"             test ! -f "$STUB/args"
@@ -144,6 +153,11 @@ out="$(PATH="$TMP/bin:$PATH" bash "$TMP/bare/review.sh" --tests "$W" 2>&1)"
 assert_contains "tests: instructions file missing" "$out" "missing $TMP/bare/review-tests.md"
 assert_contains "tests: needs a worktree"     "$(rv --tests)" "usage: review.sh"
 assert_contains "tests: takes no level"       "$(rv --tests "$W" high)" "usage: review.sh"
+git -C "$TMP/repo" checkout -q --orphan lonely; git -C "$TMP/repo" commit -q -m lonely
+out="$(rv --tests "$TMP/repo")"
+assert_contains "tests: no common history with main" "$out" "lonely has no common history with main"
+assert_contains "tests: no common history -> exit 2" "$out" "exit=2"
+git -C "$TMP/repo" checkout -q main
 
 # The code review leaves the quality of tests to the test review only when asked to.
 commit 17; REVIEW_SKIP_TESTS=1 rv "$W" >/dev/null
@@ -159,6 +173,7 @@ printf '%s\n' "Suite audit: repo at $msha: 2 test files, 9 tests. Tests run: tes
 echo "echo x >> '$M/tracked.txt'" > "$STUB/hook"
 out="$(rv --suite "$M")"
 assert_contains "suite: exit 0, edits in the checkout are fine" "$out" "exit=0"
+assert_contains "suite: prints the summary line" "$out" "Suite audit: repo at $msha: 2 test files"
 assert_contains "suite: prints the counts"    "$out" "Counts: mutation 1, missing 0, empty 1"
 assert_contains "suite: prints what it didn't check" "$out" "Not checked: e2e"
 assert_not_contains "suite: not the findings" "$out" "asserts nothing"
@@ -166,6 +181,7 @@ assert_contains "suite: names the file"       "$out" "(saved to $REVIEW_DIR/repo
 assert "suite: every finding saved"           grep -q "asserts nothing" "$REVIEW_DIR/repo-suite-$msha.md"
 assert_contains "suite: the task"             "$(cat "$STUB/args")" "Audit the whole test suite of one repo"
 assert_contains "suite: the instructions"     "$(cat "$STUB/args")" "## Suite audit"
+assert_contains "suite: stopped after 3600 s" "$(cat "$STUB/timeout")" "-k 30 3600"
 git -C "$M" checkout -q -- tracked.txt
 echo "git -C '$M' commit -q --allow-empty -m moved" > "$STUB/hook"
 assert_contains "suite: a moved HEAD -> exit 2" "$(rv --suite "$M")" "moved or changed during the review"
@@ -173,6 +189,10 @@ rm "$STUB/hook"; printf 'I looked around.\n' > "$STUB/result"
 out="$(rv --suite "$M")"
 assert_contains "suite: no Counts line -> exit 2" "$out" "exit=2"
 assert_contains "suite: says why"             "$out" "no Counts line in the audit"
+git init -q "$TMP/empty"
+out="$(rv --suite "$TMP/empty")"
+assert_contains "suite: a repo with no commits" "$out" "has no commits"
+assert_contains "suite: no commits -> exit 2" "$out" "exit=2"
 
 printf 'Counts: mutation 0, missing 0, empty 0, duplicate 0, not atomic 0, rule 0\nVerdict: ready\n' > "$STUB/result"
 assert_contains "bad level"       "$(rv "$W" max)" "level must be low, medium, high or xhigh"

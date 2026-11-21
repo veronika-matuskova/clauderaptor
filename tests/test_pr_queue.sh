@@ -258,6 +258,17 @@ out="$(Q add "$TMP/wt-notests" fix "No tests")"; assert_contains "re-queue keeps
 out="$(Q run)"
 assert "re-queue: still no test review"      test -z "$(test_reviews)"
 assert_contains "re-queue: --tests none merged" "$out" "MERGED fix/notests"
+reset_pr; echo "needs changes" > "$TQ/verdict"; mkwt flags
+Q add --tests none --review high "$TMP/wt-flags" fix "Flags" >/dev/null; Q run >/dev/null
+rm -f "$TQ/verdict"; : > "$TQ/claude.log"
+Q add --review none --tests on "$TMP/wt-flags" fix "Flags" >/dev/null; out="$(Q run)"
+assert "re-queue: a new --review beats the kept one" test -z "$(code_reviews)"
+assert "re-queue: a new --tests beats the kept one" test -n "$(test_reviews)"
+assert_contains "re-queue: new flags, merged" "$out" "MERGED fix/flags"
+reset_pr; mkwt late3
+echo "echo more >> '$TMP/wt-late3/late3.txt'; git -C '$TMP/wt-late3' commit -qam more" > "$TQ/on_e2e"
+Q add --review none "$TMP/wt-late3" fix "Late commit" >/dev/null; out="$(Q run)"
+assert_contains "tests: a commit after only the test review fails the job" "$out" "fix/late3 got commits after the review"
 reset_pr; mkwt tskip
 Q add "$TMP/wt-tskip" fix "Tests skip" >/dev/null; out="$(PR_QUEUE_TEST_REVIEW=0 Q run)"
 assert "PR_QUEUE_TEST_REVIEW=0 skips the test review" test -z "$(test_reviews)"

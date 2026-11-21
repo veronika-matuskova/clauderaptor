@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Code statusline (ported from statusline-community Fvv6W_hatC.ps1)."""
+"""Claude Code statusline."""
 import json, math, os, subprocess, sys, time
 
 RAW = sys.stdin.read()

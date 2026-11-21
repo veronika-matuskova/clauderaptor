@@ -189,8 +189,11 @@ process() {
   else
     echo "   $BRANCH has commits after the merged $(git rev-parse --short "$sha"); kept the worktree and branch" | tee -a "$LOG"
   fi
-  if [ "$(git branch --show-current)" = main ] && [ -z "$(git status --porcelain)" ]; then
+  # Untracked files don't block the pull (a fast-forward refuses to overwrite them); changes to tracked files do.
+  if [ "$(git branch --show-current)" = main ] && [ -z "$(git status --porcelain --untracked-files=no)" ]; then
     git pull -q --ff-only >>"$LOG" 2>&1 || echo "   could not pull $main_dir" | tee -a "$LOG"
+  else
+    echo "   did not pull $main_dir: it is not on main or has changes to tracked files" | tee -a "$LOG"
   fi
   echo "$(date '+%F %T') MERGED $BRANCH: #$pr as ${merged:0:7}" | tee -a "$RESULTS"
   finishjob

@@ -214,6 +214,17 @@ assert_contains "busy: says it kept them"    "$out" "kept the worktree and branc
 assert "busy: worktree kept"                 test -d "$TMP/wt-busy"
 assert "busy: new commit still on the branch" test "$(git -C "$R" rev-list --count "$sha..fix/busy")" = 1
 
+# --- the main checkout is pulled despite untracked files; a change to a tracked file blocks the pull, and it says so ---
+reset_pr; mkwt untracked; advance pulled.txt main; touch "$R/untracked.txt"
+Q add "$TMP/wt-untracked" fix "Untracked" >/dev/null; out="$(Q run)"
+assert "untracked file: main checkout pulled" test -f "$R/pulled.txt"
+assert_not_contains "untracked file: no warning" "$out" "did not pull"
+reset_pr; mkwt tracked; advance pulled2.txt main; echo local >> "$R/pulled.txt"
+Q add "$TMP/wt-tracked" fix "Tracked" >/dev/null; out="$(Q run)"
+assert "tracked change: not pulled"          test ! -f "$R/pulled2.txt"
+assert_contains "tracked change: says so"    "$out" "has changes to tracked files"
+git -C "$R" checkout -q -- pulled.txt; rm -f "$R/untracked.txt"; git -C "$R" pull -q --ff-only
+
 # --- merging fails: job failed, nothing removed ---
 reset_pr; touch "$TQ/merge_fail"; mkwt nomerge
 Q add "$TMP/wt-nomerge" fix "No merge" >/dev/null; out="$(Q run)"

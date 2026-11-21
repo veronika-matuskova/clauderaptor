@@ -1,6 +1,10 @@
 # shellcheck shell=bash
 # Tiny assert helpers, sourced by tests/test_*.sh. Each test file runs in its own process.
 set -uo pipefail
+# Run from a git hook (pre-commit), git exports GIT_INDEX_FILE, GIT_DIR, ...; drop them so git in a test
+# repo never reads or writes this repo's index.
+# shellcheck disable=SC2046
+unset $(git rev-parse --local-env-vars)
 # shellcheck disable=SC2034  # ROOT is used by the test files that source this
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FAILS=0

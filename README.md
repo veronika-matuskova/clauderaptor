@@ -25,10 +25,15 @@ Per-repo overrides still go in each repo's own `CLAUDE.md` / `.claude/`.
 
 Installs the GitHub CLI (`gh`) from its official apt repo, runs `gh auth login` (browser/device-code flow) if needed, and sets `gh` as git's credential helper for github.com. It also sets up commit/tag signing: creates a passphrase-less signing-only key `~/.ssh/id_ed25519_signing`, adds the `admin:ssh_signing_key` scope to gh (`gh auth refresh`) and uploads the key as a GitHub signing key, then sets `gpg.format=ssh`, `commit.gpgsign`, `tag.gpgsign` and `~/.config/git/allowed_signers` in your global git config. It's interactive (sudo password + login), so run it yourself in a terminal, or from Claude Code with `! ./setup-tools.sh`. Safe to re-run.
 
+## Docker
+    ./setup-docker.sh
+
+Installs Docker Engine inside WSL from Docker's official apt repo (no Docker Desktop), adds you to the `docker` group and enables `docker.socket`, so systemd starts the daemon on the first `docker` command. Agents never need to start it, and nothing needs sudo after setup. It needs systemd (`[boot] systemd=true` in `/etc/wsl.conf`). If Docker Desktop's WSL integration is on, the script stops and says how to turn it off (Settings > Resources > WSL integration, quit Desktop, `wsl --shutdown`). It also removes the `"credsStore": "desktop.exe"` that Desktop leaves in `~/.docker/config.json`, which would break every pull. Images and volumes from Docker Desktop don't carry over. Run it yourself (sudo password), or with `! ./setup-docker.sh`. Safe to re-run.
+
 ## Tests
     tests/run.sh
 
-Tests for every script (`install.sh`, `check-repos.sh`, `setup-tools.sh`, `statusline.py`), plus shellcheck when it's installed. They run in temp dirs with stubbed `gh`/`sudo`/`apt`, so they're safe to run anytime. `./install.sh` enables a pre-commit hook (`.githooks/pre-commit`) that runs them and blocks the commit if any fail (`git commit --no-verify` skips it once).
+Tests for every script (`install.sh`, `check-repos.sh`, `setup-tools.sh`, `setup-docker.sh`, `statusline.py`), plus shellcheck when it's installed. They run in temp dirs with stubbed `gh`/`docker`/`sudo`/`apt`, so they're safe to run anytime. `./install.sh` enables a pre-commit hook (`.githooks/pre-commit`) that runs them and blocks the commit if any fail (`git commit --no-verify` skips it once).
 
 ## Workspace (not committed)
 - `repos/` – clone the repos you work on here (`git clone <url> repos/<name>`). Each keeps its own git history and remote. Run `./check-repos.sh` to see each repo's status with push/pull suggestions (it asks what to clone if `repos/` is empty).

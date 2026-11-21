@@ -73,13 +73,24 @@ if flock -n "$PR_QUEUE_DIR/e2e.lock" true; then echo "$* unlocked" >> "$TQ/npm.l
 [ -f "$TQ/e2e_fail" ] && exit 1
 touch "$TQ/passed/$(git rev-parse HEAD)"
 EOF
-# claude -p (run by review.sh): logs its args and reports the verdict in $TQ/verdict (default ready).
-# $TQ/claude_fail makes it fail.
+# claude -p (run by review.sh): logs "code <prompt>" for a code review, "tests <first line>" for a test review,
+# and reports the verdict in $TQ/verdict or $TQ/tests_verdict (default ready). $TQ/claude_fail makes both fail.
+# With $TQ/sync, each session waits up to 5 s for the other one to start, and logs in sync.log if it did.
 cat > "$TQ/bin/claude" <<'EOF'
 #!/usr/bin/env bash
-echo "$*" >> "$TQ/claude.log"
+if [[ "$2" == *"code-review skill"* ]]; then
+  kind=code other=tests; echo "code $2" >> "$TQ/claude.log"; v="$(cat "$TQ/verdict" 2>/dev/null || echo ready)"
+else
+  kind=tests other=code; echo "tests ${2%%$'\n'*}" >> "$TQ/claude.log"; v="$(cat "$TQ/tests_verdict" 2>/dev/null || echo ready)"
+fi
 [ -f "$TQ/claude_fail" ] && exit 1
-v="$(cat "$TQ/verdict" 2>/dev/null || echo ready)"
+if [ -f "$TQ/sync" ]; then
+  touch "$TQ/started-$kind"
+  for _ in $(seq 50); do
+    if [ -f "$TQ/started-$other" ]; then echo "$kind saw $other" >> "$TQ/sync.log"; break; fi
+    sleep 0.1
+  done
+fi
 python3 -I -c 'import json, sys; print(json.dumps({"result": "important: a.txt:1: broken\nVerdict: " + sys.argv[1], "total_cost_usd": 0.3, "duration_ms": 1000}))' "$v"
 EOF
 chmod +x "$TQ/bin/"*
@@ -108,9 +119,12 @@ mkwt() {
 }
 reset_pr() {
   rm -f "$TQ/pr_state" "$TQ/pr_body" "$TQ/pr_branch" "$TQ/checks_seq" "$TQ/e2e_fail" "$TQ/merge_fail" "$TQ/head_lag" "$TQ/on_checks" \
-    "$TQ/verdict" "$TQ/claude_fail"
+    "$TQ/verdict" "$TQ/tests_verdict" "$TQ/claude_fail" "$TQ/sync" "$TQ"/started-* "$TQ/sync.log"
   : > "$TQ/gh.log"; : > "$TQ/created.log"; : > "$TQ/npm.log"; : > "$TQ/claude.log"
 }
+# code_reviews / test_reviews: the review sessions claude.log shows since the last reset
+code_reviews() { grep '^code ' "$TQ/claude.log"; }
+test_reviews() { grep '^tests ' "$TQ/claude.log"; }
 # called through assert
 # shellcheck disable=SC2329
 in_done() { test -n "$(find "$PR_QUEUE_DIR/done" -name "*$1.job")"; }
@@ -138,7 +152,11 @@ out="$(Q run)"
 assert_contains "happy: merged main in"      "$out" "merged origin/main"
 assert_contains "happy: reviewed at medium"  "$out" "(/code-review medium)"
 assert_contains "happy: fresh claude -p review" "$(cat "$TQ/claude.log")" 'args "medium fix/happy"'
-assert "happy: review saved"                 test -n "$(find "$PR_QUEUE_DIR/reviews" -name 'fix-happy-*.md')"
+assert "happy: review saved, without the tests" test -n "$(find "$PR_QUEUE_DIR/reviews" -name 'fix-happy-*-medium-notests.md')"
+assert_contains "happy: tests reviewed too"  "$out" "reviewing the tests of"
+assert_contains "happy: a test review session" "$(test_reviews)" "Review the tests of one change"
+assert "happy: test review saved"            test -n "$(find "$PR_QUEUE_DIR/reviews" -name 'fix-happy-*-tests.md')"
+assert_contains "happy: the code review leaves tests to it" "$(code_reviews)" "a separate test review covers them"
 assert_contains "happy: ran e2e"             "$out" "running the full e2e suite"
 assert_contains "happy: merged"              "$out" "MERGED fix/happy: #7 as 1234567"
 assert_contains "happy: e2e under the lock"  "$(cat "$TQ/npm.log")" "run test:e2e:full locked"
@@ -181,6 +199,7 @@ assert_contains "re-queue: then merged"      "$out" "MERGED fix/bad"
 reset_pr; touch "$TQ/claude_fail"; mkwt noreview
 Q add "$TMP/wt-noreview" fix "No review" >/dev/null; out="$(Q run)"
 assert_contains "review: claude fails"       "$out" "FAILED fix/noreview: the review didn't run"
+assert_contains "review: claude fails, the test review too" "$out" "; the test review didn't run: review: claude -p failed"
 reset_pr; echo fail > "$TQ/checks_seq"; mkwt again
 Q add "$TMP/wt-again" fix "Again" >/dev/null; Q run >/dev/null
 rm -f "$TQ/checks_seq"; : > "$TQ/claude.log"
@@ -195,19 +214,73 @@ assert_contains "review: a commit after the review fails the job" "$out" "fix/la
 assert "review: so no PR"                    test ! -s "$TQ/created.log"
 reset_pr; mkwt skip
 Q add "$TMP/wt-skip" fix "Skip" >/dev/null; out="$(PR_QUEUE_REVIEW=0 Q run)"
-assert "review: PR_QUEUE_REVIEW=0 skips it"  test ! -s "$TQ/claude.log"
+assert "review: PR_QUEUE_REVIEW=0 skips it"  test -z "$(code_reviews)"
 assert_contains "review: skipped, still merged" "$out" "MERGED fix/skip"
 reset_pr; mkwt skip2
 Q add --review high "$TMP/wt-skip2" fix "Skip 2" >/dev/null; out="$(PR_QUEUE_REVIEW=0 Q run)"
 assert_contains "review: --review high still reviewed with PR_QUEUE_REVIEW=0" "$(cat "$TQ/claude.log")" 'args "high fix/skip2"'
 reset_pr; mkwt none
 Q add --review none "$TMP/wt-none" fix "None" >/dev/null; out="$(Q run)"
-assert "review: --review none skips it"      test ! -s "$TQ/claude.log"
+assert "review: --review none skips it"      test -z "$(code_reviews)"
 assert_contains "review: --review none says so" "$out" "not reviewed (queued with --review none)"
 assert_contains "review: --review none merged" "$out" "MERGED fix/none"
 out="$(Q add --review max "$TMP/wt-skip" fix x)"; assert_contains "add: bad review level refused" "$out" "--review takes none, low, medium, high or xhigh"
 out="$(Q add --review)";                     assert_contains "add: --review needs a level" "$out" "pr-queue.sh add"
 out="$(PR_QUEUE_REVIEW=off Q run)";         assert_contains "run: bad PR_QUEUE_REVIEW refused" "$out" "PR_QUEUE_REVIEW must be 0 (no reviews), low"
+
+# --- the test review: at the same time as the code review; either one's "needs changes" fails the job ---
+reset_pr; touch "$TQ/sync"; mkwt both
+Q add "$TMP/wt-both" fix "Both" >/dev/null; out="$(Q run)"
+assert_contains "tests: the code review saw the test review start" "$(cat "$TQ/sync.log")" "code saw tests"
+assert_contains "tests: the test review saw the code review start" "$(cat "$TQ/sync.log")" "tests saw code"
+assert_contains "tests: both ready, merged"  "$out" "MERGED fix/both"
+reset_pr; echo "needs changes" > "$TQ/tests_verdict"; mkwt weak
+Q add "$TMP/wt-weak" fix "Weak" >/dev/null; out="$(Q run)"
+assert_contains "tests: needs changes fails the job" "$out" \
+  "FAILED fix/weak: the test review found changes to make (test review: $PR_QUEUE_DIR/reviews/fix-weak-"
+assert_contains "tests: names the saved test review" "$out" "-tests.md)"
+assert "tests: no e2e run"                   test ! -s "$TQ/npm.log"
+assert "tests: no PR opened"                 test ! -s "$TQ/created.log"
+reset_pr; echo "needs changes" > "$TQ/verdict"; echo "needs changes" > "$TQ/tests_verdict"; mkwt worse
+Q add "$TMP/wt-worse" fix "Worse" >/dev/null; out="$(Q run)"
+assert_contains "tests: both need changes, both named" "$out" \
+  "-medium-notests.md); the test review found changes to make (test review: $PR_QUEUE_DIR/reviews/fix-worse-"
+
+# --- the test review's own switches: --tests none|on (kept on a re-queue), PR_QUEUE_TEST_REVIEW=0 ---
+reset_pr; echo "needs changes" > "$TQ/verdict"; mkwt notests
+Q add --tests none --review high "$TMP/wt-notests" fix "No tests" >/dev/null; out="$(Q run)"
+assert_contains "--tests none: says so"      "$out" "tests not reviewed (queued with --tests none)"
+assert "--tests none: no test review"        test -z "$(test_reviews)"
+assert_contains "--tests none: options in any order" "$(code_reviews)" 'args "high fix/notests"'
+assert_not_contains "--tests none: the code review keeps the tests" "$(code_reviews)" "a separate test review"
+assert "--tests none: saved as a full code review" test -n "$(find "$PR_QUEUE_DIR/reviews" -name 'fix-notests-*-high.md')"
+rm -f "$TQ/verdict"; : > "$TQ/claude.log"
+out="$(Q add "$TMP/wt-notests" fix "No tests")"; assert_contains "re-queue keeps --tests" "$out" "keeping --tests none"
+out="$(Q run)"
+assert "re-queue: still no test review"      test -z "$(test_reviews)"
+assert_contains "re-queue: --tests none merged" "$out" "MERGED fix/notests"
+reset_pr; echo "needs changes" > "$TQ/verdict"; mkwt flags
+Q add --tests none --review high "$TMP/wt-flags" fix "Flags" >/dev/null; Q run >/dev/null
+rm -f "$TQ/verdict"; : > "$TQ/claude.log"
+Q add --review none --tests on "$TMP/wt-flags" fix "Flags" >/dev/null; out="$(Q run)"
+assert "re-queue: a new --review beats the kept one" test -z "$(code_reviews)"
+assert "re-queue: a new --tests beats the kept one" test -n "$(test_reviews)"
+assert_contains "re-queue: new flags, merged" "$out" "MERGED fix/flags"
+reset_pr; mkwt late3
+echo "echo more >> '$TMP/wt-late3/late3.txt'; git -C '$TMP/wt-late3' commit -qam more" > "$TQ/on_e2e"
+Q add --review none "$TMP/wt-late3" fix "Late commit" >/dev/null; out="$(Q run)"
+assert_contains "tests: a commit after only the test review fails the job" "$out" "fix/late3 got commits after the review"
+reset_pr; mkwt tskip
+Q add "$TMP/wt-tskip" fix "Tests skip" >/dev/null; out="$(PR_QUEUE_TEST_REVIEW=0 Q run)"
+assert "PR_QUEUE_TEST_REVIEW=0 skips the test review" test -z "$(test_reviews)"
+assert "PR_QUEUE_TEST_REVIEW=0: the code review runs" test -n "$(code_reviews)"
+assert_contains "PR_QUEUE_TEST_REVIEW=0: merged" "$out" "MERGED fix/tskip"
+reset_pr; mkwt ton
+Q add --tests on "$TMP/wt-ton" fix "Tests on" >/dev/null; PR_QUEUE_TEST_REVIEW=0 Q run >/dev/null
+assert "--tests on: reviewed with PR_QUEUE_TEST_REVIEW=0" test -n "$(test_reviews)"
+out="$(Q add --tests maybe "$TMP/wt-ton" fix x)"; assert_contains "add: bad --tests refused" "$out" "--tests takes on or none"
+out="$(Q add --tests)";                      assert_contains "add: --tests needs a value" "$out" "pr-queue.sh add"
+out="$(PR_QUEUE_TEST_REVIEW=yes Q run)";    assert_contains "run: bad PR_QUEUE_TEST_REVIEW refused" "$out" "PR_QUEUE_TEST_REVIEW must be 0"
 
 # --- e2e fails: no PR ---
 reset_pr; touch "$TQ/e2e_fail"; mkwt e2efail

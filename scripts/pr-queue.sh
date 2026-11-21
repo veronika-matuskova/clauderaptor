@@ -2,19 +2,23 @@
 # A queue that turns finished branches into merged PRs, one at a time, so agents can build in parallel
 # without testing against a main that moves under them.
 #
-#   pr-queue.sh add [--review <level>] <worktree> <type> "<description>" [body-file]   queue a committed branch
+#   pr-queue.sh add [--review <level>] [--tests on|none] <worktree> <type> "<description>" [body-file]   queue a committed branch
 #   pr-queue.sh run                                                  work through the queue until it is empty
 #   pr-queue.sh status                                               show the queue and the last results
 #   pr-queue.sh lock <command...>                                    run a command holding the e2e lock
 #
 # For each job, `run` does, in order:
 #   1. merge origin/main into the branch (a conflict fails the job and is aborted);
-#   2. review it with scripts/review.sh: the built-in /code-review in a fresh `claude -p` session, at the job's
-#      level (add --review low|medium|high|xhigh, or none to skip it for that job; a re-queue of the branch
-#      keeps it. Else $PR_QUEUE_REVIEW, else medium). "Needs changes" fails the
-#      job; the review is saved in $REVIEW_DIR (default $PR_QUEUE_DIR/reviews). A commit already reviewed as
-#      ready at that level isn't reviewed again. PR_QUEUE_REVIEW=0 skips this step, except for jobs queued
-#      with --review;
+#   2. review it with scripts/review.sh, in two fresh `claude -p` sessions at the same time:
+#      - the code, with the built-in /code-review at the job's level (add --review low|medium|high|xhigh, or
+#        none to skip it for that job. Else $PR_QUEUE_REVIEW, else medium). PR_QUEUE_REVIEW=0 skips it, except
+#        for jobs queued with --review;
+#      - the tests (review.sh --tests: mutation check, missing, empty, duplicate and non-atomic tests).
+#        add --tests none skips it for that job. PR_QUEUE_TEST_REVIEW=0 skips it, except for jobs queued with
+#        --tests on.
+#      A re-queue of the branch keeps its --review and --tests. "Needs changes" from either review fails the
+#      job and names the saved reviews, in $REVIEW_DIR (default $PR_QUEUE_DIR/reviews). A commit already
+#      reviewed as ready (the code: at that level) isn't reviewed again;
 #   3. if the repo has scripts/e2e-gate.mjs and the commit has no local pass: `npm run test:e2e:full`, under the lock;
 #   4. open the PR (scripts/create-pr.sh <type> "<description>" if the repo has it, else gh pr create), or push to
 #      the open one; the body is the body file (else the current one) with a "Local end-to-end run" section for
@@ -51,11 +55,18 @@ jobs_for() {
 }
 
 add() {
-  local review=""
-  if [ "${1:-}" = --review ]; then
-    review="${2:-}"; shift 2 || usage
-    case "$review" in none|low|medium|high|xhigh) ;; *) die "--review takes none, low, medium, high or xhigh, not '$review'" ;; esac
-  fi
+  local review="" tests=""
+  while :; do
+    case "${1:-}" in
+      --review)
+        review="${2:-}"; shift 2 || usage
+        case "$review" in none|low|medium|high|xhigh) ;; *) die "--review takes none, low, medium, high or xhigh, not '$review'" ;; esac ;;
+      --tests)
+        tests="${2:-}"; shift 2 || usage
+        case "$tests" in on|none) ;; *) die "--tests takes on or none, not '$tests'" ;; esac ;;
+      *) break ;;
+    esac
+  done
   [ $# -ge 3 ] || usage
   local wt type="$2" desc="$3" body="${4:-}" branch job file
   [ -d "$1" ] || die "no such directory: $1"
@@ -67,15 +78,20 @@ add() {
   [ -n "$(git -C "$wt" log --oneline origin/main..HEAD 2>/dev/null)" ] || die "$branch has no commits ahead of origin/main"
   if [ -z "$type" ] || [ -z "$desc" ]; then die "type and description must not be empty"; fi
   if [ -n "$body" ]; then [ -f "$body" ] || die "no such body file: $body"; fi
-  # Without --review, keep the level the branch's latest earlier job asked for (a fix after a failed review).
-  if [ -z "$review" ]; then
-    local d
-    for d in "$STATE/failed" "$RUNNING" "$QUEUE"; do
-      while read -r job; do
-        if [ -n "$job" ] && [ -n "$(field review "$job")" ]; then review="$(field review "$job")"; fi
-      done < <(jobs_for "$d" "$branch")
-    done
-    if [ -n "$review" ]; then echo "pr-queue: keeping --review $review from the earlier job"; fi
+  # Without --review or --tests, keep what the branch's latest earlier job asked for (a fix after a failed review).
+  local d old_review="" old_tests=""
+  for d in "$STATE/failed" "$RUNNING" "$QUEUE"; do
+    while read -r job; do
+      [ -n "$job" ] || continue
+      if [ -n "$(field review "$job")" ]; then old_review="$(field review "$job")"; fi
+      if [ -n "$(field tests "$job")" ]; then old_tests="$(field tests "$job")"; fi
+    done < <(jobs_for "$d" "$branch")
+  done
+  if [ -z "$review" ] && [ -n "$old_review" ]; then
+    review="$old_review"; echo "pr-queue: keeping --review $review from the earlier job"
+  fi
+  if [ -z "$tests" ] && [ -n "$old_tests" ]; then
+    tests="$old_tests"; echo "pr-queue: keeping --tests $tests from the earlier job"
   fi
   # Re-queueing a branch (after a fix) replaces its old job.
   while read -r job; do rm -f "$job" "${job%.job}.body"; done < <(jobs_for "$QUEUE" "$branch")
@@ -84,7 +100,7 @@ add() {
   fi
   file="$QUEUE/$(date +%s%N)-${branch//\//-}"
   if [ -n "$body" ]; then cp "$body" "$file.body"; fi
-  printf 'worktree=%s\nbranch=%s\ntype=%s\ndescription=%s\nreview=%s\n' "$wt" "$branch" "$type" "$desc" "$review" > "$file.job"
+  printf 'worktree=%s\nbranch=%s\ntype=%s\ndescription=%s\nreview=%s\ntests=%s\n' "$wt" "$branch" "$type" "$desc" "$review" "$tests" > "$file.job"
   echo "pr-queue: queued $branch ($(find "$QUEUE" -name '*.job' | wc -l) in the queue)"
 }
 
@@ -104,10 +120,19 @@ failjob() {
   return 1
 }
 finishjob() { mv "$JOB.job" "$STATE/done/"; rm -f "$JOB.body"; }
+# review_result <name> <output file> <exit code>: logs a review.sh run, and adds to $problems why it failed.
+review_result() {
+  local out file
+  out="$(cat "$2")"; printf '%s\n' "$out" >> "$LOG"
+  if grep -qx 'already reviewed as ready' <<<"$out"; then echo "   $1: already reviewed as ready" | tee -a "$LOG"; fi
+  file="$(sed -n 's/^(saved to \(.*\))$/\1/p' <<<"$out" | tail -1)"
+  if [ "$3" -eq 1 ] && [ -n "$file" ]; then problems+="; the $1 found changes to make ($1: $file)"
+  elif [ "$3" -ne 0 ]; then problems+="; the $1 didn't run: $(tail -1 <<<"$out")"; fi
+}
 
 process() {
   JOB="${1%.job}"
-  local wt type desc pr sha line main_dir merged level review review_rc reviewed="" file tries=0
+  local wt type desc pr sha line main_dir merged level review_rc reviewed="" tries=0
   wt="$(field worktree "$1")"; BRANCH="$(field branch "$1")"; type="$(field type "$1")"; desc="$(field description "$1")"
   LOG="$LOGS/$BRANCH.log"; mkdir -p "$(dirname "$LOG")"
   echo "== $(date '+%F %T') $BRANCH" | tee -a "$LOG"
@@ -126,20 +151,38 @@ process() {
     echo "   merged origin/main" | tee -a "$LOG"
   fi
 
-  # 2. Review, in a fresh session, before the e2e run is spent on it.
-  level="$(field review "$1")"
+  # 2. Review the code and the tests, in fresh sessions at the same time, before the e2e run is spent on it.
+  local tests code_pid="" tests_pid="" code_out tests_out problems=""
+  level="$(field review "$1")"; tests="$(field tests "$1")"
   if [ "$level" = none ]; then
-    echo "   not reviewed (queued with --review none)" | tee -a "$LOG"
+    echo "   not reviewed (queued with --review none)" | tee -a "$LOG"; level=""
   elif [ "${PR_QUEUE_REVIEW:-}" != 0 ] || [ -n "$level" ]; then
     level="${level:-${PR_QUEUE_REVIEW:-medium}}"
+  fi
+  if [ "$tests" = none ]; then
+    echo "   tests not reviewed (queued with --tests none)" | tee -a "$LOG"; tests=""
+  elif [ "${PR_QUEUE_TEST_REVIEW:-}" != 0 ] || [ "$tests" = on ]; then
+    tests=on
+  else
+    tests=""
+  fi
+  if [ -n "$level$tests" ]; then
     reviewed="$(git rev-parse HEAD)"
-    echo "   reviewing $(git rev-parse --short HEAD) (/code-review $level)" | tee -a "$LOG"
-    review="$(REVIEW_DIR="$REVIEWS" "$HERE/review.sh" "$wt" "$level" 2>&1)"; review_rc=$?
-    printf '%s\n' "$review" >> "$LOG"
-    if grep -qx 'already reviewed as ready' <<<"$review"; then echo "   already reviewed as ready" | tee -a "$LOG"; fi
-    file="$(sed -n 's/^(saved to \(.*\))$/\1/p' <<<"$review" | tail -1)"
-    if [ "$review_rc" -eq 1 ] && [ -n "$file" ]; then failjob "the review found changes to make (review: $file)"; return; fi
-    [ "$review_rc" -eq 0 ] || { failjob "the review didn't run: $(tail -1 <<<"$review")"; return; }
+    code_out="$(mktemp)"; tests_out="$(mktemp)"
+    if [ -n "$level" ]; then
+      echo "   reviewing $(git rev-parse --short HEAD) (/code-review $level)" | tee -a "$LOG"
+      REVIEW_DIR="$REVIEWS" REVIEW_SKIP_TESTS="${tests:+1}" "$HERE/review.sh" "$wt" "$level" >"$code_out" 2>&1 &
+      code_pid=$!
+    fi
+    if [ -n "$tests" ]; then
+      echo "   reviewing the tests of $(git rev-parse --short HEAD)" | tee -a "$LOG"
+      REVIEW_DIR="$REVIEWS" "$HERE/review.sh" --tests "$wt" >"$tests_out" 2>&1 &
+      tests_pid=$!
+    fi
+    if [ -n "$code_pid" ]; then wait "$code_pid"; review_rc=$?; review_result review "$code_out" "$review_rc"; fi
+    if [ -n "$tests_pid" ]; then wait "$tests_pid"; review_rc=$?; review_result "test review" "$tests_out" "$review_rc"; fi
+    rm -f "$code_out" "$tests_out"
+    if [ -n "$problems" ]; then failjob "${problems#; }"; return; fi
   fi
 
   # 3. The full local suite, once, on this exact commit.
@@ -245,6 +288,10 @@ run() {
   case "${PR_QUEUE_REVIEW:-medium}" in
     0|low|medium|high|xhigh) ;;
     *) die "PR_QUEUE_REVIEW must be 0 (no reviews), low, medium, high or xhigh, not '$PR_QUEUE_REVIEW'" ;;
+  esac
+  case "${PR_QUEUE_TEST_REVIEW:-1}" in
+    0|1) ;;
+    *) die "PR_QUEUE_TEST_REVIEW must be 0 (no test reviews) or 1, not '$PR_QUEUE_TEST_REVIEW'" ;;
   esac
   exec 9>"$STATE/run.lock"
   flock -n 9 || { echo "pr-queue: a runner is already working on the queue"; exit 0; }

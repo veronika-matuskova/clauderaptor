@@ -1,0 +1,15 @@
+name: tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # shellcheck is preinstalled on the runner; fail if it ever isn't, instead of skipping the lint
+      - run: command -v shellcheck
+      - run: tests/run.sh

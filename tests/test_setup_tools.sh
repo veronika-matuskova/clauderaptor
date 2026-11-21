@@ -44,7 +44,7 @@ exit 0
 EOF
   chmod +x "$BIN/gh-stub"
 }
-run() { PATH="$BIN" HOME="$H" GIT_CONFIG_GLOBAL="$H/.gitconfig" bash "$ROOT/setup-tools.sh"; }
+run() { PATH="$BIN" HOME="$H" GIT_CONFIG_GLOBAL="$H/.gitconfig" bash "$ROOT/scripts/setup-tools.sh"; }
 gitcfg() { git config --file "$H/.gitconfig" "$1"; }
 
 # Fresh machine: installs gh and shellcheck, logs in, sets git helper, sets up signing

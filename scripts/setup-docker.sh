@@ -16,6 +16,18 @@ EOF
   exit 1
 fi
 
+# Check the platform before any sudo, so an unsupported machine fails before anything is written
+OS_RELEASE="${SETUP_OS_RELEASE:-/etc/os-release}"
+# shellcheck source=/dev/null
+os_id="$(. "$OS_RELEASE" 2>/dev/null && echo "${ID:-}")"
+if [ "$os_id" != ubuntu ]; then
+  echo "this script supports Ubuntu (WSL) only; $OS_RELEASE says ID=${os_id:-unknown}" >&2; exit 1
+fi
+if [ ! -d "${SETUP_SYSTEMD_DIR:-/run/systemd/system}" ]; then
+  echo "systemd isn't running: add '[boot] systemd=true' to /etc/wsl.conf, run 'wsl --shutdown' in PowerShell, open a new terminal and re-run $0" >&2
+  exit 1
+fi
+
 # --- Docker Engine from Docker's official apt repo ---
 if ! command -v dockerd >/dev/null 2>&1; then
   echo "installing Docker Engine..."
@@ -24,7 +36,7 @@ if ! command -v dockerd >/dev/null 2>&1; then
     | sudo tee /etc/apt/keyrings/docker.asc >/dev/null
   sudo chmod go+r /etc/apt/keyrings/docker.asc
   # shellcheck source=/dev/null
-  codename="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}")"
+  codename="$(. "$OS_RELEASE" && echo "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}")"
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $codename stable" \
     | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
   sudo apt-get update
@@ -62,8 +74,11 @@ fi
 
 if out="$(docker info 2>&1)"; then
   echo "docker is ready: server $(docker version --format '{{.Server.Version}}')"
+elif ! id -nG | grep -qw docker && id -nG "$me" | grep -qw docker && out="$(sg docker -c 'docker info' 2>&1)"; then
+  # Just joined the group: docker works, but only shells started from now on have the group
+  echo "docker is ready. Open a new terminal to use it without sudo (this one started before you joined the docker group)."
 else
-  echo "$out" >&2
+  echo "$out" >&2  # from the sg retry if it ran, so a real daemon error isn't hidden behind "permission denied"
   echo "docker info failed. If it says permission denied, open a new terminal so the docker group applies (if that's not enough, run 'wsl --shutdown' in PowerShell)." >&2
   exit 1
 fi

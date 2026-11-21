@@ -4,8 +4,8 @@
 source "$(dirname "$0")/lib.sh"
 
 SRC="$TMP/repo"; DEST="$TMP/home/.claude"
-mkdir -p "$SRC/claude/rules" "$SRC/claude/skills" "$SRC/claude/agents"
-cp "$ROOT/install.sh" "$SRC/"
+mkdir -p "$SRC/scripts" "$SRC/claude/rules" "$SRC/claude/skills" "$SRC/claude/agents"
+cp "$ROOT/scripts/install.sh" "$SRC/scripts/"
 echo "# g" > "$SRC/claude/CLAUDE.md"; echo "x" > "$SRC/claude/statusline.py"
 cat > "$SRC/claude/settings.json" <<'EOF'
 {"theme": "dark", "modelSettings": {"a": {"effortLevel": "low"}, "b": {"effortLevel": "low"}}}
@@ -13,7 +13,7 @@ EOF
 cat > "$SRC/claude/settings.local.json" <<'EOF'
 {"modelSettings": {"a": {"effortLevel": "xhigh"}}, "extra": true}
 EOF
-run() { CLAUDE_CONFIG_DIR="$DEST" bash "$SRC/install.sh"; }
+run() { CLAUDE_CONFIG_DIR="$DEST" bash "$SRC/scripts/install.sh"; }
 get() { python3 -c "import json,sys; d=json.load(open('$DEST/settings.json')); print(eval(sys.argv[1]))" "$1"; }
 
 # Pre-existing regular file is backed up, not lost

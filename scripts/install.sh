@@ -3,7 +3,7 @@
 # and builds ~/.claude/settings.json from claude/settings.json (shared, committed)
 # deep-merged with claude/settings.local.json (this machine only, gitignored).
 set -euo pipefail
-SRC="$(cd "$(dirname "$0")" && pwd)/claude"
+SRC="$(cd "$(dirname "$0")/.." && pwd)/claude"
 DEST="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 mkdir -p "$DEST"
 stamp="$(date +%Y%m%d%H%M%S)"

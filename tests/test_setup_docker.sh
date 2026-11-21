@@ -8,7 +8,8 @@ source "$(dirname "$0")/lib.sh"
 setup_bin() {
   BIN="$TMP/bin.$1"; LOG="$TMP/log.$1"; H="$TMP/home.$1"; mkdir -p "$BIN" "$H"; : > "$LOG"
   for c in bash cat grep readlink python3; do ln -s "$(command -v "$c")" "$BIN/$c"; done
-  echo "t adm" > "$BIN/.groups"
+  echo "t adm" > "$BIN/.groups"; echo "t adm docker" > "$BIN/.procgroups"
+  printf 'ID=ubuntu\nUBUNTU_CODENAME=noble\n' > "$BIN/.os-release"; mkdir -p "$BIN/.systemd"
   # sudo: logs, swallows stdin for tee, and fakes apt-get install / usermod / systemctl enable
   cat > "$BIN/sudo" <<EOF
 #!/usr/bin/env bash
@@ -24,7 +25,14 @@ EOF
   for c in curl dpkg; do printf '#!/usr/bin/env bash\necho "%s $*" >> "%s"\n' "$c" "$LOG" > "$BIN/$c"; done
   cat > "$BIN/id" <<EOF
 #!/usr/bin/env bash
-case "\$1" in -un) echo t ;; -nG) cat "$BIN/.groups" ;; esac
+# id -nG <user> reads the group database (.groups); id -nG is this process's groups (.procgroups)
+case "\$1" in -un) echo t ;; -nG) if [ -n "\${2:-}" ]; then cat "$BIN/.groups"; else cat "$BIN/.procgroups"; fi ;; esac
+EOF
+  # sg: runs the command as if in the new group; .sgdown makes docker fail there too
+  cat > "$BIN/sg" <<EOF
+#!/usr/bin/env bash
+echo "sg \$*" >> "$LOG"
+SG=1 bash -c "\$3"
 EOF
   cat > "$BIN/systemctl" <<EOF
 #!/usr/bin/env bash
@@ -34,14 +42,15 @@ EOF
 #!/usr/bin/env bash
 echo "\${0##*/} \$*" >> "$LOG"
 case "\$1" in
-  info)      [ -f "$BIN/.down" ] && { echo "permission denied while trying to connect" >&2; exit 1; }; echo ok ;;
+  info)      [ -f "$BIN/.sgdown" ] && [ -n "\${SG:-}" ] && { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
+             [ -f "$BIN/.down" ] && [ -z "\${SG:-}" ] && { echo "permission denied while trying to connect" >&2; exit 1; }; echo ok ;;
   version)   echo 29.0 ;;
   --version) echo "Docker version 29.0" ;;
 esac
 EOF
-  chmod +x "$BIN/sudo" "$BIN/curl" "$BIN/dpkg" "$BIN/id" "$BIN/systemctl" "$BIN/docker-stub"
+  chmod +x "$BIN/sudo" "$BIN/curl" "$BIN/dpkg" "$BIN/id" "$BIN/sg" "$BIN/systemctl" "$BIN/docker-stub"
 }
-run() { PATH="$BIN" HOME="$H" bash "$ROOT/setup-docker.sh"; }
+run() { PATH="$BIN" HOME="$H" SETUP_OS_RELEASE="$BIN/.os-release" SETUP_SYSTEMD_DIR="$BIN/.systemd" bash "$ROOT/scripts/setup-docker.sh"; }
 
 # Fresh machine with Docker Desktop's leftover config: installs, joins group, enables socket, cleans config
 setup_bin fresh
@@ -51,6 +60,7 @@ out="$(run 2>&1)"; rc=$?
 log="$(cat "$LOG")"
 assert "fresh: exits 0" test "$rc" -eq 0
 assert_contains "fresh: adds docker apt repo" "$log" "sudo tee /etc/apt/sources.list.d/docker.list"
+assert_contains "fresh: repo for the os-release codename" "$log" "dpkg --print-architecture"
 assert_contains "fresh: fetches docker key"   "$log" "curl -fsSL https://download.docker.com/linux/ubuntu/gpg"
 assert_contains "fresh: installs engine"      "$log" "sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
 assert_contains "fresh: joins docker group"   "$log" "sudo usermod -aG docker t"
@@ -75,6 +85,36 @@ out="$(run 2>&1)"; rc=$?
 assert "down: exits non-zero" test "$rc" -ne 0
 assert_contains "down: shows docker error" "$out" "permission denied while trying to connect"
 assert_contains "down: hints at new terminal" "$out" "open a new terminal so the docker group applies"
+
+# Just joined the group: this shell lacks it but docker works via sg, so it succeeds and says to open a new terminal
+echo "t adm" > "$BIN/.procgroups"
+out="$(run 2>&1)"; rc=$?
+assert "new group: exits 0" test "$rc" -eq 0
+assert_contains "new group: checks via sg" "$(cat "$LOG")" "sg docker -c docker info"
+assert_contains "new group: says open a new terminal" "$out" "Open a new terminal to use it without sudo"
+
+# Same, but docker fails even with the group: shows the error and exits non-zero
+: > "$BIN/.sgdown"
+out="$(run 2>&1)"; rc=$?
+assert "sg down: exits non-zero" test "$rc" -ne 0
+assert_contains "sg down: shows the error from sg" "$out" "Cannot connect to the Docker daemon"
+assert_not_contains "sg down: not the stale permission error" "$out" "permission denied while trying"
+
+# Not Ubuntu: stops before any sudo
+setup_bin debian
+printf 'ID=debian\nVERSION_CODENAME=bookworm\n' > "$BIN/.os-release"
+out="$(run 2>&1)"; rc=$?
+assert "debian: exits non-zero" test "$rc" -ne 0
+assert_contains "debian: explains" "$out" "supports Ubuntu (WSL) only"
+assert_not_contains "debian: no sudo" "$(cat "$LOG")" "sudo"
+
+# No systemd: stops before any sudo and says how to enable it
+setup_bin nosystemd
+rmdir "$BIN/.systemd"
+out="$(run 2>&1)"; rc=$?
+assert "nosystemd: exits non-zero" test "$rc" -ne 0
+assert_contains "nosystemd: says how" "$out" "[boot] systemd=true"
+assert_not_contains "nosystemd: no sudo" "$(cat "$LOG")" "sudo"
 
 # Docker Desktop's integration is on: stops before installing anything
 setup_bin desktop

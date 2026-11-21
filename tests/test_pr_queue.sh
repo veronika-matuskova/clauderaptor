@@ -5,7 +5,7 @@ source "$(dirname "$0")/lib.sh"
 
 export TQ="$TMP/t" PR_QUEUE_DIR="$TMP/state" PR_QUEUE_CHECKS_WAIT=0
 mkdir -p "$TQ/bin" "$TQ/passed"
-Q() { PATH="$TQ/bin:$PATH" bash "$ROOT/pr-queue.sh" "$@" </dev/null 2>&1; }
+Q() { PATH="$TQ/bin:$PATH" bash "$ROOT/scripts/pr-queue.sh" "$@" </dev/null 2>&1; }
 
 # gh: one PR, number 7. Its state, branch and body live in files under $TQ; its head is the branch on origin.
 # $TQ/checks_seq: check results to report, one per call (the last repeats): pass, fail, pending, cancel, none.
@@ -98,7 +98,10 @@ reset_pr() {
   rm -f "$TQ/pr_state" "$TQ/pr_body" "$TQ/pr_branch" "$TQ/checks_seq" "$TQ/e2e_fail" "$TQ/merge_fail" "$TQ/head_lag" "$TQ/on_checks"
   : > "$TQ/gh.log"; : > "$TQ/created.log"; : > "$TQ/npm.log"
 }
+# called through assert
+# shellcheck disable=SC2329
 in_done() { test -n "$(find "$PR_QUEUE_DIR/done" -name "*$1.job")"; }
+# shellcheck disable=SC2329
 in_failed() { test -n "$(find "$PR_QUEUE_DIR/failed" -name "*$1.job")"; }
 
 # --- add ---
@@ -256,5 +259,8 @@ out="$(Q run)";                              assert_contains "second runner exit
 wait
 out="$(Q lock echo hi)";                     assert_contains "lock runs the command" "$out" "hi"
 out="$(Q bogus)";                            assert_contains "usage on a bad command" "$out" "pr-queue.sh add"
+
+# Old root path still works (compat link for agents prompted with it)
+assert "root pr-queue.sh links to scripts/" test "$(readlink -f "$ROOT/pr-queue.sh")" = "$ROOT/scripts/pr-queue.sh"
 
 finish

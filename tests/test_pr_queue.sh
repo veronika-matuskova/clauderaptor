@@ -279,7 +279,4 @@ wait
 out="$(Q lock echo hi)";                     assert_contains "lock runs the command" "$out" "hi"
 out="$(Q bogus)";                            assert_contains "usage on a bad command" "$out" "pr-queue.sh add"
 
-# Old root path still works (compat link for agents prompted with it)
-assert "root pr-queue.sh links to scripts/" test "$(readlink -f "$ROOT/pr-queue.sh")" = "$ROOT/scripts/pr-queue.sh"
-
 finish

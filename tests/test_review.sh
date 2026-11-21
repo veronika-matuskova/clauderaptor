@@ -8,9 +8,11 @@ unset REVIEW_TIMEOUT
 export REVIEW_DIR="$TMP/reviews" STUB="$TMP/stub"
 mkdir -p "$STUB"
 # $STUB/result: the review text to return; $STUB/fail: exit 1 instead; $STUB/hook: a script to run first.
-# Logs its cwd and args (and removes neither, so a test can tell whether it ran).
+# $STUB/slow_stop: on TERM, take 0.5 s to end. Logs its cwd and args (and removes neither, so a test can tell
+# whether it ran).
 cat > "$TMP/bin/claude" <<'EOF'
 #!/usr/bin/env bash
+[ -f "$STUB/slow_stop" ] && trap 'sleep 0.5; exit 1' TERM
 pwd > "$STUB/cwd"; printf '%s\n' "$@" > "$STUB/args"; readlink /proc/$$/fd/0 > "$STUB/stdin"
 [ -f "$STUB/fail" ] && exit 1
 [ -f "$STUB/hook" ] && bash "$STUB/hook"
@@ -104,6 +106,37 @@ out="$(REVIEW_TIMEOUT=1 rv "$W")"
 assert_contains "hung review stopped"     "$out" "took longer than 1s"
 assert_contains "hung review -> exit 2"   "$out" "exit=2"
 rm "$STUB/hook"
+
+# A kill (TERM, as pr-queue.sh sends), a hangup or a Ctrl-C (INT to the whole process group) of review.sh stops
+# its claude -p session too, which runs in timeout's own process group, and removes the temp files.
+# with_sigint <command...>: runs it in a process group of its own, with SIGINT on (a background job's is off).
+with_sigint() { exec python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"; }
+# shellcheck disable=SC2329  # called through assert
+gone() { ! kill -0 "$1" 2>/dev/null; }
+# stop_review <TERM|INT|HUP> <label>: starts a test review whose session hangs and takes 0.5 s to stop, then
+# stops it. Sets session (its pid, empty if it never started), stopped_rc and stopped_took.
+stop_review() {
+  rm -rf "$TMP/tmpdir" "$STUB/session"; mkdir "$TMP/tmpdir"; commit "$2"; touch "$STUB/slow_stop"
+  # shellcheck disable=SC2016  # expands in the hook
+  echo 'echo "$PPID" > "$STUB/session"; sleep 30' > "$STUB/hook"
+  PATH="$TMP/bin:$PATH" TMPDIR="$TMP/tmpdir" with_sigint bash "$ROOT/scripts/review.sh" --tests "$W" >"$TMP/stopped.out" 2>&1 &
+  local rpid=$! _
+  for _ in $(seq 100); do [ -s "$STUB/session" ] && break; sleep 0.1; done
+  session="$(cat "$STUB/session" 2>/dev/null)"
+  local t0=$SECONDS
+  if [ "$1" = INT ]; then kill -INT -- "-$rpid"; else kill -"$1" "$rpid"; fi
+  wait "$rpid"; stopped_rc=$?; stopped_took=$((SECONDS - t0))
+  rm "$STUB/hook" "$STUB/slow_stop"
+}
+for sig in TERM INT HUP; do
+  stop_review "$sig" "10-$sig"
+  assert "$sig: the session had started"   test -n "$session"
+  assert "$sig: exit 2"                    test "$stopped_rc" = 2
+  assert_contains "$sig: says so"          "$(cat "$TMP/stopped.out")" "stopped, and so was the claude -p session"
+  assert "$sig: the session ended first"   gone "$session"
+  assert "$sig: at once, not after the session's 30 s" test "$stopped_took" -lt 10
+  assert "$sig: temp files removed"        test -z "$(ls -A "$TMP/tmpdir")"
+done
 
 # A review longer than one command-line argument may be (128 KiB) is still read.
 commit 11; python3 -I -c 'print("x" * 200000); print("Verdict: ready")' > "$STUB/result"
@@ -199,6 +232,16 @@ assert_contains "suite: a moved HEAD is fine" "$out" "exit=0"
 assert_contains "suite: a moved HEAD is noted" "$out" "moved during the audit; the audit is of $msha"
 rm "$STUB/hook"; printf '**Suite audit:** repo.\n**Counts**: mutation 0, missing 2\n' > "$STUB/result"
 assert_contains "suite: markdown labels"      "$(rv --suite "$M")" "**Counts**: mutation 0, missing 2"
+printf -- '- Suite audit: repo.\n- Counts: mutation 3\n' > "$STUB/result"
+assert_contains "suite: a list item"          "$(rv --suite "$M")" "- Counts: mutation 3"
+printf '1. **Counts:** mutation 4\n' > "$STUB/result"
+assert_contains "suite: a numbered list item" "$(rv --suite "$M")" "1. **Counts:** mutation 4"
+printf '1) Counts: mutation 5\n' > "$STUB/result"
+assert_contains "suite: a 1) list item"       "$(rv --suite "$M")" "1) Counts: mutation 5"
+printf '+ Counts: mutation 6\n' > "$STUB/result"
+assert_contains "suite: a + list item"        "$(rv --suite "$M")" "+ Counts: mutation 6"
+printf '> **Counts:** mutation 7\n' > "$STUB/result"
+assert_contains "suite: a quoted line"        "$(rv --suite "$M")" "> **Counts:** mutation 7"
 printf 'I looked around.\n' > "$STUB/result"
 out="$(rv --suite "$M")"
 assert_contains "suite: no Counts line -> exit 2" "$out" "exit=2"

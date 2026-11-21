@@ -25,7 +25,8 @@ In a change review: the tests the change adds or changes, and the existing tests
 1. Mutation: break the code on purpose and check that a test fails.
    - Break only code that isn't a test and that the change adds or changes. Use one mutation at a time: negate a
      condition, move a boundary (`<` to `<=`), delete a statement or call, return early or a constant, drop an
-     error check. Restore the file with `git show <sha>:<path>` before the next one.
+     error check. Restore the file before the next one: the copy is not a git checkout, so write it back with
+     `git -C <repo> show <sha>:<path> > <scratch>/copy/<path>`.
    - Do at most 3 mutations per changed function and 10 per review. Pick the ones that would hurt users most.
      Skip a mutation that doesn't change behaviour.
    - Run only the tests that cover that code. Fast tests (unit tests, the repo's shell tests) run as they are.

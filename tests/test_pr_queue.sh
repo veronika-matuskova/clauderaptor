@@ -185,6 +185,14 @@ assert_contains "cancelled check: failed"    "$out" "checks failed on #7: Checks
 reset_pr; echo none > "$TQ/checks_seq"; mkwt nochecks
 Q add "$TMP/wt-nochecks" fix "No checks" >/dev/null; out="$(Q run)"
 assert_contains "no checks: gives up"        "$out" "no checks reported on #7"
+# A check that never leaves pending fails the job at PR_QUEUE_CHECKS_TIMEOUT (timeout 30 guards against a hang)
+reset_pr; echo pending > "$TQ/checks_seq"; mkwt hang
+Q add "$TMP/wt-hang" fix "Hang" >/dev/null
+out="$(PR_QUEUE_CHECKS_TIMEOUT=1 PATH="$TQ/bin:$PATH" timeout 30 bash "$ROOT/scripts/pr-queue.sh" run </dev/null 2>&1)"; rc=$?
+assert "stuck pending: runner exits"         test "$rc" -ne 124
+assert_contains "stuck pending: gives up, names the check" "$out" "checks still pending on #7 after 1s: Checks"
+assert "stuck pending: job in failed/"       in_failed hang
+assert_not_contains "stuck pending: not merged" "$(cat "$TQ/gh.log")" "pr merge"
 
 # --- the PR's head lags behind the push: checks are read only once it shows the pushed commit ---
 reset_pr; echo 2 > "$TQ/head_lag"; mkwt lag

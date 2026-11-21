@@ -19,6 +19,7 @@
 #      commits), delete the remote branch and pull the main checkout.
 # Main only moves when the queue merges, so each branch is tested once, on the commit that gets merged.
 # PR_QUEUE_MERGE=0 stops after the checks pass and leaves the PR open.
+# PR_QUEUE_CHECKS_TIMEOUT (seconds, default 3600) fails the job when checks are still pending after that long.
 # State (jobs, logs, results, the locks) lives in $PR_QUEUE_DIR (default ${XDG_STATE_HOME:-~/.local/state}/pr-queue).
 set -uo pipefail
 
@@ -27,6 +28,7 @@ QUEUE="$STATE/queue"; RUNNING="$STATE/running"; LOGS="$STATE/logs"; RESULTS="$ST
 mkdir -p "$QUEUE" "$RUNNING" "$LOGS" "$STATE/done" "$STATE/failed"
 PASS_HEADING='## Local end-to-end run'
 CHECKS_WAIT="${PR_QUEUE_CHECKS_WAIT:-30}"
+CHECKS_TIMEOUT="${PR_QUEUE_CHECKS_TIMEOUT:-3600}"
 
 die() { echo "pr-queue: $*" >&2; exit 1; }
 usage() { sed -n 's/^#   \(pr-queue\.sh .*\)/  \1/p' "$0"; exit 1; }
@@ -146,7 +148,10 @@ process() {
   done
   echo "   PR #$pr, waiting for the checks" | tee -a "$LOG"
   # Done when some are reported and none is pending, twice in a row (a workflow can start late).
-  local checks bad passes=0; tries=0
+  # A check that stays pending (a stuck runner, a workflow that never starts) fails the job at the deadline,
+  # so it can't block the queue.
+  local checks bad pending passes=0 deadline=$((SECONDS + CHECKS_TIMEOUT)) waited; tries=0
+  if [ $((CHECKS_TIMEOUT % 60)) -eq 0 ]; then waited="$((CHECKS_TIMEOUT / 60))m"; else waited="${CHECKS_TIMEOUT}s"; fi
   while :; do
     checks="$(gh pr checks "$pr" --json name,bucket -q '.[] | "\(.bucket)\t\(.name)"' 2>>"$LOG")"
     [ -n "$checks" ] && echo "$checks" >> "$LOG"
@@ -157,6 +162,10 @@ process() {
       [ $tries -lt 10 ] || { failjob "no checks reported on #$pr"; return; }
     elif grep -q '^pending' <<<"$checks"; then
       passes=0
+      if [ "$SECONDS" -ge "$deadline" ]; then
+        pending="$(awk -F'\t' '$1 == "pending" { print $2 }' <<<"$checks" | sort -u | paste -sd, -)"
+        failjob "checks still pending on #$pr after $waited: $pending"; return
+      fi
     else
       passes=$((passes + 1)); [ $passes -lt 2 ] || break
     fi

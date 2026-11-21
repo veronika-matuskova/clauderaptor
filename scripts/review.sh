@@ -12,8 +12,8 @@
 # A test review or audit gets a scratch folder, removed afterwards: it runs the tests in a copy of the
 # commit there, with the code broken on purpose, and e2e tests only under `pr-queue.sh lock`.
 # It is stopped after $REVIEW_TIMEOUT seconds (1800 for the code, 3600 for the tests: e2e runs wait for the
-# lock), and killed 30 s later if it is still running. A Ctrl-C or kill (TERM) of review.sh stops the session
-# too, and waits for it to end. (Started by pr-queue.sh, review.sh ignores SIGINT as a background job: the queue
+# lock), and killed 30 s later if it is still running. A Ctrl-C, kill (TERM) or hangup of review.sh stops the
+# session too, and waits for it to end. (Started by pr-queue.sh, review.sh ignores SIGINT as a background job: the queue
 # sends it TERM.)
 # REVIEW_SKIP_TESTS=1 tells /code-review to leave the quality of tests to the test review.
 # Reviews are saved to $REVIEW_DIR (default $PR_QUEUE_DIR/reviews, the folder pr-queue.sh uses) as
@@ -125,12 +125,12 @@ cd "$wt" || die "can't enter $wt"
 # its own, which neither signal reaches by itself. The trap waits for the session (at most 30 s, then timeout
 # kills it) before the EXIT trap removes the folders it may still be using.
 session=""
-trap '[ -z "$session" ] || { kill "$session" 2>/dev/null; wait "$session"; }; die "stopped, and so was the claude -p session"' INT TERM
+trap '[ -z "$session" ] || { kill "$session" 2>/dev/null; wait "$session"; }; die "stopped, and so was the claude -p session"' INT TERM HUP
 timeout -k 30 "$limit" claude -p "$prompt" --output-format json --permission-mode auto \
   --disallowed-tools "Edit,Write,NotebookEdit" </dev/null >"$json" &
 session=$!
-wait "$session"; rc=$?
-trap - INT TERM
+wait "$session"; rc=$?; session=""
+trap - INT TERM HUP
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then die "the review took longer than ${limit}s (REVIEW_TIMEOUT) and was stopped"; fi
 [ "$rc" -eq 0 ] || die "claude -p failed (exit $rc)"
 note=""

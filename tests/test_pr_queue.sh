@@ -76,7 +76,7 @@ EOF
 # claude -p (run by review.sh): logs "code <prompt>" for a code review, "tests <first line>" for a test review,
 # and reports the verdict in $TQ/verdict or $TQ/tests_verdict (default ready). $TQ/claude_fail makes both fail.
 # With $TQ/sync, each session waits up to 5 s for the other one to start, and logs in sync.log if it did.
-# With $TQ/hang, each session logs its pid in $TQ/hung and hangs for 30 s.
+# With $TQ/hang, each session logs its pid in $TQ/hung and hangs for 30 s; on TERM it takes 0.5 s to end.
 cat > "$TQ/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 if [[ "$2" == *"code-review skill"* ]]; then
@@ -85,7 +85,7 @@ else
   kind=tests other=code; echo "tests ${2%%$'\n'*}" >> "$TQ/claude.log"; v="$(cat "$TQ/tests_verdict" 2>/dev/null || echo ready)"
 fi
 [ -f "$TQ/claude_fail" ] && exit 1
-if [ -f "$TQ/hang" ]; then echo "$$" >> "$TQ/hung"; sleep 30; fi
+if [ -f "$TQ/hang" ]; then trap 'sleep 0.5; exit 1' TERM; echo "$$" >> "$TQ/hung"; sleep 30; fi
 if [ -f "$TQ/sync" ]; then
   touch "$TQ/started-$kind"
   for _ in $(seq 50); do
@@ -406,37 +406,47 @@ assert "no-merge: worktree kept"             test -d "$TMP/wt-open"
 # and leaves no temp files; the job stays in running/, where the next run moves it to failed/ ---
 # shellcheck disable=SC2329  # called through assert
 gone() { ! kill -0 "$1" 2>/dev/null; }
-# stop_runner <INT|TERM>: runs the queue with both sessions hanging, then sends the signal to the runner's whole
-# process group, as a terminal's Ctrl-C (INT) or `kill -- -<pgid>` (TERM) does. python gives the runner a group
-# of its own, with SIGINT on (a background job's is off). Sets started, stop_rc, took and alive.
+# stop_runner <INT|TERM|HUP> <name>: runs the queue (branch fix/<name>) with both sessions hanging, then sends the signal to the runner's
+# whole process group, as a terminal's Ctrl-C (INT), its closing (HUP) or `kill -- -<pgid>` (TERM) does. python
+# gives the runner a group of its own, with SIGINT on (a background job's is off). Sets started, stop_rc, took,
+# alive_at_exit (sessions still running when the runner ended) and alive.
 stop_runner() {
   local rpid p _
-  reset_pr; rm -rf "$TQ/hung" "$TQ/tmp"; mkdir -p "$TQ/tmp"; touch "$TQ/hang"; mkwt "stop$1"
-  Q add "$TMP/wt-stop$1" fix "Stop" >/dev/null
+  reset_pr; rm -rf "$TQ/hung" "$TQ/tmp"; mkdir -p "$TQ/tmp"; touch "$TQ/hang"; mkwt "$2"
+  Q add "$TMP/wt-$2" fix "Stop" >/dev/null
   PATH="$TQ/bin:$PATH" TMPDIR="$TQ/tmp" python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
     bash "$ROOT/scripts/pr-queue.sh" run </dev/null >/dev/null 2>&1 &
   rpid=$!
   for _ in $(seq 100); do [ "$(wc -l 2>/dev/null < "$TQ/hung")" = 2 ] && break; sleep 0.1; done
   started="$(wc -l 2>/dev/null < "$TQ/hung")"
-  local t0=$SECONDS; kill -"$1" -- "-$rpid"; wait "$rpid"; stop_rc=$?
-  # On TERM the runner ends at once, while its job is still stopping the reviews.
+  local t0=$SECONDS; kill -"$1" -- "-$rpid"
+  { wait "$rpid"; } 2>/dev/null; stop_rc=$?   # (no "Hangup" notice from bash)
+  alive_at_exit=""; while read -r p; do gone "$p" || alive_at_exit=1; done < "$TQ/hung"
+  # On TERM or HUP the runner ends at once, while its job is still stopping the reviews; the job holds the
+  # runner's lock until it ends.
   for _ in $(seq 100); do
     alive=""; while read -r p; do gone "$p" || alive=1; done < "$TQ/hung"
-    if [ -z "$alive" ] && [ -z "$(ls -A "$TQ/tmp")" ]; then break; fi
+    if [ -z "$alive" ] && [ -z "$(ls -A "$TQ/tmp")" ] && flock -n "$PR_QUEUE_DIR/run.lock" true; then break; fi
     sleep 0.1
   done
   took=$((SECONDS - t0)); rm -f "$TQ/hang"
 }
-for sig in INT TERM; do
-  stop_runner "$sig"; code=130; [ "$sig" = TERM ] && code=143
+for sig in INT TERM HUP; do
+  stop_runner "$sig" "stop$sig"
+  case "$sig" in INT) code=130 ;; TERM) code=143 ;; HUP) code=129 ;; esac
   assert "$sig: both sessions started"           test "$started" = 2
   assert "$sig: the runner ends by SIG$sig"      test "$stop_rc" = "$code"
   assert "$sig: both claude -p sessions stopped" test -z "$alive"
   assert "$sig: no temp files left"              test -z "$(ls -A "$TQ/tmp")"
   assert "$sig: at once, not after the sessions' 30 s" test "$took" -lt 10
   assert "$sig: the job stayed in running/"      test -n "$(find "$PR_QUEUE_DIR/running" -name "*stop$sig.job")"
+  assert "$sig: the runner's lock is free again" flock -n "$PR_QUEUE_DIR/run.lock" true
   rm -f "$PR_QUEUE_DIR"/running/*
 done
+# A Ctrl-C reaches the job too, so the runner ends only once both sessions have.
+stop_runner INT stopINT2
+assert "INT: the sessions ended before the runner" test -z "$alive_at_exit"
+rm -f "$PR_QUEUE_DIR"/running/*
 
 # --- a job left in running/ by a dead runner goes to failed/ ---
 printf 'worktree=/x\nbranch=fix/dead\n' > "$PR_QUEUE_DIR/running/1-fix-dead.job"

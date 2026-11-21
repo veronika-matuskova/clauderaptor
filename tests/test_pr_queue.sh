@@ -402,26 +402,41 @@ assert_contains "no-merge: ready"            "$out" "READY fix/open: #7 passed, 
 assert "no-merge: PR still open"             test "$(cat "$TQ/pr_state")" = OPEN
 assert "no-merge: worktree kept"             test -d "$TMP/wt-open"
 
-# --- a Ctrl-C of the runner during the reviews stops both claude -p sessions and leaves no temp files ---
-# Like a terminal's Ctrl-C: SIGINT to the runner's whole process group. python gives the runner a group of its
-# own, with SIGINT on (a background job's is off).
+# --- a Ctrl-C of the runner, or a TERM to its process group, during the reviews stops both claude -p sessions
+# and leaves no temp files; the job stays in running/, where the next run moves it to failed/ ---
 # shellcheck disable=SC2329  # called through assert
 gone() { ! kill -0 "$1" 2>/dev/null; }
-reset_pr; rm -f "$TQ/hung"; touch "$TQ/hang"; mkwt ctrlc; mkdir -p "$TQ/tmp"
-Q add "$TMP/wt-ctrlc" fix "Ctrl-C" >/dev/null
-PATH="$TQ/bin:$PATH" TMPDIR="$TQ/tmp" python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-  bash "$ROOT/scripts/pr-queue.sh" run </dev/null >/dev/null 2>&1 &
-rpid=$!
-for _ in $(seq 100); do [ "$(wc -l 2>/dev/null < "$TQ/hung")" = 2 ] && break; sleep 0.1; done
-assert "Ctrl-C: both sessions started"       test "$(wc -l < "$TQ/hung")" = 2
-start=$SECONDS; kill -INT -- "-$rpid"; wait "$rpid"
-assert "Ctrl-C: stops at once, not after the sessions' 30 s" test $((SECONDS - start)) -lt 10
-for _ in $(seq 50); do alive=""; while read -r p; do gone "$p" || alive=1; done < "$TQ/hung"; [ -z "$alive" ] && break; sleep 0.1; done
-assert "Ctrl-C: both claude -p sessions stopped" test -z "$alive"
-assert "Ctrl-C: no temp files left"          test -z "$(ls -A "$TQ/tmp")"
-assert "Ctrl-C: the runner stopped"          gone "$rpid"
-assert "Ctrl-C: the job stopped where it was" test -n "$(find "$PR_QUEUE_DIR/running" -name '*ctrlc.job')"
-rm -f "$TQ/hang" "$PR_QUEUE_DIR"/running/*
+# stop_runner <INT|TERM>: runs the queue with both sessions hanging, then sends the signal to the runner's whole
+# process group, as a terminal's Ctrl-C (INT) or `kill -- -<pgid>` (TERM) does. python gives the runner a group
+# of its own, with SIGINT on (a background job's is off). Sets started, stop_rc, took and alive.
+stop_runner() {
+  local rpid p _
+  reset_pr; rm -rf "$TQ/hung" "$TQ/tmp"; mkdir -p "$TQ/tmp"; touch "$TQ/hang"; mkwt "stop$1"
+  Q add "$TMP/wt-stop$1" fix "Stop" >/dev/null
+  PATH="$TQ/bin:$PATH" TMPDIR="$TQ/tmp" python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+    bash "$ROOT/scripts/pr-queue.sh" run </dev/null >/dev/null 2>&1 &
+  rpid=$!
+  for _ in $(seq 100); do [ "$(wc -l 2>/dev/null < "$TQ/hung")" = 2 ] && break; sleep 0.1; done
+  started="$(wc -l 2>/dev/null < "$TQ/hung")"
+  local t0=$SECONDS; kill -"$1" -- "-$rpid"; wait "$rpid"; stop_rc=$?
+  # On TERM the runner ends at once, while its job is still stopping the reviews.
+  for _ in $(seq 100); do
+    alive=""; while read -r p; do gone "$p" || alive=1; done < "$TQ/hung"
+    if [ -z "$alive" ] && [ -z "$(ls -A "$TQ/tmp")" ]; then break; fi
+    sleep 0.1
+  done
+  took=$((SECONDS - t0)); rm -f "$TQ/hang"
+}
+for sig in INT TERM; do
+  stop_runner "$sig"; code=130; [ "$sig" = TERM ] && code=143
+  assert "$sig: both sessions started"           test "$started" = 2
+  assert "$sig: the runner ends by SIG$sig"      test "$stop_rc" = "$code"
+  assert "$sig: both claude -p sessions stopped" test -z "$alive"
+  assert "$sig: no temp files left"              test -z "$(ls -A "$TQ/tmp")"
+  assert "$sig: at once, not after the sessions' 30 s" test "$took" -lt 10
+  assert "$sig: the job stayed in running/"      test -n "$(find "$PR_QUEUE_DIR/running" -name "*stop$sig.job")"
+  rm -f "$PR_QUEUE_DIR"/running/*
+done
 
 # --- a job left in running/ by a dead runner goes to failed/ ---
 printf 'worktree=/x\nbranch=fix/dead\n' > "$PR_QUEUE_DIR/running/1-fix-dead.job"

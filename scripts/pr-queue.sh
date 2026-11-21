@@ -19,8 +19,9 @@
 #      A re-queue of the branch keeps its --review and --tests. "Needs changes" from either review fails the
 #      job and names the saved reviews, in $REVIEW_DIR (default $PR_QUEUE_DIR/reviews). A commit already
 #      reviewed as ready (the code: at that level) isn't reviewed again. The job waits for both reviews, even
-#      when one fails early, so the branch's agent gets all the findings in one round. A Ctrl-C of the runner
-#      stops both reviews and their claude -p sessions;
+#      when one fails early, so the branch's agent gets all the findings in one round. A Ctrl-C of the runner,
+#      or a TERM to its whole process group (kill -- -<pgid>), stops both reviews and their claude -p sessions;
+#      a kill of the runner's pid alone leaves its job running;
 #   3. if the repo has scripts/e2e-gate.mjs and the commit has no local pass: `npm run test:e2e:full`, under the lock;
 #   4. open the PR (scripts/create-pr.sh <type> "<description>" if the repo has it, else gh pr create), or push to
 #      the open one; the body is the body file (else the current one) with a "Local end-to-end run" section for
@@ -131,8 +132,9 @@ review_result() {
   if [ "$3" -eq 1 ] && [ -n "$file" ]; then problems+="; the $1 found changes to make ($1: $file)"
   elif [ "$3" -ne 0 ]; then problems+="; the $1 didn't run: $(tail -1 <<<"$out")"; fi
 }
-# stop_reviews <signal>: a Ctrl-C or kill during step 2 stops both reviews (review.sh then stops its claude -p
-# session) and removes their output files. Then this job's process ends by the same signal, so the runner does too.
+# stop_reviews <signal>: a Ctrl-C or a TERM to the process group during step 2 stops both reviews (review.sh
+# then stops its claude -p session and waits for it) and removes their output files. Then this job's process
+# ends by the same signal, so the runner does too.
 stop_reviews() {
   local pid
   for pid in $code_pid $tests_pid; do kill "$pid" 2>/dev/null; done
@@ -191,8 +193,13 @@ process() {
       REVIEW_DIR="$REVIEWS" "$HERE/review.sh" --tests "$wt" >"$tests_out" 2>&1 &
       tests_pid=$!
     fi
-    if [ -n "$code_pid" ]; then wait "$code_pid"; review_rc=$?; review_result review "$code_out" "$review_rc"; fi
-    if [ -n "$tests_pid" ]; then wait "$tests_pid"; review_rc=$?; review_result "test review" "$tests_out" "$review_rc"; fi
+    # A reaped pid is cleared, so that stop_reviews can't signal a process that got the pid later.
+    if [ -n "$code_pid" ]; then
+      wait "$code_pid"; review_rc=$?; code_pid=""; review_result review "$code_out" "$review_rc"
+    fi
+    if [ -n "$tests_pid" ]; then
+      wait "$tests_pid"; review_rc=$?; tests_pid=""; review_result "test review" "$tests_out" "$review_rc"
+    fi
     trap - INT TERM
     rm -f "$code_out" "$tests_out"
     if [ -n "$problems" ]; then failjob "${problems#; }"; return; fi

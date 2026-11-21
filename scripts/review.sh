@@ -12,7 +12,9 @@
 # A test review or audit gets a scratch folder, removed afterwards: it runs the tests in a copy of the
 # commit there, with the code broken on purpose, and e2e tests only under `pr-queue.sh lock`.
 # It is stopped after $REVIEW_TIMEOUT seconds (1800 for the code, 3600 for the tests: e2e runs wait for the
-# lock), and killed 30 s later if it is still running. A Ctrl-C or kill of review.sh stops the session too.
+# lock), and killed 30 s later if it is still running. A Ctrl-C or kill (TERM) of review.sh stops the session
+# too, and waits for it to end. (Started by pr-queue.sh, review.sh ignores SIGINT as a background job: the queue
+# sends it TERM.)
 # REVIEW_SKIP_TESTS=1 tells /code-review to leave the quality of tests to the test review.
 # Reviews are saved to $REVIEW_DIR (default $PR_QUEUE_DIR/reviews, the folder pr-queue.sh uses) as
 # <branch>-<sha>-<level>.md (<level>-notests.md with REVIEW_SKIP_TESTS=1) or <branch>-<sha>-tests.md.
@@ -120,11 +122,13 @@ limit="${REVIEW_TIMEOUT:-1800}"
 if [ "$mode" != code ]; then limit="${REVIEW_TIMEOUT:-3600}"; fi
 cd "$wt" || die "can't enter $wt"
 # In the background, so that a Ctrl-C or kill stops the session too: timeout runs it in a process group of
-# its own, which neither signal reaches by itself.
+# its own, which neither signal reaches by itself. The trap waits for the session (at most 30 s, then timeout
+# kills it) before the EXIT trap removes the folders it may still be using.
+session=""
+trap '[ -z "$session" ] || { kill "$session" 2>/dev/null; wait "$session"; }; die "stopped, and so was the claude -p session"' INT TERM
 timeout -k 30 "$limit" claude -p "$prompt" --output-format json --permission-mode auto \
   --disallowed-tools "Edit,Write,NotebookEdit" </dev/null >"$json" &
 session=$!
-trap 'kill "$session" 2>/dev/null; die "stopped, and so was the claude -p session"' INT TERM
 wait "$session"; rc=$?
 trap - INT TERM
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then die "the review took longer than ${limit}s (REVIEW_TIMEOUT) and was stopped"; fi

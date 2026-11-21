@@ -26,19 +26,22 @@ while [ \$# -gt 0 ]; do [ "\$1" = -f ] && f="\$2"; shift; done
 echo private > "\$f"; echo "ssh-ed25519 AAAAtest t@t" > "\$f.pub"
 EOF
   chmod +x "$BIN/sudo" "$BIN/curl" "$BIN/dpkg" "$BIN/ssh-keygen"
-  # gh stub: 'auth status' fails until 'auth login' has run and lists the signing scope after
-  # 'auth refresh'; 'api' lists keys added with 'ssh-key add'
+  # gh stub: 'auth status' fails until 'auth login' has run and lists the signing scope between
+  # 'auth refresh --scopes' and 'auth refresh --remove-scopes'; 'api user' prints the login, and only
+  # the public 'users/me/ssh_signing_keys' endpoint lists keys added with 'ssh-key add'
   cat > "$BIN/gh-stub" <<EOF
 #!/usr/bin/env bash
 echo "\${0##*/} \$*" >> "$LOG"
-case "\$1 \$2" in
-  "auth status")  [ -f "$BIN/.loggedin" ] || exit 1
-                  echo "Token scopes: 'repo'"; [ -f "$BIN/.scoped" ] && echo "'admin:ssh_signing_key'"; exit 0 ;;
-  "auth login")   : > "$BIN/.loggedin" ;;
-  "auth refresh") : > "$BIN/.scoped" ;;
-  "api "*)        cat "$BIN/.keys" 2>/dev/null ;;
-  "ssh-key add")  read -r t k _ < "\$3"; echo "\$t \$k" >> "$BIN/.keys" ;;
-  "--version ")   echo "gh version 9.9" ;;
+case "\$*" in
+  "auth status"*)  [ -f "$BIN/.loggedin" ] || exit 1
+                   echo "Token scopes: 'repo'"; [ -f "$BIN/.scoped" ] && echo "'admin:ssh_signing_key'"; exit 0 ;;
+  "auth login"*)   : > "$BIN/.loggedin" ;;
+  "auth refresh"*--remove-scopes*) $(command -v rm) -f "$BIN/.scoped" ;;
+  "auth refresh"*) : > "$BIN/.scoped" ;;
+  "api user "*)    echo me ;;
+  "api --paginate users/me/ssh_signing_keys "*) cat "$BIN/.keys" 2>/dev/null ;;
+  "ssh-key add"*)  read -r t k _ < "\$3"; echo "\$t \$k" >> "$BIN/.keys" ;;
+  "--version"*)    echo "gh version 9.9" ;;
 esac
 exit 0
 EOF
@@ -46,6 +49,8 @@ EOF
 }
 run() { PATH="$BIN" HOME="$H" GIT_CONFIG_GLOBAL="$H/.gitconfig" bash "$ROOT/scripts/setup-tools.sh"; }
 gitcfg() { git config --file "$H/.gitconfig" "$1"; }
+# line_of <text>: number of the first log line containing text (0 if none)
+line_of() { grep -nF -- "$1" "$LOG" | head -1 | cut -d: -f1 | grep . || echo 0; }
 
 # Fresh machine: installs gh and shellcheck, logs in, sets git helper, sets up signing
 setup_bin fresh
@@ -60,6 +65,9 @@ assert_contains "fresh: sets git helper"    "$log" "gh auth setup-git"
 assert_contains "fresh: creates signing key" "$log" "-t ed25519 -N  -C t@t -f $H/.ssh/id_ed25519_signing"
 assert_contains "fresh: adds signing scope" "$log" "gh auth refresh --hostname github.com --scopes admin:ssh_signing_key"
 assert_contains "fresh: uploads signing key" "$log" "gh ssh-key add $H/.ssh/id_ed25519_signing.pub --type signing"
+assert_contains "fresh: drops signing scope" "$log" "gh auth refresh --hostname github.com --remove-scopes admin:ssh_signing_key"
+assert "fresh: scope dropped after the upload" test "$(line_of "ssh-key add")" -lt "$(line_of "remove-scopes")"
+assert_not_contains "fresh: token ends without the scope" "$("$BIN/gh" auth status)" "admin:ssh_signing_key"
 assert "fresh: gpg.format ssh"     test "$(gitcfg gpg.format)" = ssh
 assert "fresh: signingkey set"     test "$(gitcfg user.signingkey)" = "$H/.ssh/id_ed25519_signing.pub"
 assert "fresh: commit.gpgsign"     test "$(gitcfg commit.gpgsign)" = true
@@ -67,7 +75,8 @@ assert "fresh: tag.gpgsign"        test "$(gitcfg tag.gpgsign)" = true
 assert "fresh: allowedSignersFile" test "$(gitcfg gpg.ssh.allowedSignersFile)" = "$H/.config/git/allowed_signers"
 assert "fresh: allowed_signers entry" test "$(cat "$H/.config/git/allowed_signers")" = "t@t ssh-ed25519 AAAAtest"
 
-# Re-run on a set-up machine: no installs, no login, no new key/scope/upload
+# Re-run on a set-up machine (key on GitHub, scope already dropped): no installs, no login,
+# no auth flow at all, no new key or upload
 : > "$LOG"
 out="$(run 2>&1)"
 log="$(cat "$LOG")"
@@ -81,6 +90,17 @@ assert_not_contains "rerun: no refresh"    "$log" "auth refresh"
 assert_not_contains "rerun: no upload"     "$log" "ssh-key add"
 assert_contains "rerun: reports key"       "$out" "signing key already on GitHub"
 assert "rerun: one allowed_signers entry"  test "$(cat "$H/.config/git/allowed_signers")" = "t@t ssh-ed25519 AAAAtest"
+
+# Leftover scope from an earlier run (key on GitHub, token still has the scope): no upload, scope dropped
+: > "$BIN/.scoped"; : > "$LOG"
+out="$(run 2>&1)"; rc=$?
+log="$(cat "$LOG")"
+assert "leftover: exits 0" test "$rc" -eq 0
+assert_not_contains "leftover: no upload"    "$log" "ssh-key add"
+assert_not_contains "leftover: no scope added" "$log" "--scopes admin:ssh_signing_key"
+assert_contains "leftover: drops the scope"  "$log" "gh auth refresh --hostname github.com --remove-scopes admin:ssh_signing_key"
+assert_contains "leftover: says why"         "$out" "shouldn't manage signing keys"
+assert_not_contains "leftover: token ends without the scope" "$("$BIN/gh" auth status)" "admin:ssh_signing_key"
 
 # No commit email: stops before creating a key or touching git config
 setup_bin noemail

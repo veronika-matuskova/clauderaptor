@@ -186,6 +186,7 @@ assert "review: PR_QUEUE_REVIEW=0 skips it"  test ! -s "$TQ/claude.log"
 assert_contains "review: skipped, still merged" "$out" "MERGED fix/skip"
 out="$(Q add --review max "$TMP/wt-skip" fix x)"; assert_contains "add: bad review level refused" "$out" "--review takes low, medium, high or xhigh"
 out="$(Q add --review)";                     assert_contains "add: --review needs a level" "$out" "pr-queue.sh add"
+out="$(PR_QUEUE_REVIEW=off Q run)";         assert_contains "run: bad PR_QUEUE_REVIEW refused" "$out" "PR_QUEUE_REVIEW must be 0 (no reviews), low"
 
 # --- e2e fails: no PR ---
 reset_pr; touch "$TQ/e2e_fail"; mkwt e2efail

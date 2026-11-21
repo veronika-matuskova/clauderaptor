@@ -12,7 +12,7 @@
 #   2. review it with scripts/review.sh: the built-in /code-review in a fresh `claude -p` session, at the job's
 #      level (add --review low|medium|high|xhigh, else $PR_QUEUE_REVIEW, else medium). "Needs changes" fails the
 #      job; the review is saved in $REVIEW_DIR (default $PR_QUEUE_DIR/reviews). A commit already reviewed as
-#      ready isn't reviewed again. PR_QUEUE_REVIEW=0 skips this step;
+#      ready at that level isn't reviewed again. PR_QUEUE_REVIEW=0 skips this step;
 #   3. if the repo has scripts/e2e-gate.mjs and the commit has no local pass: `npm run test:e2e:full`, under the lock;
 #   4. open the PR (scripts/create-pr.sh <type> "<description>" if the repo has it, else gh pr create), or push to
 #      the open one; the body is the body file (else the current one) with a "Local end-to-end run" section for
@@ -95,7 +95,7 @@ finishjob() { mv "$JOB.job" "$STATE/done/"; rm -f "$JOB.body"; }
 
 process() {
   JOB="${1%.job}"
-  local wt type desc pr sha line main_dir merged level review tries=0
+  local wt type desc pr sha line main_dir merged level review review_rc tries=0
   wt="$(field worktree "$1")"; BRANCH="$(field branch "$1")"; type="$(field type "$1")"; desc="$(field description "$1")"
   LOG="$LOGS/$BRANCH.log"; mkdir -p "$(dirname "$LOG")"
   echo "== $(date '+%F %T') $BRANCH" | tee -a "$LOG"
@@ -117,18 +117,16 @@ process() {
   # 2. Review, in a fresh session, before the e2e run is spent on it.
   if [ "${PR_QUEUE_REVIEW:-}" != 0 ]; then
     level="$(field review "$1")"; level="${level:-${PR_QUEUE_REVIEW:-medium}}"
-    review="$REVIEWS/${BRANCH//\//-}-$(git rev-parse --short HEAD).md"
-    if grep -qx 'Verdict: ready' "$review" 2>/dev/null; then
-      echo "   already reviewed $(git rev-parse --short HEAD): ready" | tee -a "$LOG"
-    else
-      echo "   reviewing $(git rev-parse --short HEAD) (/code-review $level)" | tee -a "$LOG"
-      REVIEW_DIR="$REVIEWS" "$HERE/review.sh" "$wt" "$level" >>"$LOG" 2>&1
-      case $? in
-        0) ;;
-        1) failjob "the review found changes to make (review: $review)"; return ;;
-        *) failjob "the review didn't run"; return ;;
-      esac
-    fi
+    echo "   reviewing $(git rev-parse --short HEAD) (/code-review $level)" | tee -a "$LOG"
+    review="$(REVIEW_DIR="$REVIEWS" "$HERE/review.sh" "$wt" "$level" 2>&1)"; review_rc=$?
+    printf '%s\n' "$review" >> "$LOG"
+    if grep -qx 'already reviewed as ready' <<<"$review"; then echo "   already reviewed as ready" | tee -a "$LOG"; fi
+    case $review_rc in
+      0) ;;
+      1) failjob "the review found changes to make (review: $(sed -n 's/^(saved to \(.*\))$/\1/p' <<<"$review" | tail -1))"
+         return ;;
+      *) failjob "the review didn't run: $(tail -1 <<<"$review")"; return ;;
+    esac
   fi
 
   # 3. The full local suite, once, on this exact commit.
@@ -228,6 +226,10 @@ process() {
 }
 
 run() {
+  case "${PR_QUEUE_REVIEW:-medium}" in
+    0|low|medium|high|xhigh) ;;
+    *) die "PR_QUEUE_REVIEW must be 0 (no reviews), low, medium, high or xhigh, not '$PR_QUEUE_REVIEW'" ;;
+  esac
   exec 9>"$STATE/run.lock"
   flock -n 9 || { echo "pr-queue: a runner is already working on the queue"; exit 0; }
   local job name

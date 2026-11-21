@@ -105,10 +105,82 @@ assert_contains "long review read"        "$(rv "$W")" "exit=0"
 commit 12; out="$(REVIEW_DIR='' PR_QUEUE_DIR="$TMP/queue" rv "$W")"
 assert "default folder is \$PR_QUEUE_DIR/reviews" test -f "$TMP/queue/reviews/feat-notes-$sha-medium.md"
 
+# --- the test review (--tests): the change, the instructions file, a scratch folder removed afterwards ---
+commit 13; printf 'Reviewed: feat/notes.\n1. [must-fix] [mutation] a.js:3: no test fails.\nVerdict: needs changes\n' > "$STUB/result"
+cat > "$STUB/hook" <<'EOF'
+s="$(sed -n 's/^- Scratch folder (yours, removed afterwards): //p' "$STUB/args")"
+if [ -d "$s" ]; then echo "$s" > "$STUB/scratch"; mkdir "$s/copy"; fi
+EOF
+out="$(rv --tests "$W/sub")"
+assert_contains "tests: needs changes -> exit 1" "$out" "exit=1"
+assert_contains "tests: prints the findings"  "$out" "no test fails"
+assert_contains "tests: names the saved file" "$out" "(saved to $REVIEW_DIR/feat-notes-$sha-tests.md)"
+assert_contains "tests: title, cost and time" "$(head -1 "$REVIEW_DIR/feat-notes-$sha-tests.md")" \
+  "# Test review of feat/notes at $sha (cost \$0.42, 61 s)"
+assert_contains "tests: runs in the worktree" "$(cat "$STUB/cwd")" "$W"
+args="$(cat "$STUB/args")"; mb="$(git -C "$W" merge-base main HEAD)"
+assert_contains "tests: names the change"     "$args" "git diff ${mb:0:12} $sha (against main)"
+assert_contains "tests: gives the instructions" "$args" "Mutation: break the code on purpose"
+assert_contains "tests: gives the lock command" "$args" "$ROOT/scripts/pr-queue.sh lock <command>"
+assert_contains "tests: no edit tools"        "$args" "Edit,Write,NotebookEdit"
+assert "tests: got a scratch folder"          test -s "$STUB/scratch"
+assert "tests: scratch folder removed after"  test ! -e "$(cat "$STUB/scratch")"
+rm "$STUB/hook"; printf 'No findings.\nVerdict: ready\n' > "$STUB/result"
+assert_contains "tests: ready -> exit 0"      "$(rv --tests "$W")" "exit=0"
+out="$(rv --tests "$W")"
+assert_contains "tests: ready commit not reviewed again" "$out" "already reviewed as ready"
+assert "tests: no second session"             test ! -f "$STUB/args"
+rv "$W" >/dev/null
+assert "tests: a ready test review is not a ready code review" test -f "$STUB/args"
+commit 14; git -C "$TMP/repo" update-ref refs/remotes/origin/main main
+rv --tests "$W" >/dev/null
+assert_contains "tests: against origin/main when there is one" "$(cat "$STUB/args")" "(against origin/main)"
+git -C "$TMP/repo" update-ref -d refs/remotes/origin/main
+commit 15; echo "echo x >> '$W/new.txt'" > "$STUB/hook"
+assert_contains "tests: changed worktree -> exit 2" "$(rv --tests "$W")" "moved or changed during the review"
+rm "$W/new.txt" "$STUB/hook"
+commit 16; mkdir "$TMP/bare"; cp "$ROOT/scripts/review.sh" "$TMP/bare/"
+out="$(PATH="$TMP/bin:$PATH" bash "$TMP/bare/review.sh" --tests "$W" 2>&1)"
+assert_contains "tests: instructions file missing" "$out" "missing $TMP/bare/review-tests.md"
+assert_contains "tests: needs a worktree"     "$(rv --tests)" "usage: review.sh"
+assert_contains "tests: takes no level"       "$(rv --tests "$W" high)" "usage: review.sh"
+
+# The code review leaves the quality of tests to the test review only when asked to.
+commit 17; REVIEW_SKIP_TESTS=1 rv "$W" >/dev/null
+assert_contains "REVIEW_SKIP_TESTS=1: tests left out" "$(cat "$STUB/args")" "a separate test review covers them"
+commit 18; rv "$W" >/dev/null
+assert_not_contains "by default: tests kept"  "$(cat "$STUB/args")" "a separate test review"
+
+# --- the suite audit (--suite): any checkout; the whole report saved, the summary printed ---
+M="$TMP/repo"; msha="$(git -C "$M" rev-parse --short=12 HEAD)"
+printf '%s\n' "Suite audit: repo at $msha: 2 test files, 9 tests. Tests run: tests/run.sh, passed" \
+  "Counts: mutation 1, missing 0, empty 1, duplicate 0, not atomic 0, rule 0" "Not checked: e2e" "" \
+  "1. [mutation] a.js:3: no test fails." "2. [empty] t.sh:9: asserts nothing." > "$STUB/result"
+echo "echo x >> '$M/tracked.txt'" > "$STUB/hook"
+out="$(rv --suite "$M")"
+assert_contains "suite: exit 0, edits in the checkout are fine" "$out" "exit=0"
+assert_contains "suite: prints the counts"    "$out" "Counts: mutation 1, missing 0, empty 1"
+assert_contains "suite: prints what it didn't check" "$out" "Not checked: e2e"
+assert_not_contains "suite: not the findings" "$out" "asserts nothing"
+assert_contains "suite: names the file"       "$out" "(saved to $REVIEW_DIR/repo-suite-$msha.md)"
+assert "suite: every finding saved"           grep -q "asserts nothing" "$REVIEW_DIR/repo-suite-$msha.md"
+assert_contains "suite: the task"             "$(cat "$STUB/args")" "Audit the whole test suite of one repo"
+assert_contains "suite: the instructions"     "$(cat "$STUB/args")" "## Suite audit"
+git -C "$M" checkout -q -- tracked.txt
+echo "git -C '$M' commit -q --allow-empty -m moved" > "$STUB/hook"
+assert_contains "suite: a moved HEAD -> exit 2" "$(rv --suite "$M")" "moved or changed during the review"
+rm "$STUB/hook"; printf 'I looked around.\n' > "$STUB/result"
+out="$(rv --suite "$M")"
+assert_contains "suite: no Counts line -> exit 2" "$out" "exit=2"
+assert_contains "suite: says why"             "$out" "no Counts line in the audit"
+
+printf 'Counts: mutation 0, missing 0, empty 0, duplicate 0, not atomic 0, rule 0\nVerdict: ready\n' > "$STUB/result"
 assert_contains "bad level"       "$(rv "$W" max)" "level must be low, medium, high or xhigh"
 assert_contains "not a checkout"  "$(rv "$TMP")" "is not a git checkout"
 git -C "$W" checkout -q --detach
 assert_contains "detached HEAD"   "$(rv "$W")" "is not on a branch"
+assert_contains "detached HEAD: --tests too" "$(rv --tests "$W")" "is not on a branch"
+assert_contains "detached HEAD: an audit is fine" "$(rv --suite "$W")" "exit=0"
 assert_contains "usage"           "$(rv)" "usage: review.sh"
 
 finish

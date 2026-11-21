@@ -10,7 +10,8 @@
 # For each job, `run` does, in order:
 #   1. merge origin/main into the branch (a conflict fails the job and is aborted);
 #   2. review it with scripts/review.sh: the built-in /code-review in a fresh `claude -p` session, at the job's
-#      level (add --review low|medium|high|xhigh, else $PR_QUEUE_REVIEW, else medium). "Needs changes" fails the
+#      level (add --review low|medium|high|xhigh, or none to skip it for that job; a re-queue of the branch
+#      keeps it. Else $PR_QUEUE_REVIEW, else medium). "Needs changes" fails the
 #      job; the review is saved in $REVIEW_DIR (default $PR_QUEUE_DIR/reviews). A commit already reviewed as
 #      ready at that level isn't reviewed again. PR_QUEUE_REVIEW=0 skips this step, except for jobs queued
 #      with --review;
@@ -53,7 +54,7 @@ add() {
   local review=""
   if [ "${1:-}" = --review ]; then
     review="${2:-}"; shift 2 || usage
-    case "$review" in low|medium|high|xhigh) ;; *) die "--review takes low, medium, high or xhigh, not '$review'" ;; esac
+    case "$review" in none|low|medium|high|xhigh) ;; *) die "--review takes none, low, medium, high or xhigh, not '$review'" ;; esac
   fi
   [ $# -ge 3 ] || usage
   local wt type="$2" desc="$3" body="${4:-}" branch job file
@@ -66,6 +67,16 @@ add() {
   [ -n "$(git -C "$wt" log --oneline origin/main..HEAD 2>/dev/null)" ] || die "$branch has no commits ahead of origin/main"
   if [ -z "$type" ] || [ -z "$desc" ]; then die "type and description must not be empty"; fi
   if [ -n "$body" ]; then [ -f "$body" ] || die "no such body file: $body"; fi
+  # Without --review, keep the level the branch's latest earlier job asked for (a fix after a failed review).
+  if [ -z "$review" ]; then
+    local d
+    for d in "$STATE/failed" "$RUNNING" "$QUEUE"; do
+      while read -r job; do
+        if [ -n "$job" ] && [ -n "$(field review "$job")" ]; then review="$(field review "$job")"; fi
+      done < <(jobs_for "$d" "$branch")
+    done
+    if [ -n "$review" ]; then echo "pr-queue: keeping --review $review from the earlier job"; fi
+  fi
   # Re-queueing a branch (after a fix) replaces its old job.
   while read -r job; do rm -f "$job" "${job%.job}.body"; done < <(jobs_for "$QUEUE" "$branch")
   if [ -n "$(jobs_for "$RUNNING" "$branch")" ]; then
@@ -117,7 +128,9 @@ process() {
 
   # 2. Review, in a fresh session, before the e2e run is spent on it.
   level="$(field review "$1")"
-  if [ "${PR_QUEUE_REVIEW:-}" != 0 ] || [ -n "$level" ]; then
+  if [ "$level" = none ]; then
+    echo "   not reviewed (queued with --review none)" | tee -a "$LOG"
+  elif [ "${PR_QUEUE_REVIEW:-}" != 0 ] || [ -n "$level" ]; then
     level="${level:-${PR_QUEUE_REVIEW:-medium}}"
     reviewed="$(git rev-parse HEAD)"
     echo "   reviewing $(git rev-parse --short HEAD) (/code-review $level)" | tee -a "$LOG"
@@ -150,7 +163,7 @@ process() {
     with_line "$JOB.base" "$line" > "$JOB.newbody"
     gh pr edit "$pr" --body-file "$JOB.newbody" >>"$LOG" 2>&1 || echo "   could not set the body of #$pr" | tee -a "$LOG"
     rm -f "$JOB.base" "$JOB.newbody"
-    git push -q origin "HEAD:$BRANCH" >>"$LOG" 2>&1 || { failjob "git push failed"; return; }
+    git push -q origin "$sha:refs/heads/$BRANCH" >>"$LOG" 2>&1 || { failjob "git push failed"; return; }
   elif [ -x scripts/create-pr.sh ]; then
     GH_BROWSER=true BROWSER=true scripts/create-pr.sh "$type" "$desc" </dev/null >>"$LOG" 2>&1 \
       || { failjob "scripts/create-pr.sh failed"; return; }
@@ -161,7 +174,7 @@ process() {
       rm -f "$JOB.newbody"
     fi
   else
-    git push -q -u origin "HEAD:$BRANCH" >>"$LOG" 2>&1 || { failjob "git push failed"; return; }
+    git push -q origin "$sha:refs/heads/$BRANCH" >>"$LOG" 2>&1 || { failjob "git push failed"; return; }
     if [ -f "$JOB.body" ]; then with_line "$JOB.body" "$line"; else with_line /dev/null "$line"; fi > "$JOB.newbody"
     gh pr create --base main --head "$BRANCH" --title "$type: $desc" --body-file "$JOB.newbody" >>"$LOG" 2>&1
     local rc=$?; rm -f "$JOB.newbody"

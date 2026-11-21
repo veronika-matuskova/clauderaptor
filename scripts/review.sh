@@ -2,10 +2,10 @@
 # Reviews a worktree's branch with Claude Code's built-in /code-review, in a new headless session every time,
 # so the review never carries the calling session's context:
 #   review.sh <worktree> [low|medium|high|xhigh]     (default medium; use high for migrations, auth or RLS)
-# The session runs in the worktree, so it reads the branch's own files, but loads only user settings: the
-# branch's .claude/settings.json (hooks, permissions) can't change how it is reviewed. It has no Edit or Write
-# tools, and the review fails if the worktree's files or either checkout's HEAD or branch changed meanwhile.
-# It is stopped after $REVIEW_TIMEOUT seconds (1800).
+# The session runs in the worktree, so it reads the branch's own files and its CLAUDE.md and rules (a change
+# to those is part of the diff it reviews). It has no Edit or Write tools and no stdin, and the review fails
+# if the worktree's files or either checkout's HEAD or branch changed meanwhile. It is stopped after
+# $REVIEW_TIMEOUT seconds (1800), and killed 30 s later if it is still running.
 # The review is saved to $REVIEW_DIR (default $PR_QUEUE_DIR/reviews, the folder pr-queue.sh uses) as
 # <branch>-<sha>-<level>.md. A commit already reviewed as ready at that level or a higher one isn't reviewed again.
 # Prints the findings and a last line "Verdict: ready" or "Verdict: needs changes" (an important finding
@@ -20,7 +20,7 @@ verdict() {
 # state: what must not change during a review: the worktree's HEAD and files, and where the main checkout is
 # (its files may change: someone may be working there).
 state() {
-  git -C "$wt" rev-parse HEAD; git -C "$wt" status --porcelain
+  git -C "$wt" rev-parse HEAD; git -C "$wt" branch --show-current; git -C "$wt" status --porcelain
   git -C "$main" rev-parse HEAD; git -C "$main" branch --show-current
 }
 
@@ -50,10 +50,10 @@ otherwise \"Verdict: ready\". If the skill is not available, print \"Verdict: fa
 before="$(state)"
 limit="${REVIEW_TIMEOUT:-1800}"
 cd "$wt" || die "can't enter $wt"
-json="$(timeout "$limit" claude -p "$prompt" --output-format json --permission-mode auto --setting-sources user \
-  --disallowed-tools "Edit,Write,NotebookEdit")"
+json="$(timeout -k 30 "$limit" claude -p "$prompt" --output-format json --permission-mode auto \
+  --disallowed-tools "Edit,Write,NotebookEdit" </dev/null)"
 rc=$?
-if [ "$rc" -eq 124 ]; then die "the review took longer than ${limit}s (REVIEW_TIMEOUT) and was stopped"; fi
+if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then die "the review took longer than ${limit}s (REVIEW_TIMEOUT) and was stopped"; fi
 [ "$rc" -eq 0 ] || die "claude -p failed (exit $rc)"
 [ "$(state)" = "$before" ] || die "$wt or the main checkout $main moved or changed during the review; check them and queue it again"
 

@@ -11,7 +11,7 @@ mkdir -p "$STUB"
 # Logs its cwd and args (and removes neither, so a test can tell whether it ran).
 cat > "$TMP/bin/claude" <<'EOF'
 #!/usr/bin/env bash
-pwd > "$STUB/cwd"; printf '%s\n' "$@" > "$STUB/args"
+pwd > "$STUB/cwd"; printf '%s\n' "$@" > "$STUB/args"; readlink /proc/$$/fd/0 > "$STUB/stdin"
 [ -f "$STUB/fail" ] && exit 1
 [ -f "$STUB/hook" ] && bash "$STUB/hook"
 python3 -I -c 'import json, sys; print(json.dumps({"result": open(sys.argv[1]).read(), "total_cost_usd": 0.42, "duration_ms": 61000}))' "$STUB/result"
@@ -37,7 +37,9 @@ args="$(cat "$STUB/args")"
 assert_contains "asks for the level and branch" "$args" 'args "high feat/notes"'
 assert_contains "headless JSON"           "$args" "--output-format"
 assert_contains "no edit tools"           "$args" "Edit,Write,NotebookEdit"
-assert_contains "user settings only"      "$args" "--setting-sources"$'\n'"user"
+assert_not_contains "loads the repo's CLAUDE.md (default setting sources)" "$args" "--setting-sources"
+echo x | rv "$W" high >/dev/null
+assert_contains "no stdin, even from a pipe" "$(cat "$STUB/stdin")" "/dev/null"
 assert "saves the review"                 grep -q "the save is not awaited" "$REVIEW_DIR/feat-notes-$sha-high.md"
 out="$(rv "$W" high)"
 assert "needs changes is reviewed again"  test -f "$STUB/args"
@@ -84,7 +86,9 @@ assert_contains "says what changed"       "$out" "moved or changed during the re
 assert "not saved as ready"               test ! -f "$REVIEW_DIR/feat-notes-$sha-medium.md"
 rm "$W/new.txt"; commit 8; echo "git -C '$TMP/repo' checkout -q -b other" > "$STUB/hook"
 assert_contains "main checkout switched -> exit 2" "$(rv "$W")" "moved or changed during the review"
-git -C "$TMP/repo" checkout -q main; commit 9; echo "echo x >> '$TMP/repo/tracked.txt'" > "$STUB/hook"
+git -C "$TMP/repo" checkout -q main; commit 9; echo "git -C '$W' switch -q -c other-wt" > "$STUB/hook"
+assert_contains "worktree switched branch -> exit 2" "$(rv "$W")" "moved or changed during the review"
+git -C "$W" switch -q feat/notes; echo "echo x >> '$TMP/repo/tracked.txt'" > "$STUB/hook"
 assert_contains "edits in the main checkout are fine" "$(rv "$W")" "exit=0"
 git -C "$TMP/repo" checkout -q -- tracked.txt
 commit 10; echo "sleep 5" > "$STUB/hook"

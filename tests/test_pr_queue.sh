@@ -173,6 +173,11 @@ assert_contains "review: --review high"      "$(cat "$TQ/claude.log")" 'args "hi
 assert "review: no e2e run"                  test ! -s "$TQ/npm.log"
 assert "review: no PR opened"                test ! -s "$TQ/created.log"
 assert "review: job in failed/"              in_failed bad
+rm -f "$TQ/verdict"; : > "$TQ/claude.log"
+out="$(Q add "$TMP/wt-bad" fix "Bad")";      assert_contains "re-queue keeps --review" "$out" "keeping --review high"
+out="$(Q run)"
+assert_contains "re-queue: reviewed at high again" "$(cat "$TQ/claude.log")" 'args "high fix/bad"'
+assert_contains "re-queue: then merged"      "$out" "MERGED fix/bad"
 reset_pr; touch "$TQ/claude_fail"; mkwt noreview
 Q add "$TMP/wt-noreview" fix "No review" >/dev/null; out="$(Q run)"
 assert_contains "review: claude fails"       "$out" "FAILED fix/noreview: the review didn't run"
@@ -195,7 +200,12 @@ assert_contains "review: skipped, still merged" "$out" "MERGED fix/skip"
 reset_pr; mkwt skip2
 Q add --review high "$TMP/wt-skip2" fix "Skip 2" >/dev/null; out="$(PR_QUEUE_REVIEW=0 Q run)"
 assert_contains "review: --review high still reviewed with PR_QUEUE_REVIEW=0" "$(cat "$TQ/claude.log")" 'args "high fix/skip2"'
-out="$(Q add --review max "$TMP/wt-skip" fix x)"; assert_contains "add: bad review level refused" "$out" "--review takes low, medium, high or xhigh"
+reset_pr; mkwt none
+Q add --review none "$TMP/wt-none" fix "None" >/dev/null; out="$(Q run)"
+assert "review: --review none skips it"      test ! -s "$TQ/claude.log"
+assert_contains "review: --review none says so" "$out" "not reviewed (queued with --review none)"
+assert_contains "review: --review none merged" "$out" "MERGED fix/none"
+out="$(Q add --review max "$TMP/wt-skip" fix x)"; assert_contains "add: bad review level refused" "$out" "--review takes none, low, medium, high or xhigh"
 out="$(Q add --review)";                     assert_contains "add: --review needs a level" "$out" "pr-queue.sh add"
 out="$(PR_QUEUE_REVIEW=off Q run)";         assert_contains "run: bad PR_QUEUE_REVIEW refused" "$out" "PR_QUEUE_REVIEW must be 0 (no reviews), low"
 

@@ -5,6 +5,8 @@
 - The queue reviews each branch before its e2e run: the built-in `/code-review` in a fresh `claude -p` session
   (`scripts/review.sh`). Queue migrations, auth or RLS changes with `pr-queue.sh add --review high`. A failed
   review goes back to the branch's agent, like a failed test; its findings are in the file the failure names.
+  When a branch fails its second review, the main session reads the findings and decides instead: it sends the
+  agent only what is worth fixing, or queues the branch with `--review none` to merge it without another review.
 - Shared test infrastructure (a local database stack, a mail catcher, fixed ports) stays one shared instance.
   Use it only under `~/code/clauderaptor/scripts/pr-queue.sh lock`. Don't give each worktree its own copy (memory is limited: WSL has 8 GB).
 - To make a slow suite faster, parallelize inside one run: several test workers, each with its own data

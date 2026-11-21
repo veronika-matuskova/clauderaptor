@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Tests for check-repos.sh using local bare remotes (no network) and a stub gh.
 # shellcheck source=tests/lib.sh
 source "$(dirname "$0")/lib.sh"

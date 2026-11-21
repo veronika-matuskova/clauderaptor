@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Tests for claude/statusline.py: feeds sample status JSON, checks the rendered text.
 # shellcheck source=tests/lib.sh
 source "$(dirname "$0")/lib.sh"
@@ -20,6 +21,7 @@ out="$(json | python3 "$SL" | strip)"
 assert_contains "model and effort" "$out" "Opus | xhigh |"
 assert_contains "token counts"     "$out" "150.5k/1M (15%)"
 assert_contains "duration"         "$out" "1h 2m"
+# shellcheck disable=SC2016  # literal dollar sign, not an expansion
 assert_contains "cost"             "$out" '$1.23'
 assert_contains "branch, clean"    "$out" "| main | ✓"
 assert_contains "5h limit + reset" "$out" "5h: 70% - 2h 1m"

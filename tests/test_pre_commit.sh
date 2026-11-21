@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Tests for .githooks/pre-commit: commit allowed when tests pass, blocked when they fail.
 # shellcheck source=tests/lib.sh
 source "$(dirname "$0")/lib.sh"

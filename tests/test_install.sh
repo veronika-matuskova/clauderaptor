@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Tests for install.sh, run against a copy of the repo layout so the real config is untouched.
 # shellcheck source=tests/lib.sh
 source "$(dirname "$0")/lib.sh"

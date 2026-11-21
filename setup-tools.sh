@@ -36,4 +36,42 @@ fi
 # Use gh as git's credential helper for github.com (overrides other helpers for that host only)
 gh auth setup-git
 
+# --- Sign commits and tags with an SSH key, so GitHub shows them as "Verified" ---
+# Dedicated signing-only key (GitHub won't accept it for push/auth). No passphrase, so
+# non-interactive commits (e.g. from Claude Code) can sign without a prompt.
+SIGNING_KEY="$HOME/.ssh/id_ed25519_signing"
+EMAIL="$(git config --global user.email || true)"
+if [ -z "$EMAIL" ]; then
+  echo "set your commit email first: git config --global user.email <email on your GitHub account>" >&2
+  exit 1
+fi
+if [ ! -f "$SIGNING_KEY.pub" ]; then
+  echo "creating SSH signing key $SIGNING_KEY..."
+  [ -d "$HOME/.ssh" ] || mkdir -m 700 "$HOME/.ssh"
+  ssh-keygen -q -t ed25519 -N "" -C "$EMAIL" -f "$SIGNING_KEY"
+fi
+read -r ktype kdata _ < "$SIGNING_KEY.pub"
+pubkey="$ktype $kdata"
+
+# Uploading signing keys needs an extra token scope (interactive, browser/device-code flow)
+if [[ "$(gh auth status 2>&1)" != *admin:ssh_signing_key* ]]; then
+  gh auth refresh --hostname github.com --scopes admin:ssh_signing_key
+fi
+if grep -qxF "$pubkey" <<<"$(gh api --paginate user/ssh_signing_keys --jq '.[].key')"; then
+  echo "signing key already on GitHub"
+else
+  gh ssh-key add "$SIGNING_KEY.pub" --type signing --title "$HOSTNAME commit signing"
+fi
+
+git config --global gpg.format ssh
+git config --global user.signingkey "$SIGNING_KEY.pub"
+git config --global commit.gpgsign true
+git config --global tag.gpgsign true
+# Lets `git log --show-signature` verify signatures locally
+ALLOWED="$HOME/.config/git/allowed_signers"
+mkdir -p "${ALLOWED%/*}"
+grep -qF "$pubkey" "$ALLOWED" 2>/dev/null || echo "$EMAIL $pubkey" >> "$ALLOWED"
+git config --global gpg.ssh.allowedSignersFile "$ALLOWED"
+echo "commits and tags are signed with $SIGNING_KEY"
+
 gh auth status

@@ -23,7 +23,7 @@ Per-repo overrides still go in each repo's own `CLAUDE.md` / `.claude/`.
 ## CLI tools
     ./setup-tools.sh
 
-Installs the GitHub CLI (`gh`) from its official apt repo, runs `gh auth login` (browser/device-code flow) if needed, and sets `gh` as git's credential helper for github.com. It's interactive (sudo password + login), so run it yourself in a terminal, or from Claude Code with `! ./setup-tools.sh`. Safe to re-run.
+Installs the GitHub CLI (`gh`) from its official apt repo, runs `gh auth login` (browser/device-code flow) if needed, and sets `gh` as git's credential helper for github.com. It also sets up commit/tag signing: creates a passphrase-less signing-only key `~/.ssh/id_ed25519_signing`, adds the `admin:ssh_signing_key` scope to gh (`gh auth refresh`) and uploads the key as a GitHub signing key, then sets `gpg.format=ssh`, `commit.gpgsign`, `tag.gpgsign` and `~/.config/git/allowed_signers` in your global git config. It's interactive (sudo password + login), so run it yourself in a terminal, or from Claude Code with `! ./setup-tools.sh`. Safe to re-run.
 
 ## Tests
     tests/run.sh

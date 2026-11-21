@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/mascot.png" alt="clauderaptor mascot: a cheerful orange raptor in a cream scarf" width="220"></p>
+<p align="center"><img src="docs/mascot.png" alt="clauderaptor mascot: a raptor in a safari hat and safety vest walking a pack of little raptors on leashes" width="520"></p>
 
 # clauderaptor
 

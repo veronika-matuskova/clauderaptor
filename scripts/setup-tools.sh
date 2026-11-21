@@ -53,14 +53,22 @@ fi
 read -r ktype kdata _ < "$SIGNING_KEY.pub"
 pubkey="$ktype $kdata"
 
-# Uploading signing keys needs an extra token scope (interactive, browser/device-code flow)
-if [[ "$(gh auth status 2>&1)" != *admin:ssh_signing_key* ]]; then
-  gh auth refresh --hostname github.com --scopes admin:ssh_signing_key
-fi
-if grep -qxF "$pubkey" <<<"$(gh api --paginate user/ssh_signing_keys --jq '.[].key')"; then
+# Is the key on GitHub already? The account's public list of signing keys needs no token scope,
+# so a re-run on a set-up machine starts no auth flow.
+login="$(gh api user --jq .login)"
+if grep -qxF "$pubkey" <<<"$(gh api --paginate "users/$login/ssh_signing_keys" --jq '.[].key')"; then
   echo "signing key already on GitHub"
 else
+  # Uploading needs an extra token scope (interactive, browser/device-code flow)
+  if [[ "$(gh auth status 2>&1)" != *admin:ssh_signing_key* ]]; then
+    gh auth refresh --hostname github.com --scopes admin:ssh_signing_key
+  fi
   gh ssh-key add "$SIGNING_KEY.pub" --type signing --title "$HOSTNAME commit signing"
+fi
+# Drop that scope again, also when an earlier run left it (interactive, browser/device-code flow)
+if [[ "$(gh auth status 2>&1)" == *admin:ssh_signing_key* ]]; then
+  echo "removing the admin:ssh_signing_key scope: the gh token every tool and agent uses shouldn't manage signing keys"
+  gh auth refresh --hostname github.com --remove-scopes admin:ssh_signing_key
 fi
 
 git config --global gpg.format ssh

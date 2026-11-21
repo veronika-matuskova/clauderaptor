@@ -21,10 +21,12 @@ get() { python3 -c "import json,sys; d=json.load(open('$DEST/settings.json')); p
 edit() { python3 -c "import json,sys; p='$DEST/settings.json'; d=json.load(open(p)); exec(sys.argv[1]); json.dump(d, open(p, 'w'), indent=2)" "$1"; }
 hook='d["hooks"]["SessionStart"][0]["hooks"][0]["command"]'
 
-# Pre-existing regular file is backed up, not lost
-mkdir -p "$DEST"; echo "old" > "$DEST/CLAUDE.md"
+# Pre-existing regular file and a link to somewhere else are backed up, not lost
+mkdir -p "$DEST" "$TMP/other-agents"; echo "old" > "$DEST/CLAUDE.md"; ln -s "$TMP/other-agents" "$DEST/agents"
 out="$(run)"
 assert "existing CLAUDE.md backed up" bash -c "grep -q old '$DEST'/CLAUDE.md.bak.*"
+assert "foreign link backed up as a link" bash -c "test \"\$(readlink '$DEST'/agents.bak.*)\" = '$TMP/other-agents'"
+assert_contains "foreign link: says where it pointed" "$out" "backed up $DEST/agents (it linked to $TMP/other-agents)"
 for item in CLAUDE.md statusline.py rules skills agents; do
   assert "$item is a symlink into the repo" test "$(readlink "$DEST/$item")" = "$SRC/claude/$item"
 done

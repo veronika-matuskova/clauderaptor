@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/mascot.png" alt="clauderaptor mascot: a cheerful orange raptor in a cream scarf" width="220"></p>
+
 # clauderaptor
 
 Shared Claude Code config (global instructions, rules, skills, agents, settings, status line) plus setup scripts for a WSL/Ubuntu machine.

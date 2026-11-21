@@ -6,19 +6,19 @@ source "$(dirname "$0")/lib.sh"
 mkdir -p "$TMP/bin"
 export REVIEW_DIR="$TMP/reviews" STUB="$TMP/stub"
 mkdir -p "$STUB"
-# $STUB/result: the review text to return; $STUB/fail: exit 1 instead; $STUB/touch: a file to change first.
+# $STUB/result: the review text to return; $STUB/fail: exit 1 instead; $STUB/hook: a script to run first.
 # Logs its cwd and args (and removes neither, so a test can tell whether it ran).
 cat > "$TMP/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 pwd > "$STUB/cwd"; printf '%s\n' "$@" > "$STUB/args"
 [ -f "$STUB/fail" ] && exit 1
-[ -f "$STUB/touch" ] && echo changed >> "$(cat "$STUB/touch")"
+[ -f "$STUB/hook" ] && bash "$STUB/hook"
 python3 -I -c 'import json, sys; print(json.dumps({"result": open(sys.argv[1]).read(), "total_cost_usd": 0.42, "duration_ms": 61000}))' "$STUB/result"
 EOF
 chmod +x "$TMP/bin/claude"
 rv() { rm -f "$STUB/args"; PATH="$TMP/bin:$PATH" bash "$ROOT/scripts/review.sh" "$@" 2>&1; echo "exit=$?"; }
 # commit: a new commit on the worktree's branch, so the next review isn't a cached one
-commit() { git -C "$W" commit -q --allow-empty -m "change $1"; sha="$(git -C "$W" rev-parse --short HEAD)"; }
+commit() { git -C "$W" commit -q --allow-empty -m "change $1"; sha="$(git -C "$W" rev-parse --short=12 HEAD)"; }
 
 git init -q -b main "$TMP/repo"
 echo base > "$TMP/repo/tracked.txt"; git -C "$TMP/repo" add -A; git -C "$TMP/repo" commit -q -m base
@@ -50,6 +50,8 @@ assert "no second session"                test ! -f "$STUB/args"
 assert_contains "cached: still exit 0"    "$out" "exit=0"
 out="$(rv "$W" high)"
 assert "another level is a new review"    test -f "$STUB/args"
+out="$(rv "$W" low)"
+assert_contains "a ready higher level counts" "$out" "already reviewed as ready"
 
 # The verdict is read from the last verdict line, with markdown and case ignored.
 commit 2; printf 'No findings.\n**Verdict: Ready.**\n' > "$STUB/result"
@@ -66,23 +68,31 @@ commit 6; touch "$STUB/fail"
 assert_contains "claude fails -> exit 2"  "$(rv "$W")" "claude -p failed"
 rm "$STUB/fail"
 
-# A session that changes the worktree or the main checkout fails the review, even with "ready".
+# A review fails, even with "ready", if the worktree changes or either checkout moves meanwhile;
+# editing files in the main checkout is fine. A review that hangs is stopped.
 printf 'Verdict: ready\n' > "$STUB/result"
-commit 7; echo "$W/new.txt" > "$STUB/touch"
+commit 7; echo "echo x >> '$W/new.txt'" > "$STUB/hook"
 out="$(rv "$W")"
 assert_contains "changed worktree -> exit 2" "$out" "exit=2"
-assert_contains "says what changed"       "$out" "the review session changed $W"
+assert_contains "says what changed"       "$out" "moved or changed during the review"
 assert "not saved as ready"               test ! -f "$REVIEW_DIR/feat-notes-$sha-medium.md"
-rm "$W/new.txt"; commit 8; echo "$TMP/repo/tracked.txt" > "$STUB/touch"
-assert_contains "changed main checkout -> exit 2" "$(rv "$W")" "the review session changed"
-git -C "$TMP/repo" checkout -q -- tracked.txt; rm "$STUB/touch"
+rm "$W/new.txt"; commit 8; echo "git -C '$TMP/repo' checkout -q -b other" > "$STUB/hook"
+assert_contains "main checkout switched -> exit 2" "$(rv "$W")" "moved or changed during the review"
+git -C "$TMP/repo" checkout -q main; commit 9; echo "echo x >> '$TMP/repo/tracked.txt'" > "$STUB/hook"
+assert_contains "edits in the main checkout are fine" "$(rv "$W")" "exit=0"
+git -C "$TMP/repo" checkout -q -- tracked.txt
+commit 10; echo "sleep 5" > "$STUB/hook"
+out="$(REVIEW_TIMEOUT=1 rv "$W")"
+assert_contains "hung review stopped"     "$out" "took longer than 1s"
+assert_contains "hung review -> exit 2"   "$out" "exit=2"
+rm "$STUB/hook"
 
 # A review longer than one command-line argument may be (128 KiB) is still read.
-commit 9; python3 -I -c 'print("x" * 200000); print("Verdict: ready")' > "$STUB/result"
+commit 11; python3 -I -c 'print("x" * 200000); print("Verdict: ready")' > "$STUB/result"
 assert_contains "long review read"        "$(rv "$W")" "exit=0"
 
 # Without REVIEW_DIR, reviews go where pr-queue.sh keeps them.
-commit 10; out="$(REVIEW_DIR='' PR_QUEUE_DIR="$TMP/queue" rv "$W")"
+commit 12; out="$(REVIEW_DIR='' PR_QUEUE_DIR="$TMP/queue" rv "$W")"
 assert "default folder is \$PR_QUEUE_DIR/reviews" test -f "$TMP/queue/reviews/feat-notes-$sha-medium.md"
 
 assert_contains "bad level"       "$(rv "$W" max)" "level must be low, medium, high or xhigh"

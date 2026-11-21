@@ -95,7 +95,7 @@ finishjob() { mv "$JOB.job" "$STATE/done/"; rm -f "$JOB.body"; }
 
 process() {
   JOB="${1%.job}"
-  local wt type desc pr sha line main_dir merged level review review_rc tries=0
+  local wt type desc pr sha line main_dir merged level review review_rc reviewed="" file tries=0
   wt="$(field worktree "$1")"; BRANCH="$(field branch "$1")"; type="$(field type "$1")"; desc="$(field description "$1")"
   LOG="$LOGS/$BRANCH.log"; mkdir -p "$(dirname "$LOG")"
   echo "== $(date '+%F %T') $BRANCH" | tee -a "$LOG"
@@ -117,16 +117,14 @@ process() {
   # 2. Review, in a fresh session, before the e2e run is spent on it.
   if [ "${PR_QUEUE_REVIEW:-}" != 0 ]; then
     level="$(field review "$1")"; level="${level:-${PR_QUEUE_REVIEW:-medium}}"
+    reviewed="$(git rev-parse HEAD)"
     echo "   reviewing $(git rev-parse --short HEAD) (/code-review $level)" | tee -a "$LOG"
     review="$(REVIEW_DIR="$REVIEWS" "$HERE/review.sh" "$wt" "$level" 2>&1)"; review_rc=$?
     printf '%s\n' "$review" >> "$LOG"
     if grep -qx 'already reviewed as ready' <<<"$review"; then echo "   already reviewed as ready" | tee -a "$LOG"; fi
-    case $review_rc in
-      0) ;;
-      1) failjob "the review found changes to make (review: $(sed -n 's/^(saved to \(.*\))$/\1/p' <<<"$review" | tail -1))"
-         return ;;
-      *) failjob "the review didn't run: $(tail -1 <<<"$review")"; return ;;
-    esac
+    file="$(sed -n 's/^(saved to \(.*\))$/\1/p' <<<"$review" | tail -1)"
+    if [ "$review_rc" -eq 1 ] && [ -n "$file" ]; then failjob "the review found changes to make (review: $file)"; return; fi
+    [ "$review_rc" -eq 0 ] || { failjob "the review didn't run: $(tail -1 <<<"$review")"; return; }
   fi
 
   # 3. The full local suite, once, on this exact commit.
@@ -139,6 +137,9 @@ process() {
     line="$(node scripts/e2e-gate.mjs pr-line 2>>"$LOG")" || { failjob "no local e2e pass recorded for $(git rev-parse --short HEAD)"; return; }
   fi
   sha="$(git rev-parse HEAD)"
+  if [ -n "$reviewed" ] && [ "$sha" != "$reviewed" ]; then
+    failjob "$BRANCH got commits after the review; queue it again to review them"; return
+  fi
 
   # 4. Open the PR, or update the open one. The body goes first: CI reads it when the push arrives.
   pr="$(gh pr view "$BRANCH" --json number,state -q 'select(.state=="OPEN") | .number' 2>/dev/null)"

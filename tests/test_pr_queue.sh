@@ -64,8 +64,10 @@ sha="$(git rev-parse HEAD)"
 printf 'Full end-to-end suite passed locally on `%s` (1 passed).\n' "$sha"
 EOF
 # npm run test:e2e:full: records whether it ran under the e2e lock, then passes unless $TQ/e2e_fail exists.
+# $TQ/on_e2e: a script run once, first.
 cat > "$TQ/bin/npm" <<'EOF'
 #!/usr/bin/env bash
+[ -f "$TQ/on_e2e" ] && { bash "$TQ/on_e2e"; rm -f "$TQ/on_e2e"; }
 if flock -n "$PR_QUEUE_DIR/e2e.lock" true; then echo "$* unlocked" >> "$TQ/npm.log"; else echo "$* locked" >> "$TQ/npm.log"; fi
 [ -f "$TQ/e2e_fail" ] && exit 1
 touch "$TQ/passed/$(git rev-parse HEAD)"
@@ -180,6 +182,11 @@ Q add "$TMP/wt-again" fix "Again" >/dev/null; out="$(Q run)"
 assert_contains "review: same commit not reviewed again" "$out" "already reviewed"
 assert "review: no second claude run"        test ! -s "$TQ/claude.log"
 assert_contains "review: then merged"        "$out" "MERGED fix/again"
+reset_pr; mkwt late2
+echo "echo more >> '$TMP/wt-late2/late2.txt'; git -C '$TMP/wt-late2' commit -qam more" > "$TQ/on_e2e"
+Q add "$TMP/wt-late2" fix "Late commit" >/dev/null; out="$(Q run)"
+assert_contains "review: a commit after the review fails the job" "$out" "fix/late2 got commits after the review"
+assert "review: so no PR"                    test ! -s "$TQ/created.log"
 reset_pr; mkwt skip
 Q add "$TMP/wt-skip" fix "Skip" >/dev/null; out="$(PR_QUEUE_REVIEW=0 Q run)"
 assert "review: PR_QUEUE_REVIEW=0 skips it"  test ! -s "$TQ/claude.log"

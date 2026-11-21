@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Symlinks this repo's claude/ contents into ~/.claude (backs up existing files)
+# Symlinks this repo's claude/ contents into ~/.claude (backs up existing files and links to elsewhere)
 # and builds ~/.claude/settings.json from claude/settings.json (shared, committed)
 # merged with claude/settings.local.json (this machine only, gitignored): dicts merge,
 # lists combine (as Claude Code combines them across its settings files), other values: local wins.
@@ -12,7 +12,11 @@ stamp="$(date +%Y%m%d%H%M%S)"
 
 for item in CLAUDE.md statusline.py rules skills agents; do
   target="$DEST/$item"
-  if [ -e "$target" ] && [ ! -L "$target" ]; then
+  if [ -L "$target" ] && [ "$(readlink "$target")" != "$SRC/$item" ]; then
+    # A link somewhere else (another config repo, an old checkout): keep it rather than replace it silently
+    echo "backed up $target (it linked to $(readlink "$target"))"
+    mv "$target" "$target.bak.$stamp"
+  elif [ -e "$target" ] && [ ! -L "$target" ]; then
     mv "$target" "$target.bak.$stamp"
     echo "backed up $target"
   fi

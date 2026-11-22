@@ -36,7 +36,7 @@ assert_contains "says why" "$out" "exists and is not a link"
 assert "the file is kept" test "$(cat "$B2/raptor-stats")" = mine
 
 echo "-- the link runs the app (from another folder)"
-# dashboard.sh finds stats.py and report.py through the link: stub python3 to record what it runs.
+# dashboard.sh finds stats.py, report.py and serve.py through the link: stub python3 to record what it runs.
 mkdir -p "$TMP/stub"
 cat > "$TMP/stub/python3" <<'EOF'
 #!/bin/sh
@@ -47,8 +47,10 @@ export PY_ARGV="$TMP/py.argv"
 (cd "$TMP" && PATH="$TMP/stub:$PATH" "$BIN/raptor-stats" --windows-user bob >/dev/null 2>&1); rc=$?
 assert "exit 0" test "$rc" -eq 0
 assert_contains "ingest from the app's folder" "$(cat "$PY_ARGV")" "-I -B $ROOT/apps/stats/stats.py ingest"
-assert_contains "then the report, with the arguments" "$(cat "$PY_ARGV")" \
-  "-I -B $ROOT/apps/stats/report.py --open --windows-user bob"
+assert_contains "then the report, the server and the window, with the arguments" "$(cat "$PY_ARGV")" \
+  "-I -B $ROOT/apps/stats/stats.py ingest
+-I -B $ROOT/apps/stats/report.py
+-I -B $ROOT/apps/stats/serve.py open --windows-user bob"
 
 echo "-- uninstall"
 out="$(XDG_BIN_HOME="$B2" bash "$IN" --uninstall 2>&1)"; rc=$?

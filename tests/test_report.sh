@@ -127,7 +127,14 @@ assert_not_contains "no other img" "$tags" "<img"
 assert_not_contains "no other tag with a src" "$tags" "src="
 assert_not_contains "no other tag with an href" "$tags" "href="
 assert_contains "a CSP that allows nothing but inline styles and data: images" "$H" \
-  "default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+  "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'\">"
+
+echo "-- the Refresh button, as a file"
+assert_contains "is hidden (no script shows it)" "$H" '<button id="refresh" type="button" hidden>Refresh</button>'
+assert_contains "with a note to run raptor-stats" "$T" "Refresh Last ingested: "
+assert_contains "the note" "$T" "Opened as a file: run raptor-stats to refresh."
+assert_contains "the data note says it talks only to its local server" "$T" \
+  "loads nothing from the network. Opened by raptor-stats, it talks only to its own local server (serve.py, on 127.0.0.1), for Refresh."
 
 echo "-- escaping"
 assert_contains "a hostile branch name is escaped" "$H" "&lt;script&gt;alert(1)&lt;/script&gt;"
@@ -479,6 +486,30 @@ assert "exits non-zero" test "$rc" -ne 0
 assert_contains "with the error" "$out" "disk full"
 assert "leaves no temp file" test -z "$(find "$TMP/out" -name '.report-*')"
 assert "leaves the old report as it was" cmp -s "$OUT" "$TMP/before.html"
+
+echo "-- served_page: the page as serve.py serves it"
+N=nonceNONCEnonce1234; K=tokenTOKENtoken-_123456
+out="$(N=$N K=$K OUTF="$OUT" py 'import os
+print(r.served_page(open(os.environ["OUTF"]).read(), os.environ["N"], os.environ["K"]))')"
+assert_contains "the meta CSP gets the nonce and the server" "$out" \
+  "content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; script-src 'nonce-$N'; connect-src 'self'\">"
+assert_not_contains "and no longer the file's" "$out" "form-action 'none'\">"
+assert "one script" test "$(grep -o '<script' <<<"$out" | wc -l)" -eq 1
+assert_contains "with the nonce, at the end of the body" "$out" "<script nonce=\"$N\">"
+assert_contains "the token in it" "$out" "var T = \"$K\""
+assert_contains "the script is last in the body" "$out" "})();</script></body></html>"
+assert_contains "still escaped" "$out" "&lt;script&gt;alert(1)&lt;/script&gt;"
+for bad in "x\"y-1234567890123456" "short"; do
+  assert_contains "refuses a nonce like $bad" "$(B="$bad" OUTF="$OUT" py 'import os
+try:
+    r.served_page(open(os.environ["OUTF"]).read(), os.environ["B"], "tokenTOKENtoken-_123456")
+except ValueError as ex:
+    print("ValueError", ex)')" "ValueError"
+done
+assert_contains "refuses a page that is not a report" "$(py 'try:
+    r.served_page("<html><body></body></html>", "nonceNONCEnonce1234", "tokenTOKENtoken-_123456")
+except ValueError as ex:
+    print("ValueError", ex)')" "ValueError not a report page"
 
 echo "-- compact numbers"
 assert_contains "in full under 10,000, compact from it" "$(py 'print(" ".join(r.compact(v) for v in (9999, 10000, 12345, 999949, 999950, 1000000, 2500000000, 1.5)))')" \

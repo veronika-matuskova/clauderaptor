@@ -166,7 +166,11 @@ assert "a made-up ticket: 403" test "$(code "$PORT" GET "/?k=${tk%?}x")" = 403
 assert "the token as a ticket: 403" test "$(code "$PORT" GET "/?k=$TOKEN")" = 403
 
 echo "-- refresh picks up new data"
+assert_contains "no sessions yet" "$(body "$PORT" GET "/?t=$TOKEN")" '<tr><td>sessions</td><td class="num">0</td></tr>'
 event 2
+# a transcript in --projects: the ingest reads it from there ($HOME/.claude/projects stays empty)
+printf '%s\n' '{"type":"assistant","timestamp":"2026-10-02T10:00:00.000Z","sessionId":"s1","cwd":"/x","message":{"id":"m1","model":"claude-opus-4-1","usage":{"input_tokens":5,"output_tokens":7}}}' \
+  > "$TMP/projects/p/s1.jsonl"
 R="$(req "$PORT" POST /refresh "X-Raptor-Token: $TOKEN" "Origin: http://127.0.0.1:$PORT")"
 assert "200" test "$(head -1 <<<"$R")" = 200
 assert_contains "ok" "$R" '{"ok": true, "message": "refreshed"}'
@@ -174,6 +178,10 @@ assert_contains "the page has the new numbers" "$(body "$PORT" GET "/?t=$TOKEN")
 assert_contains "and so does the file" "$(cat "$OUT")" 'Merged branches</div><div class="tv">2<'
 assert_not_contains "which has no script" "$(cat "$OUT")" "<script"
 assert "and stays 0600" test "$(stat -c %a "$OUT")" = 600
+assert_contains "the ingest read --projects" "$(body "$PORT" GET "/?t=$TOKEN")" '<tr><td>sessions</td><td class="num">1</td></tr>'
+assert_contains "the page shows a failed refresh's error, and reloads only on ok" "$(body "$PORT" GET "/?t=$TOKEN")" \
+  'if (r.ok && j.ok) { location.reload(); return; }
+        say("Refresh failed: " + (j.error || "HTTP " + r.status));'
 
 echo "-- a failed refresh"
 cp "$DB" "$TMP/db.bak"
@@ -186,6 +194,23 @@ assert_not_contains "no path" "$(sed '1,/^$/d' <<<"$R")" "/"
 assert_contains "the log has the details" "$(cat "$SD.log")" "Traceback"
 cp "$TMP/db.bak" "$DB"
 assert "and the next refresh works" test "$(code "$PORT" POST /refresh "X-Raptor-Token: $TOKEN")" = 200
+
+echo "-- a failed rebuild, a missing report, a file that is not a report"
+mv "$OUT" "$TMP/report.bak"; mkdir "$OUT"  # report.py can't replace a folder
+R="$(req "$PORT" POST /refresh "X-Raptor-Token: $TOKEN")"
+assert "a failed rebuild: 500" test "$(head -1 <<<"$R")" = 500
+assert_contains "says so" "$R" '{"ok": false, "error": "the rebuild failed (exit 1); see serve.log in the stats folder"}'
+rmdir "$OUT"
+R="$(req "$PORT" GET "/?t=$TOKEN")"
+assert "no report file: 503" test "$(head -1 <<<"$R")" = 503
+assert_contains "says to run raptor-stats" "$R" "no report yet: run raptor-stats"
+echo '<html><body>not the report</body></html>' > "$OUT"
+R="$(req "$PORT" GET "/?t=$TOKEN")"
+assert "a file that is not a report page: 500" test "$(head -1 <<<"$R")" = 500
+assert_contains "says so" "$R" "the report file is not a report page"
+assert_not_contains "and doesn't serve it" "$R" "not the report"
+mv "$TMP/report.bak" "$OUT"
+assert "the report again: 200" test "$(code "$PORT" GET "/?t=$TOKEN")" = 200
 
 echo "-- one refresh at a time"
 mkfifo "$HOLD"  # the ingest's git waits on it until the test writes
@@ -258,6 +283,44 @@ while [ "$(date +%s%N)" -lt "$end" ] && alive "$PID"; do  # requests that fail t
 done
 assert "requests without the token don't keep it up: it stops while they come" test -z "$(alive "$PID" && echo up)"
 gone "$PID"
+
+echo "-- a refresh longer than --idle"
+: > "$SD2.log"
+start_server "$SD2" --idle 2
+mkfifo "$HOLD"
+cat > "$TMP/long.py" <<'EOF'
+import errno, http.client, os, sys, threading, time
+port, token, fifo = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+res = {}
+def refresh():
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+    c.request("POST", "/refresh", headers={"X-Raptor-Token": token})
+    res["status"] = c.getresponse().status
+t = threading.Thread(target=refresh)
+t.start()
+fd, deadline = None, time.monotonic() + 30
+while fd is None and time.monotonic() < deadline:
+    try:
+        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as e:
+        if e.errno != errno.ENXIO:
+            raise
+        time.sleep(0.05)
+if fd is None:
+    sys.exit("the ingest never ran git")
+time.sleep(5)  # the ingest is held for over twice --idle, with no other request
+os.unlink(fifo)
+os.write(fd, b"go\n")
+os.close(fd)
+t.join(60)
+print("refresh", res.get("status"))
+EOF
+out="$(timeout 90 python3 -I -B "$TMP/long.py" "$PORT" "$TOKEN" "$HOLD" 2>&1)"
+assert_contains "the refresh answers" "$out" "refresh 200"
+assert_not_contains "the idle watch left the server alone while it ran" "$(cat "$SD2.log")" "stopping"
+assert "the server is still up right after it" alive "$PID"
+assert "and stops when idle after it" gone "$PID"
+rm -f "$HOLD"
 
 echo "-- open: a new server, then the same one again"
 cat > "$TMP/bin/wslpath" <<'EOF'

@@ -506,6 +506,13 @@ try:
 except ValueError as ex:
     print("ValueError", ex)')" "ValueError"
 done
+for bad in 'tok"en</script><script>alert(1)//' "short"; do
+  assert_contains "refuses a token like $bad" "$(B="$bad" OUTF="$OUT" py 'import os
+try:
+    print(r.served_page(open(os.environ["OUTF"]).read(), "nonceNONCEnonce1234", os.environ["B"])[-200:])
+except ValueError as ex:
+    print("ValueError", ex)')" "ValueError a nonce and a token are token_urlsafe strings"
+done
 assert_contains "refuses a page that is not a report" "$(py 'try:
     r.served_page("<html><body></body></html>", "nonceNONCEnonce1234", "tokenTOKENtoken-_123456")
 except ValueError as ex:

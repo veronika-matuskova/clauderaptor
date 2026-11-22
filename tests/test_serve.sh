@@ -110,6 +110,12 @@ assert_contains "the script shows it" "$R" "b.hidden = false;"
 assert_contains "Last ingested in the header" "$R" '<span class="sub">Last ingested: '
 assert_not_contains "no inline handlers" "$R" " onclick="
 assert_contains "not cached" "$R" "Cache-Control: no-store"
+assert_contains "not in a frame" "$R" "X-Frame-Options: DENY"
+assert_contains "no referrer (the URL holds the token)" "$R" "Referrer-Policy: no-referrer"
+assert_contains "no sniffing" "$R" "X-Content-Type-Options: nosniff"
+J="$(req "$PORT" POST /heartbeat "X-Raptor-Token: $TOKEN")"
+assert_contains "a JSON reply: no sniffing" "$J" "X-Content-Type-Options: nosniff"
+assert_contains "a JSON reply: no referrer" "$J" "Referrer-Policy: no-referrer"
 nonce2="$(req "$PORT" GET "/?t=$TOKEN" | sed -n "s/^Content-Security-Policy:.*'nonce-\([A-Za-z0-9_-]*\)'.*/\1/p")"
 assert "a new nonce for each page" test -n "$nonce2" -a "$nonce2" != "$nonce"
 assert_contains "the page has the db's numbers" "$R" 'Merged branches</div><div class="tv">1<'
@@ -337,10 +343,13 @@ export EDGE_ARGV="$TMP/edge.argv"
 # shellcheck disable=SC2329 # called through assert
 wait_argv() { for _ in $(seq 50); do [ -f "$EDGE_ARGV" ] && return 0; sleep 0.1; done; return 1; }
 sopen() { PATH="$TMP/bin:$PATH" STATS_EDGE="$TMP/bin/msedge.exe" python3 -I -B "$SV" open --db "$DB" --idle 60 "$@" 2>&1; }
-out="$(sopen)"; rc=$?
+out="$(sopen --idle 61 --projects "$TMP/projects")"; rc=$?
 P1="$(state "$SD" pid)"; PORT="$(state "$SD" port)"; TOKEN="$(state "$SD" token)"; echo "$P1" >> "$TMP/pids"
 assert "exit 0" test "$rc" -eq 0
-assert_contains "starts a server" "$out" "report: serving it at http://127.0.0.1:$PORT/ (pid $P1; it stops 60 s after its last request)"
+assert_contains "starts a server" "$out" "report: serving it at http://127.0.0.1:$PORT/ (pid $P1; it stops 61 s after its last request)"
+args="$(tr '\0' '\n' < "/proc/$P1/cmdline")"
+assert_contains "and passes it --idle" "$args" $'\n--idle\n61\n'
+assert_contains "and --projects" "$args" $'\n--projects\n'"$TMP/projects"
 assert_contains "and opens Edge" "$out" "report: opening it in an Edge app window"
 assert "the server runs" alive "$P1"
 assert "Edge started" wait_argv

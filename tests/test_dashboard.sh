@@ -1,10 +1,10 @@
 # shellcheck shell=bash
-# Tests for scripts/stats/dashboard.sh: ingest into the default db, then the report opened, with msedge.exe and
+# Tests for apps/stats/dashboard.sh: ingest into the default db, then the report opened, with msedge.exe and
 # wslpath stubbed (the real Edge never starts).
 # shellcheck source=tests/lib.sh
 source "$(dirname "$0")/lib.sh"
 
-DS="$ROOT/scripts/stats/dashboard.sh"
+DS="$ROOT/apps/stats/dashboard.sh"
 export TZ=UTC PR_QUEUE_DIR="$TMP/state" XDG_STATE_HOME="$TMP/xdg" STATS_WINDOWS_USERS_DIR="$TMP/users"
 export STATS_EDGE="$TMP/bin/msedge.exe" EDGE_ARGV="$TMP/edge.argv"
 unset REVIEW_DIR STATS_EVENTS_FILE CLAUDERAPTOR_STATS_DIR CLAUDERAPTOR_WINDOWS_USER

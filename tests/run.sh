@@ -13,7 +13,7 @@ for t in tests/test_*.sh; do
 done
 if command -v shellcheck >/dev/null 2>&1; then
   echo "== shellcheck"
-  if shellcheck -x scripts/*.sh scripts/*/*.sh tests/*.sh .githooks/pre-commit; then echo "  ok   no warnings"; else failed=$((failed + 1)); fi
+  if shellcheck -x scripts/*.sh scripts/*/*.sh apps/*/*.sh tests/*.sh .githooks/pre-commit; then echo "  ok   no warnings"; else failed=$((failed + 1)); fi
 else
   echo "== shellcheck not installed, skipped (run scripts/setup/setup-tools.sh)"
 fi

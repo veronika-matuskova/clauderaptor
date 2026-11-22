@@ -622,6 +622,11 @@ echo "-- compact numbers"
 assert_contains "in full under 10,000, compact from it" "$(py 'print(" ".join(r.compact(v) for v in (9999, 10000, 12345, 999949, 999950, 1000000, 2500000000, 1.5)))')" \
   "9,999 10K 12.3K 999.9K 1M 1M 2.5B 1.50"
 
+echo "-- ago: how long, in the Queue now section"
+assert_contains "seconds, minutes, hours and days, at each boundary" \
+  "$(py 'print(" | ".join(r.ago(v) for v in (-3, 0, 5, 59, 60, 3599, 3600, 86399, 86400, 90000, 172799)))')" \
+  "0 s | 0 s | 5 s | 59 s | 1 min | 59 min | 1 h 00 min | 23 h 59 min | 1 d 0 h | 1 d 1 h | 1 d 23 h"
+
 echo "-- no bytecode in the checkout"
 assert "no __pycache__ in scripts/" test -z "$(find "$ROOT/scripts" -name __pycache__)"
 

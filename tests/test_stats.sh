@@ -12,10 +12,10 @@ R="$PR_QUEUE_DIR/reviews"; EV="$PR_QUEUE_DIR/events.jsonl"
 mkdir -p "$R" "$PR_QUEUE_DIR/repos/app" "$PR_QUEUE_DIR/repos/tool/failed" "$TMP/out"
 DB="$TMP/out/stats.db"
 
-ingest() { python3 -I "$ST" ingest --db "${1:-$DB}" 2>&1; }
+ingest() { python3 -I -B "$ST" ingest --db "${1:-$DB}" 2>&1; }
 # q <sql>: the rows, one per line, columns joined by |
 q() {
-  python3 -I -c 'import sqlite3, sys
+  python3 -I -B -c 'import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
 for r in c.execute(sys.argv[2]):
     print("|".join("" if v is None else str(v) for v in r))
@@ -159,12 +159,12 @@ assert "tests skipped: the sidecar's tests_skipped wins" test "$(q "$T = 'feat-c
 assert "tests skipped: null for other kinds" test "$(q "$T = 'feat-a-111111111111-tests.md'")" = null
 echo "-- file modes and the default db"
 assert "db is 0600" test "$(stat -c %a "$DB")" = 600
-python3 -I "$ST" ingest >/dev/null 2>&1
+python3 -I -B "$ST" ingest >/dev/null 2>&1
 SD="$XDG_STATE_HOME/clauderaptor-stats"
 assert "default db in \$XDG_STATE_HOME/clauderaptor-stats" test -f "$SD/stats.db"
 assert "stats dir created 0700" test "$(stat -c %a "$SD")" = 700
 assert "default db 0600" test "$(stat -c %a "$SD/stats.db")" = 600
-CLAUDERAPTOR_STATS_DIR="$TMP/custom/stats" python3 -I "$ST" ingest >/dev/null 2>&1
+CLAUDERAPTOR_STATS_DIR="$TMP/custom/stats" python3 -I -B "$ST" ingest >/dev/null 2>&1
 assert "CLAUDERAPTOR_STATS_DIR wins" test -f "$TMP/custom/stats/stats.db"
 assert "custom stats dir 0700" test "$(stat -c %a "$TMP/custom/stats")" = 700
 
@@ -315,7 +315,7 @@ assert "schema version recorded once" test "$(q "SELECT COUNT(*) || ':' || MAX(v
 
 echo "-- a version 1 db is migrated"
 DB2="$TMP/out/v1.db"
-python3 -I -c 'import sqlite3, sys
+python3 -I -B -c 'import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
 c.executescript("""
 CREATE TABLE schema_version (version INTEGER NOT NULL); INSERT INTO schema_version VALUES (1);
@@ -340,5 +340,9 @@ assert "migrated: review files read again, rulings filled" test "$(q "SELECT COU
 assert "migrated: tests_skipped filled" test "$(q "SELECT tests_skipped FROM reviews WHERE id = 'feat-c-444444444444-low.md'")" = 1
 assert "migrated: the views are the new ones" test "$(q "SELECT group_concat(DISTINCT kind) FROM v_findings_by_severity")" = "code,tests"
 unset DB2
+
+echo "-- no bytecode in the checkout"
+# Run as a script and imported (the py helper), stats.py leaves no __pycache__ next to it.
+assert "no __pycache__ in scripts/" test -z "$(find "$ROOT/scripts" -name __pycache__)"
 
 finish

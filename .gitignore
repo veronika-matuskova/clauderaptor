@@ -10,3 +10,6 @@ tasks/*
 
 # Skills synced from claude.ai (written by Claude Code via the skills symlink)
 claude/skills/synced/
+
+# Python bytecode (a review session that imports scripts/stats/stats.py would write it)
+__pycache__/

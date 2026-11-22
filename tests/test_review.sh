@@ -69,6 +69,7 @@ assert_contains "headless JSON"           "$args" "--output-format"
 assert_contains "no edit tools"           "$args" "Edit,Write,NotebookEdit"
 assert_contains "loads none of the branch's config" "$args" "--safe-mode"
 assert_contains "names the rules in the prompt" "$args" 'rules under "Rules for this review" in your system prompt'
+assert_contains "the verdict goes by those rules" "$args" 'important or breaks one of the rules under "Rules for this review" in your system prompt'
 sp="$(cat "$STUB/sysprompt")"; mb="$(git -C "$W" merge-base main HEAD)"
 assert_contains "rules: from the base commit"   "$sp" "the repo's at commit ${mb:0:12} (the base of the change, against main)"
 assert_contains "rules: the base's CLAUDE.md"   "$sp" "Base rule: tests live in tests/."

@@ -8,15 +8,23 @@ unset CAP_TASKS CAP_MEMORY CAP_TOTAL_TASKS CAP_TOTAL_MEMORY
 
 BIN="$TMP/bin"; mkdir -p "$BIN"
 export NO_SYSTEMD="$TMP/no_systemd" NO_SWAP_CAP="$TMP/no_swap_cap" NO_SLICE_CAP="$TMP/no_slice_cap"
+export EXPANDS="$TMP/expands"
 # $NO_SYSTEMD: every call fails; $NO_SWAP_CAP: a call that sets MemorySwapMax fails; $NO_SLICE_CAP: setting
-# capped.slice's cap fails.
+# capped.slice's cap fails. $EXPANDS: a newer systemd-run, which has --expand-environment and, without
+# --expand-environment=no, expands ${...} (to nothing here) and $$ in the command's arguments.
 cat > "$BIN/systemd-run" <<'EOF'
 #!/usr/bin/env bash
+if [ "$1" = --help ]; then [ -f "$EXPANDS" ] && echo "  --expand-environment=BOOL"; exit 0; fi
 echo "systemd-run $*" >> "$LOG"
 [ -f "$NO_SYSTEMD" ] && exit 1
 [ -f "$NO_SWAP_CAP" ] && [[ "$*" == *MemorySwapMax* ]] && exit 1
+[ -f "$EXPANDS" ] && [[ " $* " != *" --expand-environment=no "* ]] && expand=1
 while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done
-shift; exec "$@"
+shift
+if [ -n "${expand:-}" ]; then
+  shopt -s extglob; args=(); for a in "$@"; do a="${a//\$\{*([^\}])\}/}"; args+=("${a//\$\$/\$}"); done; set -- "${args[@]}"
+fi
+exec "$@"
 EOF
 cat > "$BIN/systemctl" <<'EOF'
 #!/usr/bin/env bash
@@ -71,6 +79,12 @@ CAP_TASKS=7 CAP_MEMORY=100M CAP_TOTAL_TASKS=9 CAP_TOTAL_MEMORY=1G C true
 assert_contains "CAP_TASKS and CAP_MEMORY"  "$(cat "$LOG")" "-p TasksMax=7 -p MemoryMax=100M"
 assert_contains "CAP_TOTAL_TASKS and CAP_TOTAL_MEMORY" "$(cat "$LOG")" "capped.slice TasksMax=9 MemoryMax=1G"
 assert_contains "arguments kept as they are" "$(C printf '%s|' 'a b' '' c)" "a b||c|"
+# A newer systemd-run: --expand-environment=no, in the check and the real call, so ${...} and $$ stay as they are.
+newlog expand; touch "$EXPANDS"
+out="$(C printf '%s|' '${HOME}' 'a$$b')"
+rm -f "$EXPANDS"
+assert_contains "newer systemd-run: \${...} and \$\$ kept" "$out" '${HOME}|a$$b|'
+assert "newer systemd-run: the check and the call" test "$(grep -c -- 'TimeoutStopSec=10 --expand-environment=no -- ' "$LOG")" = 2
 
 # Inside another capped command, a scope of its own too.
 newlog nested
@@ -141,6 +155,7 @@ if [ -z "$(env -u CAP_OFF bash "$ROOT/scripts/capped.sh" true 2>&1)" ]; then
   assert_contains "real: the caps apply"      "$out" "pids.max=30 memory.max=314572800 swap.max=0"
   assert_contains "real: the overall cap applies" "$out" "slice=capped.slice pids.max=4000 memory.max=5368709120 swap.max=0"
   assert_contains "real: a nested call, in capped.slice too" "$out" "nested: a scope of its own in capped.slice"
+  assert_contains "real: \${...} and \$\$ kept"  "$(env -u CAP_OFF bash "$ROOT/scripts/capped.sh" printf '%s|' '${HOME}' 'a$$b')" '${HOME}|a$$b|'
   assert_contains "real: a setsid child stays in the scope" "$out" "setsid child in the scope"
   assert "real: nothing left running"         test -z "$(pgrep -f "^sleep $m")"
   m="601.$$"

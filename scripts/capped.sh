@@ -13,6 +13,8 @@
 # without end, stay inside that cap, and so do several capped commands at the same time.
 # When capped.sh ends, also by a SIGKILL, whatever is still running in the scope is stopped (TERM, then KILL
 # after 10 s): a watcher outside its process group stops the scope if capped.sh dies without cleaning up.
+# The command gets its arguments as they are: newer systemd-run (e.g. 259) expands ${...} and $$ in them, as
+# in ExecStart=, so capped.sh turns that off where systemd-run has --expand-environment.
 # CAP_OFF=1 runs the command as it is (the tests set it: each test file already runs under a cap of its own).
 # Without a systemd user instance that can apply the caps (e.g. in CI), the command runs uncapped, with a warning.
 # Exit code: the command's; 2 if no command was given.
@@ -21,10 +23,11 @@ set -uo pipefail
 if [ -n "${CAP_OFF:-}" ]; then exec "$@"; fi
 caps=(-p TasksMax="${CAP_TASKS:-2000}" -p MemoryMax="${CAP_MEMORY:-4G}" -p MemorySwapMax=0 -p TimeoutStopSec=10)
 total=(TasksMax="${CAP_TOTAL_TASKS:-4000}" MemoryMax="${CAP_TOTAL_MEMORY:-5G}" MemorySwapMax=0)
+keep=(); [[ "$(systemd-run --help 2>/dev/null)" != *--expand-environment* ]] || keep=(--expand-environment=no)
 # The check sets the overall cap and applies the same caps, so a cap systemd can't set means no cap rather
 # than no command.
 if ! systemctl --user set-property --runtime capped.slice "${total[@]}" >/dev/null 2>&1 ||
-   ! systemd-run --user --scope --quiet --slice=capped.slice "${caps[@]}" -- true >/dev/null 2>&1; then
+   ! systemd-run --user --scope --quiet --slice=capped.slice "${caps[@]}" "${keep[@]}" -- true >/dev/null 2>&1; then
   echo "capped: no systemd user instance that can apply the caps, so '${*:1:2}' runs without a cap" >&2
   exec "$@"
 fi
@@ -33,4 +36,4 @@ trap 'systemctl --user stop "$unit.scope" >/dev/null 2>&1' EXIT
 # shellcheck disable=SC2016  # $1 and $2 expand in the watcher
 setsid bash -c 'tail --pid="$1" -f /dev/null; systemctl --user stop "$2.scope"' _ "$$" "$unit" \
   </dev/null >/dev/null 2>&1 &
-systemd-run --user --scope --quiet --collect --slice=capped.slice --unit="$unit" "${caps[@]}" -- "$@"
+systemd-run --user --scope --quiet --collect --slice=capped.slice --unit="$unit" "${caps[@]}" "${keep[@]}" -- "$@"

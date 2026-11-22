@@ -88,7 +88,7 @@ assert_contains "noemail: says what to set" "$OUT" "FAIL  no git user.email: git
 assert_contains "noemail: name still ok" "$OUT" "ok    user.name: t"
 
 setup nosign; git config --file "$G" commit.gpgsign false; check
-assert_contains "nosign: signing off" "$OUT" "FAIL  commit signing isn't set up"
+assert_contains "nosign: signing off" "$OUT" "FAIL  commit signing isn't set up: run scripts/setup/setup.sh tools"
 setup noformat; git config --file "$G" --unset gpg.format; check
 assert "noformat: exits 1" [ "$RC" -eq 1 ]
 assert_contains "noformat: a key without gpg.format=ssh isn't signing" "$OUT" "FAIL  commit signing isn't set up"
@@ -112,7 +112,7 @@ setup nogh; rm "$BIN/gh"; check
 assert "nogh: one FAIL, no login check" [ "$RC" -eq 1 ]
 assert_contains "nogh: gh" "$OUT" "FAIL  gh not found"
 setup ghout; : > "$BIN/.gh-out"; check
-assert_contains "ghout: not logged in" "$OUT" "FAIL  gh isn't logged in"
+assert_contains "ghout: not logged in" "$OUT" "FAIL  gh isn't logged in: run scripts/setup/setup.sh tools"
 
 setup nonode; rm "$BIN/node"; check
 assert "nonode: only a warning" [ "$RC" -eq 0 ]
@@ -132,7 +132,7 @@ ln -sfn "$D/elsewhere" "$H/.claude/agents"; rm "$H/.claude/settings.json"; check
 assert "noinstall: exits 2" [ "$RC" -eq 2 ]
 assert_contains "noinstall: lists each link" "$OUT" \
   "FAIL  in $H/.claude: statusline.py is a broken link; rules isn't a link; agents is a broken link: run scripts/setup/install.sh"
-assert_contains "noinstall: settings" "$OUT" "FAIL  no $H/.claude/settings.json"
+assert_contains "noinstall: settings" "$OUT" "FAIL  no $H/.claude/settings.json: run scripts/setup/install.sh"
 setup otherlink; mkdir -p "$D/x/stuff"; ln -sfn "$D/x/stuff" "$H/.claude/skills"; check
 assert_contains "otherlink: a link outside claude/" "$OUT" "skills links to $D/x/stuff"
 

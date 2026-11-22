@@ -861,6 +861,34 @@ echo "$TMP/g/nogit" > "$S9/repos/app/checkout"
 PR_QUEUE_DIR="$S9" ingest "$DB9" >/dev/null
 assert "a repo whose git fails keeps its rows" test "$(Q9 "SELECT COUNT(*) FROM main_commits WHERE repo = 'app'")" -eq 9
 
+echo "-- git: fixes before or with a merge, shared titles, a fix: subject of a feat/ branch"
+S11="$TMP/state11"; G="$TMP/g/lib"; DB11="$TMP/out/eleven.db"
+mkdir -p "$S11/reviews" "$S11/repos/lib/done" "$S11/repos/lib/failed" "$G"
+echo "$G" > "$S11/repos/lib/checkout"
+git -C "$G" init -q -b main
+printf 'worktree=/w/lib-p\nbranch=feat/p\ntype=feat\ndescription=add p\n' > "$S11/repos/lib/done/1-feat-p.job"
+# Two branches' job files with one title: its squash commit gets no branch.
+printf 'worktree=/w/lib-s1\nbranch=feat/s1\ntype=chore\ndescription=same title\n' > "$S11/repos/lib/done/2-feat-s1.job"
+printf 'worktree=/w/lib-s2\nbranch=feat/s2\ntype=chore\ndescription=same title\n' > "$S11/repos/lib/failed/3-feat-s2.job"
+# A feat/ branch merged under a "fix: ..." subject: not a fix.
+printf 'worktree=/w/lib-f\nbranch=feat/fixy\ntype=fix\ndescription=tidy p\n' > "$S11/repos/lib/done/4-feat-fixy.job"
+gc 2026-11-01T10:00:00+01:00 "fix: early p" p.txt
+gc 2026-11-02T10:00:00+01:00 "feat: add p (#1)" p.txt
+gc 2026-11-02T10:00:00+01:00 "fix: same time p" p.txt
+gc 2026-11-03T10:00:00+01:00 "chore: same title (#2)" s.txt
+gc 2026-11-04T10:00:00+01:00 "fix: tidy p (#3)" p.txt
+{ for b in feat/p feat/s1 feat/fixy; do
+    printf '{"v":1,"ts":"2026-11-08T10:00:00.000Z","event":"merged","repo":"lib","branch":"%s","job_id":"m-%s"}\n' "$b" "${b//\//-}"
+  done; } > "$S11/events.jsonl"
+PR_QUEUE_DIR="$S11" ingest "$DB11" >/dev/null
+Q11() { DB2="$DB11" q "$1"; }
+assert "a shared title: no branch; a feat/ branch's fix: subject: kind other; a fix: of no branch: fix" \
+  test "$(Q11 "SELECT group_concat(subject || '|' || ifnull(branch, '-') || '|' || kind, ', ') FROM (SELECT * FROM main_commits ORDER BY ts, subject)")" \
+  = "fix: early p|-|fix, feat: add p (#1)|feat/p|other, fix: same time p|-|fix, chore: same title (#2)|-|other, fix: tidy p (#3)|feat/fixy|other"
+assert "escaped: not by a fix merged before the branch or at the same time, nor by a feat/ branch's fix: subject" \
+  test "$(Q11 "SELECT group_concat(branch || ':' || ifnull(fixed_by, '-'), ' ') FROM (SELECT * FROM v_escaped_defects ORDER BY branch)")" \
+  = "feat/fixy:- feat/p:-"
+
 echo "-- flaky CI checks"
 S10="$TMP/state10"; mkdir -p "$S10/reviews"
 # ck <ts> <event> <job> <branch> <sha> [<result>]

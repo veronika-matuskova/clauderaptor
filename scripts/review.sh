@@ -33,11 +33,12 @@
 # and exits 0, or 2 if it didn't run.
 # A judge gets the review files (the ones that need changes) and the branch's earlier judgements, decides for
 # each blocking finding whether it is real and worth fixing, and lists what the agent must fix. It is saved
-# as <branch>-<sha>-judge.md; a commit already judged ready isn't judged again. Its last verdict line is
-# "ready" (exit 0: nothing to fix), "needs changes" (exit 1: the To fix list goes to the agent) or "escalate"
-# (exit 3: it rejected a finding that would be critical if real, and the user decides). "Needs changes" in a
-# second judgement of the branch (another commit's judgement needed changes too) also exits 3: after two
-# judged rounds the user decides, not the queue or its session.
+# as <branch>-<sha>-judge.md, with a hash of the reviews it judged; a commit already judged ready on the same
+# reviews isn't judged again. Its last verdict line is "ready" (exit 0: nothing to fix), "needs changes" (exit
+# 1: the To fix list goes to the agent) or "escalate" (exit 3: it rejected a finding that would be critical if
+# real, and the user decides). "Needs changes" in a second judgement of the branch (the judgement of a commit
+# HEAD descends from needed changes too) also exits 3: after two judged rounds the user decides, not the queue
+# or its session.
 set -uo pipefail
 die() { echo "review: $*" >&2; exit 2; }
 # verdict <file>: "ready", "needs changes", "escalate" (a judge only) or "failed", from the last verdict line
@@ -115,7 +116,10 @@ case "${1:-}" in
   --tests|--suite) [ $# -eq 2 ] || die "$usage"; mode="${1#--}"; shift ;;
   --judge)
     [ $# -ge 3 ] || die "$usage"; mode=judge; shift; reviews=("${@:2}")
-    for f in "${reviews[@]}"; do [ -f "$f" ] || die "no such review file: $f"; done
+    for i in "${!reviews[@]}"; do
+      [ -f "${reviews[$i]}" ] || die "no such review file: ${reviews[$i]}"
+      reviews[i]="$(readlink -f "${reviews[$i]}")"  # absolute: the session runs in the worktree
+    done
     ;;
   *)
     if [ $# -lt 1 ] || [ $# -gt 2 ]; then die "$usage"; fi
@@ -179,15 +183,19 @@ in your system prompt, otherwise \"Verdict: ready\". If the skill is not availab
     ;;
   judge)
     out="$base-judge.md"
-    if [ "$(verdict "$out")" = ready ]; then
+    # The reviews it judges (their paths and contents): a ready judgement counts only for the same ones.
+    judged="Judged reviews: $(sha256sum -- "${reviews[@]}" | sha256sum | cut -d' ' -f1)"
+    if [ "$(verdict "$out")" = ready ] && grep -qxF "$judged" "$out"; then
       cat "$out"; echo "already judged as ready"; echo "(saved to $out)"; exit 0
     fi
     change_base; rules_at="$mb"; rules_what="the base of the change, against $against"
-    # The branch's earlier judgements (of other commits), oldest first.
+    # The branch's earlier judgements, oldest first: of other commits HEAD descends from, so not of another
+    # repo's branch of the same name, nor of an earlier branch of that name, merged (squashed) before.
     prefix="$dir/${branch//\//-}-"; earlier=""
     for f in "$prefix"*-judge.md; do
       if [ ! -f "$f" ] || [ "$f" = "$out" ]; then continue; fi
-      rest="${f#"$prefix"}"; [[ "$rest" =~ ^[0-9a-f]{7,40}-judge\.md$ ]] || continue
+      rest="${f#"$prefix"}"; [[ "$rest" =~ ^([0-9a-f]{7,40})-judge\.md$ ]] || continue
+      git -C "$wt" merge-base --is-ancestor "${BASH_REMATCH[1]}" HEAD 2>/dev/null || continue
       earlier+="$(stat -c %Y "$f") $f"$'\n'
     done
     earlier="$(sort -n <<<"$earlier" | cut -d' ' -f2- | sed '/^$/d')"
@@ -251,6 +259,7 @@ print(d.get("result") or "")
 body=""
 if [[ "$review" == *$'\n'* ]]; then body="${review#*$'\n'}"; fi
 printf '# %s%s)\n\n%s\n' "$title" "${review%%$'\n'*}" "$body" > "$out"
+if [ "$mode" = judge ]; then echo "$judged" >> "$out"; fi
 
 if [ "$mode" = suite ]; then
   # A label line, with markdown around the label (**Counts**:, **Counts:**) or as a list item (- Counts:, 1. Counts:)

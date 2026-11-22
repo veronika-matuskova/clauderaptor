@@ -497,6 +497,16 @@ assert_contains "judge: an escalation needs the user" "$out" \
 assert "judge: escalation, no e2e"           test ! -s "$TQ/npm.log"
 assert "judge: escalation, job in failed/"   in_failed critical
 
+# A judge that didn't run fails the job too, before e2e, naming the reviews' findings and why.
+reset_pr; echo "needs changes" > "$TQ/verdict"; echo failed > "$TQ/judge_verdict"; mkwt nojudge
+Q add "$TMP/wt-nojudge" fix "No judge" >/dev/null; out="$(Q run)"
+assert_contains "judge: didn't run, fails the job" "$out" \
+  "FAILED fix/nojudge: the review found changes to make (review: $PR_QUEUE_DIR/reviews/fix-nojudge-"
+assert_contains "judge: didn't run, says so" "$out" "; the judge didn't run: review: no verdict in the review"
+assert "judge: didn't run, no e2e"           test ! -s "$TQ/npm.log"
+assert "judge: didn't run, no PR"            test ! -s "$TQ/created.log"
+assert "judge: didn't run, job in failed/"   in_failed nojudge
+
 # No judge when a review didn't run, or with PR_QUEUE_JUDGE=0.
 reset_pr; echo garbage > "$TQ/verdict"; echo "needs changes" > "$TQ/tests_verdict"; mkwt halfrun
 Q add "$TMP/wt-halfrun" fix "Half run" >/dev/null; out="$(Q run)"

@@ -387,15 +387,31 @@ assert "judge: got a scratch folder"          test -s "$STUB/scratch"
 assert "judge: scratch folder removed after"  test ! -e "$(cat "$STUB/scratch")"
 assert_contains "judge: stopped after 3600 s" "$(cat "$STUB/timeout")" "-k 30 3600"
 rm "$STUB/hook"
-out="$(rv --judge "$W" "$TMP/code-review.md")"
+out="$(rv --judge "$W" "$TMP/code-review.md" "$TMP/test-review.md")"
 assert_contains "judge: ready commit not judged again" "$out" "already judged as ready"
 assert "judge: no second session"             test ! -f "$STUB/args"
+# Only on the same reviews: other review files, or a review that changed, are judged again.
+out="$(rv --judge "$W" "$TMP/code-review.md")"
+assert "judge: other reviews are judged"      test -f "$STUB/args"
+echo "2. important: a.js:9: a new finding." >> "$TMP/code-review.md"
+out="$(cd "$TMP" && rv --judge "$W" code-review.md)"
+assert "judge: a changed review is judged"    test -f "$STUB/args"
+assert_contains "judge: a relative path given as absolute" "$(cat "$STUB/args")" \
+  "Reviews to judge (read each with cat): $(readlink -f "$TMP")/code-review.md"
 
 # A judgement that needs changes; then, on the next commit, an escalation; then a second round of changes.
+# Rulings of commits HEAD doesn't descend from don't count: another repo's branch of the same name (a commit
+# this repo doesn't have), or an earlier branch of the name, merged (squashed) before (a commit off the branch).
 commit 20; printf 'Verdicts:\n1. [CONFIRMED important] a.js:3: ...\nTo fix: 1\nEscalate: none\nVerdict: needs changes\n' > "$STUB/result"
 first="$REVIEW_DIR/feat-notes-$sha-judge.md"
+other="$REVIEW_DIR/feat-notes-0123456789ab-judge.md"
+side="$REVIEW_DIR/feat-notes-$(git -C "$W" commit-tree -m side "HEAD^{tree}" | cut -c1-12)-judge.md"
+echo 'Verdict: needs changes' | tee "$other" > "$side"
 out="$(rv --judge "$W" "$TMP/code-review.md")"
 assert_contains "judge: needs changes -> exit 1" "$out" "exit=1"
+assert_not_contains "judge: not another repo's ruling" "$(cat "$STUB/args")" "$other"
+assert_not_contains "judge: nor one of a commit off the branch" "$(cat "$STUB/args")" "$side"
+rm "$other" "$side"
 out="$(rv --judge "$W" "$TMP/code-review.md")"
 assert "judge: needs changes is judged again" test -f "$STUB/args"
 assert_contains "judge: its own earlier judgement is no second round" "$out" "exit=1"

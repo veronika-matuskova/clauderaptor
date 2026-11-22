@@ -274,6 +274,13 @@ assert_contains "tests: gives the cap command" "$args" "Cap command: $ROOT/scrip
 assert_contains "tests: no edit tools"        "$args" "Edit,Write,NotebookEdit"
 assert_contains "tests: loads none of the branch's config" "$args" "--safe-mode"
 assert_contains "tests: on Sonnet"        "$(flag --model)" "sonnet"
+# The old path, scripts/review.sh, is a link (runners and rules from before the move use it): it still finds the
+# instructions, the config and capped.sh.
+commit 30; out="$(PATH="$TMP/bin:$PATH" bash "$ROOT/scripts/review.sh" --tests "$W" 2>&1)"; args="$(cat "$STUB/args")"
+assert_contains "old path: reviewed"          "$out" "Verdict"
+assert_contains "old path: the instructions"  "$args" "Mutation: break the code on purpose"
+assert_contains "old path: the cap command"   "$args" "Cap command: $ROOT/scripts/capped.sh <command>"
+assert_contains "old path: the lock command"  "$args" "$ROOT/scripts/queue/pr-queue.sh lock <command>"
 assert_contains "tests: medium effort"    "$(flag --effort)" "medium"
 assert_contains "tests: names the rules commit" "$args" "from commit ${mb:0:12}"
 assert_contains "tests: base rules"           "$(cat "$STUB/sysprompt")" "Base rule: tests live in tests/."

@@ -162,11 +162,9 @@ out="$(Q add "$TMP/wt-happy" fix x "$TMP/nobody.md")"; assert_contains "add: mis
 echo "My summary" > "$TQ/body.md"
 out="$(Q add "$TMP/wt-happy" fix "Happy thing" "$TQ/body.md")"; assert_contains "add: queued" "$out" "queued fix/happy"
 out="$(Q status)";                           assert_contains "status lists the job"       "$out" "fix/happy"
-# The old path, scripts/pr-queue.sh, is a link to it: agents' prompts still use it.
-out="$(PATH="$TQ/bin:$PATH" bash "$ROOT/scripts/pr-queue.sh" status </dev/null 2>&1)"
-assert_contains "old path: works"            "$out" "fix/happy"
-assert "old path: a link to queue/pr-queue.sh" [ "$(readlink -f "$ROOT/scripts/pr-queue.sh")" = "$ROOT/scripts/queue/pr-queue.sh" ]
-out="$(Q run)"
+# Run through the old path, scripts/pr-queue.sh (a link: agents' prompts still use it). It must find review.sh
+# in queue/, next to the script the link points to.
+out="$(PATH="$TQ/bin:$PATH" bash "$ROOT/scripts/pr-queue.sh" run </dev/null 2>&1)"
 assert_contains "happy: merged main in"      "$out" "merged origin/main"
 assert_contains "happy: reviewed at medium"  "$out" "(/code-review medium)"
 assert_contains "happy: fresh claude -p review" "$(cat "$TQ/claude.log")" 'args "medium fix/happy"'

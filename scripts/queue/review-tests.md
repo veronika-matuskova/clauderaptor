@@ -29,6 +29,9 @@ In a change review: the tests the change adds or changes, and the existing tests
      condition, move a boundary (`<` to `<=`), delete a statement or call, return early or a constant, drop an
      error check. Restore the file before the next one: the copy is not a git checkout, so write it back with
      `git -C <repo> show <sha>:<path> > <scratch>/copy/<path>`.
+   - Run the mutations one after another, in the one copy: never several copies or test runs at the same time
+     (no `&`, `xargs -P` or parallel loops). The machine is shared with e2e runs and other sessions, and the
+     repo's tests may already run several workers.
    - Do at most 3 mutations per changed function and 10 per review. Pick the ones that would hurt users most.
      Skip a mutation that doesn't change behaviour.
    - Run only the tests that cover that code. Fast tests (unit tests, the repo's shell tests) run as they are.

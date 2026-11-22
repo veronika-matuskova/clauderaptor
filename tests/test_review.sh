@@ -251,6 +251,20 @@ out="$(rv --suite "$TMP/empty")"
 assert_contains "suite: a repo with no commits" "$out" "has no commits"
 assert_contains "suite: no commits -> exit 2" "$out" "exit=2"
 
+# Outside any cap (no CAPPED), the session runs in a capped systemd scope (systemd-run stubbed: it logs, then
+# runs the command after "--").
+cat > "$TMP/bin/systemd-run" <<'EOF'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB/systemd-run"
+while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done
+shift; exec "$@"
+EOF
+printf '#!/usr/bin/env bash\n' > "$TMP/bin/systemctl"; chmod +x "$TMP/bin/systemd-run" "$TMP/bin/systemctl"
+printf 'No findings.\nVerdict: ready\n' > "$STUB/result"; commit capped
+out="$(CAPPED='' rv "$W")"
+assert_contains "capped: the review runs"     "$out" "exit=0"
+assert "capped: claude -p in a capped scope"  grep -q -- "--scope .*TasksMax=.*-- claude -p" "$STUB/systemd-run"
+
 printf 'Counts: mutation 0, missing 0, empty 0, duplicate 0, not atomic 0, rule 0\nVerdict: ready\n' > "$STUB/result"
 assert_contains "bad level"       "$(rv "$W" max)" "level must be low, medium, high or xhigh"
 assert_contains "not a checkout"  "$(rv "$TMP")" "is not a git checkout"

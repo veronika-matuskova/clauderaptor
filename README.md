@@ -30,6 +30,7 @@ It's interactive (sudo password, GitHub login), so run it yourself in a terminal
 - Clone repos you work on into `repos/` and keep task notes in `tasks/` (both gitignored). `scripts/check-repos.sh` shows each repo's status, or offers to clone when `repos/` is empty.
 - Parallel agents: an agent commits in its worktree and runs `~/code/clauderaptor/scripts/pr-queue.sh add [--review high] [--tests none] <worktree> <type> "<description>"`; the main session runs `scripts/pr-queue.sh run` to merge main, review the branch's code and tests (two fresh `claude -p` sessions at the same time, `scripts/review.sh`: the built-in `/code-review`, and a test review with a mutation check), test, open the PR, wait for CI and merge, one branch at a time. `status` shows the queue. Details are in the script header.
 - Test suite audit: `scripts/review.sh --suite <checkout>` checks a repo's whole test suite (mutations, missing, empty, duplicate and non-atomic tests) and saves every finding to a file. The checks are in `scripts/review-tests.md`.
+- Caps: `scripts/capped.sh <command...>` runs a command in a systemd user scope that caps its processes and memory (`CAP_TASKS`, default 2000; `CAP_MEMORY`, default 4G; no swap), so a runaway such as a fork bomb is stopped there instead of freezing WSL. The review sessions and every test file run under it; run mutation loops under it too.
 
 ## Tests
     tests/run.sh

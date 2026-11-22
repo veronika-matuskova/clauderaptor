@@ -1,6 +1,12 @@
 # shellcheck shell=bash
 # Tiny assert helpers, sourced by tests/test_*.sh. Each test file runs in its own process.
 set -uo pipefail
+# Each test file runs under scripts/capped.sh, also when run by itself (e.g. a mutation loop), so that a script
+# under test that starts processes without end is stopped by the cap instead of filling the machine. Started
+# again once, marked so that it never loops.
+if [ -z "${TESTS_CAPPED:-}" ]; then
+  TESTS_CAPPED=1 exec "$(dirname "${BASH_SOURCE[0]}")/../scripts/capped.sh" bash "$0" "$@"
+fi
 # Run from a git hook (pre-commit), git exports GIT_INDEX_FILE, GIT_DIR, ...; drop them so git in a test
 # repo never reads or writes this repo's index.
 # shellcheck disable=SC2046

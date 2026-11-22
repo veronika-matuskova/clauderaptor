@@ -371,6 +371,16 @@ printf 'No findings.\nVerdict: ready\n' > "$STUB/result"; commit capped
 out="$(CAP_OFF='' rv "$W")"
 assert_contains "capped: the review runs"     "$out" "exit=0"
 assert "capped: claude -p in a capped scope"  grep -q -- "--scope .*TasksMax=.*-- claude -p" "$STUB/systemd-run"
+# A user manager (its socket) that can't apply the caps: claude -p doesn't run, and the review fails with
+# capped.sh's message.
+printf '#!/usr/bin/env bash\necho "Failed to set unit properties on capped.slice: Connection timed out" >&2; exit 1\n' \
+  > "$TMP/bin/systemctl"
+mkdir -p "$TMP/run/systemd"; (cd "$TMP/run/systemd" && python3 -I -c 'import socket; socket.socket(socket.AF_UNIX).bind("private")')
+commit nocap
+out="$(CAP_OFF='' XDG_RUNTIME_DIR="$TMP/run" rv "$W")"
+assert_contains "no cap: the review didn't run (exit 2)" "$out" "exit=2"
+assert_contains "no cap: capped.sh's message"  "$out" "CAP_OFF=1 runs it without a cap"
+assert "no cap: no claude -p"                  test ! -f "$STUB/args"
 
 printf 'Counts: mutation 0, missing 0, empty 0, duplicate 0, not atomic 0, rule 0\nVerdict: ready\n' > "$STUB/result"
 assert_contains "bad level"       "$(rv "$W" max)" "level must be low, medium, high or xhigh"

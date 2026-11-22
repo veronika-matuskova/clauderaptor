@@ -16,21 +16,40 @@
 # The command gets its arguments as they are: newer systemd-run (e.g. 259) expands ${...} and $$ in them, as
 # in ExecStart=, so capped.sh turns that off where systemd-run has --expand-environment.
 # CAP_OFF=1 runs the command as it is (the tests set it: each test file already runs under a cap of its own).
-# Without a systemd user instance that can apply the caps (e.g. in CI), the command runs uncapped, with a warning.
-# Exit code: the command's; 2 if no command was given.
+# Before the command, a check sets the overall cap and applies the same caps in a scope that runs true. If it
+# fails:
+# - without a systemd user instance (no systemd-run or systemctl, or no socket of a user manager,
+#   $XDG_RUNTIME_DIR/systemd/private, which both connect to), the command runs uncapped, with a warning;
+# - with one, the check is tried again, 3 tries 1 s apart, since a call may time out under load (when a
+#   runaway is likely). If none passes, the command doesn't run: capped.sh exits 125 with a message, and
+#   CAP_OFF=1 runs it without a cap, on purpose.
+# Exit code: the command's; 2 if no command was given; 125 if the caps couldn't be applied.
 set -uo pipefail
 [ $# -ge 1 ] || { echo "usage: capped.sh <command...>" >&2; exit 2; }
 if [ -n "${CAP_OFF:-}" ]; then exec "$@"; fi
 caps=(-p TasksMax="${CAP_TASKS:-2000}" -p MemoryMax="${CAP_MEMORY:-4G}" -p MemorySwapMax=0 -p TimeoutStopSec=10)
 total=(TasksMax="${CAP_TOTAL_TASKS:-4000}" MemoryMax="${CAP_TOTAL_MEMORY:-5G}" MemorySwapMax=0)
 keep=(); [[ "$(systemd-run --help 2>/dev/null)" != *--expand-environment* ]] || keep=(--expand-environment=no)
-# The check sets the overall cap and applies the same caps, so a cap systemd can't set means no cap rather
-# than no command.
-if ! systemctl --user set-property --runtime capped.slice "${total[@]}" >/dev/null 2>&1 ||
-   ! systemd-run --user --scope --quiet --slice=capped.slice "${caps[@]}" "${keep[@]}" -- true >/dev/null 2>&1; then
-  echo "capped: no systemd user instance that can apply the caps, so '${*:1:2}' runs without a cap" >&2
-  exec "$@"
-fi
+# check: runs the check; err gets what systemd said.
+check() {
+  err="$(systemctl --user set-property --runtime capped.slice "${total[@]}" 2>&1 >/dev/null &&
+    systemd-run --user --scope --quiet --slice=capped.slice "${caps[@]}" "${keep[@]}" -- true 2>&1 >/dev/null)"
+}
+tries=1
+until check; do
+  # No systemd user instance? This asks nothing of the manager, so one too busy to answer still counts.
+  if ! command -v systemd-run >/dev/null || ! command -v systemctl >/dev/null ||
+     [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -S "$XDG_RUNTIME_DIR/systemd/private" ]; then
+    echo "capped: no systemd user instance to apply the caps, so '${*:1:2}' runs without a cap" >&2
+    exec "$@"
+  fi
+  if [ "$tries" -ge 3 ]; then
+    echo "capped: systemd couldn't apply the caps (3 tries${err:+; last: ${err##*$'\n'}}), so '${*:1:2}' didn't run." \
+      "CAP_OFF=1 runs it without a cap, on purpose." >&2
+    exit 125
+  fi
+  tries=$((tries + 1)); sleep 1
+done
 unit="capped-$$-$RANDOM"
 trap 'systemctl --user stop "$unit.scope" >/dev/null 2>&1' EXIT
 # shellcheck disable=SC2016  # $1 and $2 expand in the watcher

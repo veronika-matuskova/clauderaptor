@@ -150,6 +150,13 @@ out="$(env -u CAP_OFF -u XDG_RUNTIME_DIR PATH="$BIN:$PATH" bash "$ROOT/scripts/c
 rm -f "$NO_SYSTEMD"
 assert_contains "no XDG_RUNTIME_DIR: the command runs, with a warning" "$out" "runs without a cap"$'\n'"cmd-ran"
 assert "no XDG_RUNTIME_DIR: its exit code"  test "$rc" = 5
+# A regular file where the manager's socket would be: no user manager either.
+mkdir -p "$TMP/filerun/systemd"; : > "$TMP/filerun/systemd/private"
+newlog notsock; touch "$NO_SYSTEMD"
+out="$(XDG="$TMP/filerun" C bash -c 'echo cmd-ran; exit 5' 2>&1)"; rc=$?
+rm -f "$NO_SYSTEMD"
+assert_contains "a file, not a socket: the command runs, with a warning" "$out" "runs without a cap"$'\n'"cmd-ran"
+assert "a file, not a socket: its exit code" test "$rc" = 5
 # Without systemd-run or systemctl (a PATH of bash and the other stub), even with a user manager's socket.
 for missing in systemd-run systemctl; do
   d="$TMP/no-$missing"; mkdir -p "$d"; ln -s "$(command -v bash)" "$d/bash"

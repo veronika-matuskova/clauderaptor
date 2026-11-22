@@ -445,6 +445,16 @@ SID=s-judge; line 2026-11-10T11:10:00.000Z j1 $O 1 2 3 0 4 > "$PROJ/-home-u-code
 SID=s-suite; line 2026-11-10T11:20:00.000Z u1 $O 1 1 1 0 1 > "$PROJ/-home-u-code-app/s-suite.jsonl"
 # A review from before the sidecars: the sdk-cli session in a worktree that ended as it was written.
 SID=s-oldrev; { line 2026-11-10T12:00:00.000Z o1 $O 5 5 5 0 5; line 2026-11-10T12:04:00.000Z; } > "$PROJ/-home-u-code-app/s-oldrev.jsonl"
+# An agent session that was still running when a review of its branch, with no session of its own, was
+# written: it stays an agent.
+SID=s-long CWD=/home/u/code/app/repos/app-feat-w BR=feat/w
+{ line 2026-11-10T10:00:00.000Z; line 2026-11-10T14:00:00.000Z; } > "$PROJ/-home-u-code-app/s-long.jsonl"
+# Ended 2 minutes after a review of its branch was written: no review either.
+SID=s-late CWD=/home/u/code/app/repos/app-feat-v BR=feat/v
+{ line 2026-11-10T11:00:00.000Z; line 2026-11-10T12:02:00.000Z; } > "$PROJ/-home-u-code-app/s-late.jsonl"
+# Two reviews of its branch written after it ended: the nearer one.
+SID=s-near CWD=/home/u/code/app/repos/app-feat-u BR=feat/u
+{ line 2026-11-10T11:00:00.000Z; line 2026-11-10T12:00:00.000Z; } > "$PROJ/-home-u-code-app/s-near.jsonl"
 SID=s-main EP=cli CWD=/home/u/code/app BR=main
 line 2026-11-10T09:00:00.000Z x1 claude-mystery-9 100 100 0 0 0 > "$PROJ/-home-u-code-app/s-main.jsonl"
 SID=s-main2 EP=cli CWD=/home/u/code/app/repos/app BR=main
@@ -482,10 +492,22 @@ printf '{"v":1,"kind":"suite","file":"app-suite-abcabcabcabc.md","session_id":"s
 # shellcheck disable=SC2016  # literal dollar sign, not an expansion
 printf '# Review of feat/x at abcabcabcabc (/code-review medium, cost $1.00, 60 s)\nVerdict: ready\n' > "$R4/feat-x-abcabcabcabc-medium.md"
 touch -d '2026-11-10 12:04:30' "$R4/feat-x-abcabcabcabc-medium.md"
+# shellcheck disable=SC2016  # literal dollar sign, not an expansion
+printf '# Review of feat/w at dddddddddddd (/code-review medium, cost $1.00, 60 s)\nVerdict: ready\n' > "$R4/feat-w-dddddddddddd-medium.md"
+touch -d '2026-11-10 12:00:00' "$R4/feat-w-dddddddddddd-medium.md"
+# shellcheck disable=SC2016  # literal dollar sign, not an expansion
+printf '# Review of feat/v at ffffffffffff (/code-review medium, cost $1.00, 60 s)\nVerdict: ready\n' > "$R4/feat-v-ffffffffffff-medium.md"
+touch -d '2026-11-10 12:00:00' "$R4/feat-v-ffffffffffff-medium.md"
+# shellcheck disable=SC2016  # literal dollar sign, not an expansion
+printf '# Review of feat/u at eeeeeeeeeeee (/code-review medium, cost $1.00, 60 s)\nVerdict: ready\n' > "$R4/feat-u-eeeeeeeeeeee-medium.md"
+touch -d '2026-11-10 12:04:00' "$R4/feat-u-eeeeeeeeeeee-medium.md"
+# shellcheck disable=SC2016  # literal dollar sign, not an expansion
+printf '# Test review of feat/u at eeeeeeeeeeee (cost $1.00, 60 s)\nVerdict: ready\n' > "$R4/feat-u-eeeeeeeeeeee-tests.md"
+touch -d '2026-11-10 12:01:00' "$R4/feat-u-eeeeeeeeeeee-tests.md"
 ev2 2026-11-10T13:00:00.000Z merged mx feat/x '"pr":1' | sed 's/"repo":"one"/"repo":"app"/' > "$S4/events.jsonl"
 out="$(PR_QUEUE_DIR="$S4" ingest "$DB2")"; rc=$?
 assert "ingest with transcripts exits 0" test "$rc" -eq 0
-assert_contains "the summary counts the transcripts" "$out" "17 transcripts read, 11 new messages"
+assert_contains "the summary counts the transcripts" "$out" "20 transcripts read, 11 new messages"
 assert_contains "the summary names the model with no price" "$out" "no price for claude-mystery-9"
 assert_not_contains "a model with no tokens is not unpriced" "$out" "$O:"
 
@@ -509,6 +531,12 @@ assert_contains "a judge's sidecar session: judge" "$(q "$SQ = 's-judge'")" "jud
 assert_contains "a suite audit's sidecar session: suite" "$(q "$SQ = 's-suite'")" "suite|app"
 assert_contains "no sidecar, ended as a review of its branch was written: review" \
   "$(q "SELECT role, review_id FROM sessions WHERE session_id = 's-oldrev'")" "review|feat-x-abcabcabcabc-medium.md"
+assert_contains "a session still running when a review of its branch was written stays an agent" \
+  "$(q "SELECT role, ifnull(review_id,'none') FROM sessions WHERE session_id = 's-long'")" "agent|none"
+assert_contains "a session that ended after a review of its branch was written stays an agent" \
+  "$(q "SELECT role, ifnull(review_id,'none') FROM sessions WHERE session_id = 's-late'")" "agent|none"
+assert_contains "of two reviews written after a session ended, the nearer one is its" \
+  "$(q "SELECT role, review_id FROM sessions WHERE session_id = 's-near'")" "review|feat-u-eeeeeeeeeeee-tests.md"
 assert_contains "cli in the main checkout: main" "$(q "$SQ = 's-main'")" "main|app|app|main"
 assert_contains "cli in a main checkout under repos/: main" "$(q "$SQ = 's-main2'")" "main|app|app|main"
 assert_contains "cli in a worktree: other" "$(q "$SQ = 's-cliwt'")" "other|app"
@@ -548,8 +576,9 @@ assert_contains "tokens by role: agent, with its subagent and the main session's
   "$(q "SELECT sessions, subagent_sessions, msgs, tokens_in, tokens_out, tokens_cache_w, tokens_cache_r, cost_usd_est, subagent_cost_usd_est, unpriced_msgs FROM v_tokens_by_role WHERE role = 'agent' AND repo = 'app'")" \
   "3|2|3|3000000|100000|200000|1000000|11.6|4.1|0"
 assert "tokens by role: no subagent row once rolled up" test "$(q "SELECT COUNT(*) FROM v_tokens_by_role WHERE role = 'subagent'")" -eq 0
-got="$(q "SELECT role, sessions, subagent_sessions, tokens, subagent_tokens, subagent_token_share, subagent_cost_usd_est FROM v_subagent_share WHERE role = 'review'")"
-assert_contains "subagent share of a role" "$got" "review|3|1|220|100|0.4545|0.0004"
+got="$(q "SELECT role, sessions, subagent_sessions, tokens, subagent_tokens, subagent_token_share, cost_usd_est, subagent_cost_usd_est, subagent_cost_share FROM v_subagent_share WHERE role = 'review'")"
+# cost: r1 (10*4 + 20*20 + 30*5 + 40*0.2) + o1 (5*4 + 5*20 + 5*5 + 5*0.2) + r2 (100*4) = 598 + 146 + 400 per MTok
+assert_contains "subagent share of a role's tokens and cost" "$got" "review|3|1|220|100|0.4545|0.0011|0.0004|0.3497"
 assert_contains "tokens by role: unpriced messages counted" "$(q "SELECT ifnull(cost_usd_est,'null'), unpriced_msgs FROM v_tokens_by_role WHERE role = 'main'")" "0.0|1"
 assert_contains "cache hit rate: cache reads / all input" "$(q "SELECT tokens_cache_r, tokens_input, cache_hit_rate FROM v_cache_hit_rate WHERE role = 'agent'")" \
   "1000000|4200000|0.2381"
@@ -566,7 +595,7 @@ CWD="$WT" BR=feat/x line 2026-11-10T09:01:00.000Z b1 $O 10 0 0 0 30 > "$P5/p/s-b
 PROJ="$P5" PR_QUEUE_DIR="$S4" ingest "$TMP/out/boss.db" >/dev/null
 got="$(DB2="$TMP/out/boss.db" q "SELECT (SELECT group_concat(role) FROM v_tokens_by_role), (SELECT group_concat(role) FROM v_cache_hit_rate), (SELECT group_concat(role) FROM v_subagent_share)")"
 assert "only a subagent's tokens: the views name its rolled-up role" test "$got" = "agent|agent|agent"
-assert_contains "and its subagent share is all of it" "$(DB2="$TMP/out/boss.db" q "SELECT subagent_token_share, cache_hit_rate FROM v_subagent_share, v_cache_hit_rate")" "1.0|0.75"
+assert_contains "and its subagent share is all of it" "$(DB2="$TMP/out/boss.db" q "SELECT subagent_token_share, subagent_cost_share, cache_hit_rate FROM v_subagent_share, v_cache_hit_rate")" "1.0|1.0|0.75"
 
 echo "-- transcripts: incremental, partial line, reread"
 M="$PROJ/-home-u-code-app/s-main.jsonl"
@@ -627,7 +656,7 @@ c.commit()' "$DB3"
 PR_QUEUE_DIR="$S4" ingest "$DB3" >/dev/null
 DB2="$DB3"
 assert "migrated: version 4" test "$(q "SELECT group_concat(version) FROM schema_version")" = 4
-assert "migrated: the sessions are read" test "$(q "SELECT COUNT(*) FROM sessions")" -eq 16
+assert "migrated: the sessions are read" test "$(q "SELECT COUNT(*) FROM sessions")" -eq 19
 assert_contains "migrated: the views work" "$(q "SELECT agent_cost_usd_est FROM v_cost_per_merged_branch")" "11.6"
 unset DB2 PROJ
 

@@ -34,8 +34,8 @@ and v_cost_per_merged_branch (the agents' estimated cost, from the transcripts, 
 cost, from the review files, per merged branch). These count a subagent toward its parent's role.
 Session roles: review, judge or suite for a session a review sidecar names; subagent for a subagent's file
 (sessions.role_eff rolls it up into its parent's role, and a subagent of the main session that worked in a
-worktree into agent); for an sdk-cli session in a worktree without a sidecar, the review's kind if it ended
-within 5 minutes after a review of its branch without a sidecar was written (the reviews from before the
+worktree into agent); for an sdk-cli session in a worktree without a sidecar, the review's kind if a review of
+its branch without a sidecar was written within 5 minutes after the session ended (the reviews from before the
 sidecars), else agent; main for a cli session in a checkout; other for anything else (cli in a worktree, a
 session in a temp dir). A subagent's repo and branch are those of the worktree it spent the most lines in.
 """
@@ -661,8 +661,8 @@ def where(name, place, known):
 def classify_sessions(db, state):
     """Every session's repo, role, rolled-up role and message count, again. Roles: a session a review sidecar
     names gets that review's kind; a subagent's file, subagent; an sdk-cli session in a worktree that has no
-    sidecar but ran on the branch of a review without one and ended as it was written (within 5 minutes), that
-    review's kind; else an sdk-cli session in a worktree, agent; a cli session in a checkout, main; anything else
+    sidecar, and ended at most 5 minutes before a review of its branch without one was written, that review's
+    kind (a session that was still running when the review was written is no review); else an sdk-cli session in a worktree, agent; a cli session in a checkout, main; anything else
     (cli in a worktree, a temp dir), other.
     A subagent's repo and branch are those of the worktree it spent the most lines in (link = worktree: an agent
     the main session started cd's into its worktree), else of its first cwd (link = cwd). Its rolled-up role
@@ -704,10 +704,10 @@ def classify_sessions(db, state):
             role = "subagent"
         elif entry == "sdk-cli" and in_worktree:
             role = "agent"
-            if start and end:
-                s0, e0 = epoch(start), epoch(end)
-                near = [(abs(f - e0), rid, kind) for b, f, rid, kind in unnamed
-                        if b == branch and rid not in taken and s0 <= f <= e0 + 300]
+            if end:
+                e0 = epoch(end)
+                near = [(f - e0, rid, kind) for b, f, rid, kind in unnamed
+                        if b == branch and rid not in taken and e0 <= f <= e0 + 300]
                 if near:
                     _, review_id, kind = min(near)
                     taken.add(review_id)

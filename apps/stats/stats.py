@@ -23,6 +23,10 @@ Sources, all in $PR_QUEUE_DIR (default ${XDG_STATE_HOME:-~/.local/state}/pr-queu
   repo and worktree come from); the session id is the file's name. Never the messages' content, nor the
   account or organization ids.
   Streamed chunks repeat a message's usage: each message.id counts once.
+- git, in each repo's main checkout (repos/<repo>/checkout): main's first-parent commits (sha, time, subject,
+  the files changed, and the queue branch it merged, if known), and the commits that touched the rules
+  (claude/rules/**, CLAUDE.md, scripts/queue/review.sh, claude/agents/**). Read again on every run.
+meta's last_ingest is the time of the last ingest.
 Ingesting the same files again changes nothing. A db of an older schema version gets the new columns, and its
 review files are read again to fill them.
 Views: v_rounds_per_branch, v_findings_by_severity (code and test reviews only), v_cost_by_kind_level,
@@ -32,12 +36,16 @@ From the transcripts: v_tokens_by_role (tokens and the estimated API-equivalent 
 v_subagent_share (the subagents' part of each role), v_cache_hit_rate (cache reads / all input tokens, per role)
 and v_cost_per_merged_branch (the agents' estimated cost, from the transcripts, and the reviews' and judges'
 cost, from the review files, per merged branch). These count a subagent toward its parent's role.
+v_escaped_defects: each branch the queue merged, and the fix or revert within 14 days that touched its files.
+v_flaky_checks: each failed CI check run, and when checks passed with no new commits (from the events).
 Session roles: review, judge or suite for a session a review sidecar names; subagent for a subagent's file
 (sessions.role_eff rolls it up into its parent's role, and a subagent of the main session that worked in a
 worktree into agent); for an sdk-cli session in a worktree without a sidecar, the review's kind if a review of
 its branch without a sidecar was written within 5 minutes after the session ended (the reviews from before the
 sidecars), else agent; main for a cli session in a checkout; other for anything else (cli in a worktree, a
 session in a temp dir). A subagent's repo and branch are those of the worktree it spent the most lines in.
+Sessions whose branch was never queued get one from the job files (see link_to_jobs): branch_eff, used by
+v_cost_per_merged_branch.
 """
 import argparse
 import calendar
@@ -48,10 +56,11 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -72,7 +81,7 @@ CREATE TABLE IF NOT EXISTS ingest_state (path TEXT PRIMARY KEY, inode INTEGER, s
 CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT PRIMARY KEY, role TEXT, repo TEXT, worktree TEXT, branch TEXT, cwd_hash TEXT, place TEXT,
   entrypoint TEXT, start TEXT, end TEXT, msgs INTEGER, parent_session TEXT, review_id TEXT, role_eff TEXT,
-  link TEXT);
+  link TEXT, branch_eff TEXT);
 CREATE TABLE IF NOT EXISTS session_places (
   session_id TEXT NOT NULL, cwd_hash TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT, place TEXT, lines INTEGER,
   PRIMARY KEY (session_id, cwd_hash, branch));
@@ -86,6 +95,15 @@ CREATE TABLE IF NOT EXISTS usage_daily (
 CREATE TABLE IF NOT EXISTS prices (
   model TEXT NOT NULL, effective_from TEXT NOT NULL, usd_in REAL, usd_out REAL, usd_cache_w REAL,
   usd_cache_w_1h REAL, usd_cache_r REAL, source TEXT, PRIMARY KEY (model, effective_from));
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS checks (
+  job_id TEXT, repo TEXT, branch TEXT, sha TEXT, queued_sha TEXT, ts TEXT, result TEXT);
+CREATE TABLE IF NOT EXISTS main_commits (
+  repo TEXT NOT NULL, sha TEXT NOT NULL, ts TEXT, subject TEXT, branch TEXT, kind TEXT, PRIMARY KEY (repo, sha));
+CREATE TABLE IF NOT EXISTS main_commit_files (repo TEXT NOT NULL, sha TEXT NOT NULL, path TEXT NOT NULL,
+  PRIMARY KEY (repo, sha, path));
+CREATE TABLE IF NOT EXISTS rule_changes (
+  repo TEXT NOT NULL, sha TEXT NOT NULL, ts TEXT, subject TEXT, PRIMARY KEY (repo, sha));
 """
 
 # Dropped and made again on every run, so that a new version's views replace an old db's.
@@ -99,6 +117,8 @@ DROP VIEW IF EXISTS v_tokens_by_role;
 DROP VIEW IF EXISTS v_cache_hit_rate;
 DROP VIEW IF EXISTS v_cost_per_merged_branch;
 DROP VIEW IF EXISTS v_subagent_share;
+DROP VIEW IF EXISTS v_escaped_defects;
+DROP VIEW IF EXISTS v_flaky_checks;
 CREATE VIEW v_rounds_per_branch AS
   SELECT repo, branch, round AS rounds, ended AS merged_at, job_id FROM jobs WHERE outcome = 'merged';
 -- The queue's reviewers' findings: not the judge's rulings, nor the suite audits (not part of the queue).
@@ -154,7 +174,8 @@ CREATE VIEW v_cache_hit_rate AS
          ROUND(1.0 * SUM(u.cache_r) / NULLIF(SUM(u.tokens_in + u.cache_r + u.cache_w), 0), 4) AS cache_hit_rate
   FROM sessions s JOIN usage_daily u ON u.session_id = s.session_id GROUP BY s.role_eff;
 -- Per merged branch, since its previous merge: the agents' estimated cost (agent sessions, their subagents, and
--- the main session's subagents that worked in the branch's worktree; linked by the transcripts' repo and branch)
+-- the main session's subagents that worked in the branch's worktree or were linked to its job; by the sessions'
+-- repo and branch_eff: the transcripts' branch, or the one link_to_jobs found)
 -- and the reviews' and judges' cost from the review files, which is authoritative.
 CREATE VIEW v_cost_per_merged_branch AS
   WITH m AS (
@@ -163,7 +184,7 @@ CREATE VIEW v_cost_per_merged_branch AS
               AND p.ended < j.ended) AS since
     FROM jobs j WHERE j.outcome = 'merged' AND j.repo IS NOT NULL AND j.branch IS NOT NULL),
   a AS (
-    SELECT s.session_id, s.repo, s.branch, s.start, SUM(u.cost_usd_est) AS cost
+    SELECT s.session_id, s.repo, COALESCE(s.branch_eff, s.branch) AS branch, s.start, SUM(u.cost_usd_est) AS cost
     FROM sessions s JOIN usage_daily u ON u.session_id = s.session_id
     WHERE s.role_eff = 'agent' GROUP BY s.session_id)
   SELECT m.repo AS repo, m.branch AS branch, m.merged_at AS merged_at, m.job_id AS job_id,
@@ -178,6 +199,25 @@ CREATE VIEW v_cost_per_merged_branch AS
             AND r.kind = 'judge' AND r.finished <= m.merged_at AND (m.since IS NULL OR r.finished > m.since))
            AS judge_cost_usd
   FROM m;
+-- Each branch the queue merged (a main commit whose branch has a merged job), escaped if a later fix (a fix/
+-- branch, or a "fix:" commit of no known branch) or revert merged into main within 14 days touches one of its
+-- files.
+CREATE VIEW v_escaped_defects AS
+  SELECT c.repo AS repo, c.branch AS branch, c.sha AS sha, c.ts AS merged_at,
+         (SELECT x.sha FROM main_commits x WHERE x.repo = c.repo AND x.sha <> c.sha AND x.kind IN ('fix', 'revert')
+            AND x.ts > c.ts AND julianday(x.ts) <= julianday(c.ts) + 14
+            AND EXISTS (SELECT 1 FROM main_commit_files a JOIN main_commit_files b ON b.path = a.path
+                        WHERE a.repo = c.repo AND a.sha = c.sha AND b.repo = x.repo AND b.sha = x.sha)
+            ORDER BY x.ts LIMIT 1) AS fixed_by
+  FROM main_commits c WHERE c.branch IS NOT NULL
+    AND EXISTS (SELECT 1 FROM jobs j WHERE j.repo = c.repo AND j.branch = c.branch AND j.outcome = 'merged');
+-- Each failed CI check run of a job, flaky if checks then passed with no new commits: on the same sha, or in a
+-- later job of the branch queued at the same commit (the queue's merge of main gives it another sha).
+CREATE VIEW v_flaky_checks AS
+  SELECT c.job_id AS job_id, c.repo AS repo, c.branch AS branch, c.sha AS sha, c.ts AS failed_at,
+         (SELECT MIN(p.ts) FROM checks p WHERE p.result = 'pass' AND p.ts > c.ts AND p.repo IS c.repo
+            AND (p.sha = c.sha OR (p.branch = c.branch AND p.queued_sha = c.queued_sha))) AS passed_at
+  FROM checks c WHERE c.result = 'fail';
 """
 
 
@@ -687,8 +727,7 @@ def classify_sessions(db, state):
     A subagent's repo and branch are those of the worktree it spent the most lines in (link = worktree: an agent
     the main session started cd's into its worktree), else of its first cwd (link = cwd). Its rolled-up role
     (role_eff) is its parent's, except that a subagent of a main session that worked in a worktree is an agent."""
-    known = sorted((os.path.basename(p) for p in glob.glob(os.path.join(glob.escape(state), "repos", "*"))
-                    if os.path.isdir(p)), key=len, reverse=True)
+    known = known_repos(state)
     by_session = {}
     unnamed = []  # (branch, finished epoch, review id, kind) of the reviews no sidecar ties to a session
     for rid, kind, sess, branch, finished in db.execute(
@@ -743,10 +782,57 @@ def classify_sessions(db, state):
     db.executemany("UPDATE sessions SET role = ?, repo = ?, worktree = ?, branch = ?, link = ?, msgs = ?, review_id = ? "
                    "WHERE session_id = ?", updates)
     # Rolled up: a subagent counts toward its parent's role (subagent if its parent has no transcript).
-    db.execute("UPDATE sessions SET role_eff = role")
+    db.execute("UPDATE sessions SET role_eff = role, branch_eff = branch")
     db.execute("UPDATE sessions SET role_eff = COALESCE((SELECT CASE WHEN p.role = 'main' AND sessions.link = 'worktree' "
                "THEN 'agent' ELSE p.role END FROM sessions p WHERE p.session_id = sessions.parent_session), 'subagent') "
                "WHERE parent_session IS NOT NULL")
+    link_to_jobs(db, state, known)
+
+
+LINK_WINDOW = 600  # seconds from a session's end to the job queued after it
+
+
+def link_to_jobs(db, state, known):
+    """The branch of each agent-like session whose own branch was never queued (main, none, another): the
+    main session's subagents, and the agents' sessions and subagents. Their transcripts often don't show the
+    branch: an agent that works with git -C and absolute paths stays in the main checkout, and a worktree's
+    lines can carry the main checkout's branch.
+    1. A session in a worktree a job file names, for one branch only, gets that branch (link = job_worktree).
+    2. Else a subagent, or an agent session, that ended at most LINK_WINDOW before a job of its repo was queued
+       (job_queued events, and the times in the job files' names) gets the branch of the nearest such job
+       (link = queued). A subagent of the main session linked so counts as an agent (role_eff)."""
+    jobs = job_files(state)
+    wt_branches = {}
+    queued = {}  # job_id -> (repo, branch, queued epoch)
+    for j in jobs:
+        if j["repo"] and j["branch"] and j["worktree"] and j["worktree"] not in known:
+            wt_branches.setdefault((j["repo"], j["worktree"]), set()).add(j["branch"])
+        if j["repo"] and j["branch"] and j["queued"]:
+            queued[j["job_id"]] = (j["repo"], j["branch"], j["queued"])
+    for jid, repo, branch, ts in db.execute("SELECT job_id, repo, branch, queued FROM jobs WHERE queued IS NOT NULL"):
+        if repo and branch:
+            queued[jid] = (repo, branch, epoch(ts))
+    branches = {(r, b) for r, b, _ in queued.values()}
+    branches |= {(r, b) for (r, _), bs in wt_branches.items() for b in bs}
+    updates = []
+    for sid, repo, wt, branch, end, role, role_eff, parent in db.execute(
+            "SELECT session_id, repo, worktree, branch, end, role, role_eff, parent_session FROM sessions "
+            "WHERE repo IS NOT NULL AND (role = 'agent' OR (parent_session IS NOT NULL AND role_eff IN ('agent', 'main')))"
+            ).fetchall():
+        if (repo, branch) in branches:
+            continue
+        new = None
+        bs = wt_branches.get((repo, wt), set())
+        if len(bs) == 1:
+            new = (next(iter(bs)), "job_worktree")
+        elif end:
+            e0 = epoch(end)
+            near = sorted((q - e0, b) for r, b, q in queued.values() if r == repo and 0 <= q - e0 <= LINK_WINDOW)
+            if near:
+                new = (near[0][1], "queued")
+        if new:
+            updates.append((new[0], new[1], "agent" if parent else role_eff, sid))
+    db.executemany("UPDATE sessions SET branch_eff = ?, link = ?, role_eff = ? WHERE session_id = ?", updates)
 
 
 def rebuild_usage(db):
@@ -800,25 +886,40 @@ def fail_reason(text):
     return "other"
 
 
+def known_repos(state):
+    """The repos the queue knows (its repos/ folders), longest name first."""
+    return sorted((os.path.basename(p) for p in glob.glob(os.path.join(glob.escape(state), "repos", "*"))
+                   if os.path.isdir(p)), key=len, reverse=True)
+
+
+def job_files(state):
+    """Every job file the queue kept (queued, running, done, failed; per repo, and the old single queue's), as
+    {job_id, repo, branch, worktree (its folder name), type, description, queued (epoch, from the file's
+    name, or None)}. An old job's repo is the known repo its worktree's folder is or starts with "<repo>-"."""
+    known = known_repos(state)
+    out = []
+    paths = [(job, repo) for repo in known
+             for job in glob.glob(os.path.join(glob.escape(state), "repos", glob.escape(repo), "*", "*.job"))]
+    paths += [(job, None) for job in (glob.glob(os.path.join(glob.escape(state), "legacy", "*", "*.job"))
+                                      + glob.glob(os.path.join(glob.escape(state), "*", "*.job")))]
+    for job, repo in sorted(paths):
+        wt = os.path.basename((job_field(job, "worktree") or "").rstrip("/")) or None
+        if repo is None and wt:
+            repo = next((k for k in known if wt == k or wt.startswith(k + "-")), None)
+        name = os.path.basename(job)[:-4]
+        ns = name.split("-", 1)[0]
+        out.append({"job_id": name, "repo": repo, "branch": job_field(job, "branch") or None, "worktree": wt,
+                    "type": job_field(job, "type"), "description": job_field(job, "description"),
+                    "queued": int(ns) / 1e9 if ns.isdigit() and len(ns) >= 16 else None})
+    return out
+
+
 def job_repos(state):
     """branch -> repo, from the job files (a branch found in two repos maps to none)."""
-    known = sorted((os.path.basename(p) for p in glob.glob(os.path.join(glob.escape(state), "repos", "*"))
-                    if os.path.isdir(p)), key=len, reverse=True)
     found = {}
-
-    def add(branch, repo):
-        if branch and repo:
-            found.setdefault(branch, set()).add(repo)
-
-    for repo in known:
-        for job in glob.glob(os.path.join(glob.escape(state), "repos", glob.escape(repo), "*", "*.job")):
-            add(job_field(job, "branch"), repo)
-    for job in (glob.glob(os.path.join(glob.escape(state), "legacy", "*", "*.job"))
-                + glob.glob(os.path.join(glob.escape(state), "*", "*.job"))):
-        wt = job_field(job, "worktree") or ""
-        base = os.path.basename(wt.rstrip("/"))
-        repo = next((k for k in known if base == k or base.startswith(k + "-")), None)
-        add(job_field(job, "branch"), repo)
+    for j in job_files(state):
+        if j["branch"] and j["repo"]:
+            found.setdefault(j["branch"], set()).add(j["repo"])
     return {b: next(iter(r)) for b, r in found.items() if len(r) == 1}
 
 
@@ -848,6 +949,8 @@ def rebuild_jobs(db, state):
     jobs = {}
     first_event = {}  # repo -> the time of its first event
     review_events = {}  # review basename -> (ts, job_id, repo) of each of its review_finished events
+    checks = []  # (job_id, repo, branch, sha, ts, result) of each checks_finished that passed or failed
+    queued_sha = {}  # job_id -> the commit it was queued at
     for ts, ev, js in db.execute("SELECT ts, event, json FROM events_raw ORDER BY ts, hash"):
         try:
             d = json.loads(js)
@@ -867,6 +970,7 @@ def rebuild_jobs(db, state):
         j["branch"] = j["branch"] or d.get("branch")
         if ev == "job_queued":
             j["queued"] = ts
+            queued_sha[jid] = d.get("sha") if isinstance(d.get("sha"), str) else None
             j["review_level"] = d.get("review") if d.get("review") not in ("", None) else j["review_level"]
             j["tests"] = d.get("tests") if d.get("tests") not in ("", None) else j["tests"]
         elif ev == "job_started":
@@ -886,6 +990,9 @@ def rebuild_jobs(db, state):
         elif ev == "escalated":
             j["outcome"] = "escalated"
             j["fail_reason"] = j["fail_reason"] or d.get("reason")
+        elif ev == "checks_finished" and d.get("result") in ("pass", "fail"):
+            checks.append((jid, repo, d.get("branch"), d.get("sha") if isinstance(d.get("sha"), str) else None,
+                           ts, d["result"]))
         elif ev == "review_finished" and isinstance(d.get("review_file"), str):
             name = os.path.basename(d["review_file"])
             review_events.setdefault(name, []).append((ts, jid, repo))
@@ -934,6 +1041,9 @@ def rebuild_jobs(db, state):
             "review_level", "tests", "source", "found"]
     db.executemany("INSERT INTO jobs (%s) VALUES (%s)" % (", ".join(cols), ", ".join("?" * len(cols))),
                    [[j[c] for c in cols] for j in jobs.values()])
+    db.execute("DELETE FROM checks")
+    db.executemany("INSERT INTO checks (job_id, repo, branch, sha, queued_sha, ts, result) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                   [(c[0], c[1], c[2], c[3], queued_sha.get(c[0]), c[4], c[5]) for c in checks])
     return review_events, named, branch_repo
 
 
@@ -972,6 +1082,106 @@ def link_reviews(db, review_events, named, branch_repo):
     db.executemany("UPDATE reviews SET job_id = ?, repo = ?, cached = ? WHERE id = ?", updates)
 
 
+# --- git: what merged into main, and when the rules changed ----------------------------------------------------
+
+RULE_PATHS = (":(glob)claude/rules/**", ":(glob)**/CLAUDE.md", "scripts/queue/review.sh", ":(glob)claude/agents/**")
+FIX_RE = re.compile(r"^fix(\([^)]*\))?!?:", re.I)
+REVERT_RE = re.compile(r'^(revert "|revert(\([^)]*\))?!?:)', re.I)
+PR_SUFFIX_RE = re.compile(r"^(.*?)\s*\(#\d+\)$")
+MERGE_PR_RE = re.compile(r"^Merge pull request #\d+ from [^/\s]+/(\S+)")
+
+
+def checkouts(state):
+    """(repo, main checkout) of each repo the queue knows, from repos/<repo>/checkout."""
+    out = []
+    for repo in sorted(known_repos(state)):
+        try:
+            with open(os.path.join(state, "repos", repo, "checkout"), encoding="utf-8") as fh:
+                path = fh.read().strip()
+        except OSError:
+            continue
+        if path and os.path.isdir(path):
+            out.append((repo, path))
+    return out
+
+
+def git(path, *args):
+    """git's output in the checkout, or None if it fails."""
+    try:
+        return subprocess.run(["git", "-C", path, "-c", "core.quotePath=false"] + list(args), capture_output=True,
+                              text=True, errors="replace", check=True, stdin=subprocess.DEVNULL).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def git_log(path, *args):
+    """[(sha, short sha, UTC time, subject, [files])] of git log's commits."""
+    out = git(path, "log", "--format=%x00%H%x09%h%x09%cI%x09%s", *args)
+    if out is None:
+        return None
+    commits = []
+    for chunk in out.split("\0")[1:]:
+        lines = chunk.split("\n")
+        parts = lines[0].split("\t", 3)
+        if len(parts) == 4:
+            commits.append((parts[0], parts[1], norm_ts(parts[2]), parts[3], [f for f in lines[1:] if f]))
+    return commits
+
+
+def ingest_git(db, state):
+    """main_commits, main_commit_files and rule_changes, again, from each known repo's main checkout (origin/main,
+    else its HEAD): main's first-parent commits with the files each changed, and the commits that touched the
+    rules (RULE_PATHS). A commit's branch: the merged event's merge_sha, else a "Merge pull request ... from
+    <owner>/<branch>" subject, else a squash merge's "<type>: <description> (#N)" that one branch's job files
+    have. Its kind: revert, fix (a fix/ branch, or a "fix:" commit of no queue branch) or other. A repo whose
+    git fails keeps its rows. Returns (repos read, main commits, rule changes)."""
+    by_title = {}
+    for j in job_files(state):
+        if j["repo"] and j["branch"] and j["type"] and j["description"]:
+            by_title.setdefault((j["repo"], "%s: %s" % (j["type"], j["description"])), set()).add(j["branch"])
+    by_sha = {}
+    for (js,) in db.execute("SELECT json FROM events_raw WHERE event = 'merged'"):
+        try:
+            d = json.loads(js)
+        except ValueError:
+            continue
+        if isinstance(d.get("merge_sha"), str) and d["merge_sha"] and d.get("branch"):
+            by_sha[d["merge_sha"]] = d["branch"]
+    done = n_commits = n_rules = 0
+    for repo, path in checkouts(state):
+        ref = next((r for r in ("origin/main", "HEAD") if git(path, "rev-parse", "--verify", "-q", r + "^{commit}")),
+                   None)
+        commits = git_log(path, "--first-parent", "--name-only", ref) if ref else None
+        rules = git_log(path, "--first-parent", ref, "--", *RULE_PATHS) if ref else None
+        if commits is None or rules is None:
+            continue
+        db.execute("DELETE FROM main_commits WHERE repo = ?", (repo,))
+        db.execute("DELETE FROM main_commit_files WHERE repo = ?", (repo,))
+        db.execute("DELETE FROM rule_changes WHERE repo = ?", (repo,))
+        for sha, _, ts, subject, files in commits:
+            branch = by_sha.get(sha)
+            m = MERGE_PR_RE.match(subject)
+            if not branch and m:
+                branch = m.group(1)
+            t = PR_SUFFIX_RE.match(subject)
+            if not branch and t and len(by_title.get((repo, t.group(1)), ())) == 1:
+                branch = next(iter(by_title[(repo, t.group(1))]))
+            kind = "other"
+            if REVERT_RE.match(subject):
+                kind = "revert"
+            elif (branch or "").startswith("fix/") or (not branch and FIX_RE.match(subject)):
+                kind = "fix"
+            db.execute("INSERT OR REPLACE INTO main_commits VALUES (?, ?, ?, ?, ?, ?)",
+                       (repo, sha, ts, subject, branch, kind))
+            db.executemany("INSERT OR IGNORE INTO main_commit_files VALUES (?, ?, ?)", [(repo, sha, f) for f in files])
+        db.executemany("INSERT OR REPLACE INTO rule_changes VALUES (?, ?, ?, ?)",
+                       [(repo, short, ts, subject) for _, short, ts, subject, _ in rules])
+        done += 1
+        n_commits += len(commits)
+        n_rules += len(rules)
+    return done, n_commits, n_rules
+
+
 # --- db -------------------------------------------------------------------------------------------------------
 
 def default_db():
@@ -994,8 +1204,10 @@ def work_tree_of(path):
 
 
 MIGRATIONS = {2: [("reviews", "tests_skipped", "INTEGER"), ("findings", "ruling", "TEXT")],
-              3: [("jobs", "found", "TEXT")]}
-# Version 4 adds tables only (sessions, usage_msgs, usage_daily, prices): SCHEMA makes them.
+              3: [("jobs", "found", "TEXT")],
+              5: [("sessions", "branch_eff", "TEXT")]}
+# Version 4 adds tables only (sessions, usage_msgs, usage_daily, prices): SCHEMA makes them. Version 5 also adds
+# meta, checks, main_commits, main_commit_files and rule_changes.
 
 
 def migrate(db):
@@ -1044,6 +1256,8 @@ def ingest(dbpath, projects=None):
         files, new_msgs, skipped = ingest_transcripts(db, projects or default_projects())
         classify_sessions(db, state)
         unpriced = rebuild_usage(db)
+        git_repos, git_commits, git_rules = ingest_git(db, state)
+        db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_ingest', ?)", (iso(time.time()),))
     counts = {t: db.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
               for t in ("events_raw", "jobs", "reviews", "findings", "sessions", "usage_msgs")}
     roles = db.execute("SELECT group_concat(role || ' ' || n, ', ') FROM "
@@ -1053,6 +1267,7 @@ def ingest(dbpath, projects=None):
           % (new, changed, counts["events_raw"], counts["jobs"], counts["reviews"], counts["findings"], dbpath))
     print("stats: %d transcripts read, %d new messages; db has %d sessions (%s), %d messages"
           % (files, new_msgs, counts["sessions"], roles or "none", counts["usage_msgs"]))
+    print("stats: git: %d main commits and %d rule changes from %d repos" % (git_commits, git_rules, git_repos))
     if unpriced:
         print("stats: no price for %s: their cost is null" % ", ".join(unpriced))
     if skipped:

@@ -919,7 +919,8 @@ for sig in INT TERM HUP; do
   PR_QUEUE_POLL=30 PATH="$TQ/bin:$PATH" TMPDIR="$TQ/tmp" python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
     bash "$ROOT/scripts/queue/pr-queue.sh" run </dev/null >/dev/null 2>&1 &
   rpid=$!
-  for _ in $(seq 100); do [ "$(wc -l 2>/dev/null < "$TQ/hung")" = 4 ] && break; sleep 0.1; done
+  # Up to 30 s: with another suite running at the same time (a second checkout), 10 s was once not enough.
+  for _ in $(seq 300); do [ "$(wc -l 2>/dev/null < "$TQ/hung")" = 4 ] && break; sleep 0.1; done
   assert "several repos, $sig: all four sessions started" test "$(wc -l < "$TQ/hung")" = 4
   t0=$SECONDS
   if [ "$sig" = INT ]; then kill -INT -- "-$rpid"; else kill -"$sig" "$rpid"; fi

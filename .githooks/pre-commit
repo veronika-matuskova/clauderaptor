@@ -7,7 +7,8 @@ cd "$(git rev-parse --show-toplevel)" || exit 1
 bad=()
 while IFS= read -r -d '' f; do
   case "${f##*/}" in
-    *.db | *.sqlite | *.sqlite3 | *.db-journal | *.db-wal | events*.jsonl | report.html) bad+=("$f") ;;
+    *.db | *.db-journal | *.db-wal | *.db-shm | *.sqlite | *.sqlite-journal | *.sqlite-wal | *.sqlite-shm | \
+      *.sqlite3 | *.sqlite3-journal | *.sqlite3-wal | *.sqlite3-shm | events*.jsonl | report.html) bad+=("$f") ;;
   esac
 done < <(git diff --cached --name-only --diff-filter=ACMR -z)
 if [ "${#bad[@]}" -gt 0 ]; then

@@ -13,9 +13,16 @@ claude/skills/synced/
 
 # Stats data lives in the state dir (~/.local/state), never in the repo (the pre-commit hook also refuses it)
 *.db
-*.sqlite
-*.sqlite3
 *.db-journal
 *.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
 events*.jsonl
 report.html

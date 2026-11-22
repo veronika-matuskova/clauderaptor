@@ -388,6 +388,23 @@ assert_contains "a branch in two repos' job files: no repo" "$(q "SELECT ifnull(
 assert_contains "a branch in one repo's job files: that repo" "$(q "SELECT ifnull(repo,'none') FROM jobs WHERE branch = 'feat/solo'")" "one"
 unset DB2
 
+echo "-- a job replaced in the queue is no round"
+S3="$TMP/state3"; mkdir -p "$S3/reviews"; DB2="$TMP/out/replaced.db"
+{ ev2 2026-05-01T10:00:00.000Z job_queued r1 feat/rp
+  ev2 2026-05-01T10:10:00.000Z job_failed r1 feat/rp '"step":"review","reason":"review_code"'
+  ev2 2026-05-01T11:00:00.000Z job_queued r2 feat/rp
+  ev2 2026-05-01T11:05:00.000Z job_failed r2 feat/rp '"step":"queue","reason":"replaced"'
+  ev2 2026-05-01T11:06:00.000Z job_queued r3 feat/rp
+  ev2 2026-05-01T11:30:00.000Z merged r3 feat/rp '"pr":1'; } > "$S3/events.jsonl"
+PR_QUEUE_DIR="$S3" ingest "$DB2" >/dev/null
+P="SELECT ifnull(round,'none'), outcome FROM jobs WHERE job_id"
+assert_contains "the real rounds are 1 and 2: first" "$(q "$P = 'r1'")" "1|failed"
+assert_contains "the replaced job keeps its row, with no round" "$(q "$P = 'r2'")" "none|replaced"
+assert_contains "the real rounds are 1 and 2: merged" "$(q "$P = 'r3'")" "2|merged"
+assert_contains "rounds to merge leave it out" "$(q "SELECT rounds FROM v_rounds_per_branch")" "2"
+assert "failure counts leave it out" test "$(q "SELECT group_concat(fail_reason || ':' || failures) FROM v_failures_by_reason")" = "review_code:1"
+unset DB2
+
 echo "-- no bytecode in the checkout"
 # Run as a script and imported (the py helper), stats.py leaves no __pycache__ next to it.
 assert "no __pycache__ in scripts/" test -z "$(find "$ROOT/scripts" -name __pycache__)"

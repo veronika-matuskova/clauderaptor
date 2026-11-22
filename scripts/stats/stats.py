@@ -18,8 +18,9 @@ Sources, all in $PR_QUEUE_DIR (default ${XDG_STATE_HOME:-~/.local/state}/pr-queu
   the rounds of the time before a repo had events.
 Ingesting the same files again changes nothing. A db of an older schema version gets the new columns, and its
 review files are read again to fill them.
-Views: v_rounds_per_branch, v_findings_by_severity (code and test reviews only), v_cost_by_kind_level and
-v_judge_rulings (reviewer_precision: the share of the blocking findings it judged that the judge confirmed).
+Views: v_rounds_per_branch, v_findings_by_severity (code and test reviews only), v_cost_by_kind_level,
+v_failures_by_reason (failed and escalated rounds; a job replaced in the queue never ran, so it is no round)
+and v_judge_rulings (reviewer_precision: the share of the blocking findings it judged that the judge confirmed).
 """
 import argparse
 import calendar
@@ -59,6 +60,7 @@ DROP VIEW IF EXISTS v_rounds_per_branch;
 DROP VIEW IF EXISTS v_findings_by_severity;
 DROP VIEW IF EXISTS v_cost_by_kind_level;
 DROP VIEW IF EXISTS v_judge_rulings;
+DROP VIEW IF EXISTS v_failures_by_reason;
 CREATE VIEW v_rounds_per_branch AS
   SELECT repo, branch, round AS rounds, ended AS merged_at, job_id FROM jobs WHERE outcome = 'merged';
 -- The queue's reviewers' findings: not the judge's rulings, nor the suite audits (not part of the queue).
@@ -70,6 +72,10 @@ CREATE VIEW v_cost_by_kind_level AS
          SUM(duration_s) AS duration_s, SUM(tokens_in) AS tokens_in, SUM(tokens_out) AS tokens_out,
          SUM(tokens_cache_w) AS tokens_cache_w, SUM(tokens_cache_r) AS tokens_cache_r
   FROM reviews GROUP BY kind, level;
+-- Failed rounds by reason (a replaced job never ran: not a failure).
+CREATE VIEW v_failures_by_reason AS
+  SELECT repo, fail_reason, COUNT(*) AS failures FROM jobs WHERE outcome IN ('failed', 'escalated')
+  GROUP BY repo, fail_reason;
 -- The judge rules on the reviewers' blocking findings: reviewer_precision is the share it confirmed.
 CREATE VIEW v_judge_rulings AS
   SELECT ruling, COUNT(*) AS findings,
@@ -490,6 +496,8 @@ def rebuild_jobs(db, state):
             j["ended"] = ts
             j["outcome"] = "escalated" if j["outcome"] == "escalated" else "failed"
             j["fail_reason"] = d.get("reason")
+            if j["fail_reason"] == "replaced":  # removed from the queue by a re-queue of its branch: never ran
+                j["outcome"] = "replaced"
             if isinstance(d.get("found"), list):  # the reviews that found changes to make: code, tests
                 j["found"] = ",".join(sorted({k for k in d["found"] if isinstance(k, str) and k})) or None
         elif ev == "escalated":
@@ -531,6 +539,9 @@ def rebuild_jobs(db, state):
     rounds = {}
     for j in sorted(jobs.values(), key=lambda j: (j["queued"] or j["started"] or j["_first"] or "", j["job_id"])):
         key = (j["repo"], j["branch"])
+        if j["outcome"] == "replaced":
+            j["round"] = None  # never ran, so not a round
+            continue
         rounds[key] = rounds.get(key, 0) + 1
         j["round"] = rounds[key]
         if j["outcome"] == "merged":

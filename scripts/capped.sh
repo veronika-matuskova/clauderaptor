@@ -10,7 +10,8 @@
 # review session): a runaway in it fills only its own cap, so the caller keeps running and can report it.
 # All the scopes are in capped.slice, which caps them together: TasksMax=$CAP_TOTAL_TASKS (default 4000),
 # MemoryMax=$CAP_TOTAL_MEMORY (default 5G), no swap, and CPUQuota=$CAP_TOTAL_CPU (default 60% of the CPUs,
-# e.g. 480% with 8), so capped tests and mutation loops leave CPUs for e2e runs and sessions. So capped
+# e.g. 480% with 8; all of them, `nproc --all`, so a caller's OMP_NUM_THREADS or taskset doesn't lower the
+# cap for every capped command; 2 if nproc fails), so capped tests and mutation loops leave CPUs for e2e runs and sessions. So capped
 # commands that call capped.sh again, even without end, stay inside that cap, and so do several capped
 # commands at the same time. The CPU cap applies only where the user manager has the cpu controller
 # (scripts/setup/setup.sh caps delegates it; check.sh says whether it has it); without it, systemd accepts
@@ -33,7 +34,7 @@ set -uo pipefail
 if [ -n "${CAP_OFF:-}" ]; then exec "$@"; fi
 caps=(-p TasksMax="${CAP_TASKS:-2000}" -p MemoryMax="${CAP_MEMORY:-4G}" -p MemorySwapMax=0 -p TimeoutStopSec=10)
 total=(TasksMax="${CAP_TOTAL_TASKS:-4000}" MemoryMax="${CAP_TOTAL_MEMORY:-5G}" MemorySwapMax=0
-  CPUQuota="${CAP_TOTAL_CPU:-$(( $(nproc 2>/dev/null || echo 2) * 60 ))%}")
+  CPUQuota="${CAP_TOTAL_CPU:-$(( $(nproc --all 2>/dev/null || echo 2) * 60 ))%}")
 keep=(); [[ "$(systemd-run --help 2>/dev/null)" != *--expand-environment* ]] || keep=(--expand-environment=no)
 # check: runs the check; err gets what systemd said.
 check() {

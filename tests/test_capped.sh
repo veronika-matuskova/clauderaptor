@@ -88,7 +88,7 @@ assert "the command's exit code"            test "$rc" = 3
 assert_contains "a scope of its own, in capped.slice" "$(cat "$LOG")" \
   "--scope --quiet --collect --slice=capped.slice --unit=capped-"
 assert_contains "the overall cap on capped.slice" "$(cat "$LOG")" \
-  "systemctl --user set-property --runtime capped.slice TasksMax=4000 MemoryMax=5G MemorySwapMax=0 CPUQuota=$(($(nproc) * 60))%"
+  "systemctl --user set-property --runtime capped.slice TasksMax=4000 MemoryMax=5G MemorySwapMax=0 CPUQuota=$(($(nproc --all) * 60))%"
 assert_contains "the default caps"          "$(cat "$LOG")" \
   "-p TasksMax=2000 -p MemoryMax=4G -p MemorySwapMax=0 -p TimeoutStopSec=10 -- bash -c"
 assert_contains "the check: the same caps, in capped.slice" "$(cat "$LOG")" \
@@ -102,10 +102,16 @@ CAP_TASKS=7 CAP_MEMORY=100M CAP_TOTAL_TASKS=9 CAP_TOTAL_MEMORY=1G CAP_TOTAL_CPU=
 assert_contains "CAP_TASKS and CAP_MEMORY"  "$(cat "$LOG")" "-p TasksMax=7 -p MemoryMax=100M"
 assert_contains "CAP_TOTAL_TASKS, CAP_TOTAL_MEMORY and CAP_TOTAL_CPU" "$(cat "$LOG")" \
   "capped.slice TasksMax=9 MemoryMax=1G MemorySwapMax=0 CPUQuota=150%"
-# The default CPU cap: 60% of the CPUs nproc reports
-newlog cpus; printf '#!/usr/bin/env bash\necho 3\n' > "$BIN/nproc"; chmod +x "$BIN/nproc"
+# The default CPU cap: 60% of all the CPUs (nproc --all: OMP_NUM_THREADS and taskset don't count), 2 if
+# nproc fails. The stub prints 3 for --all, 1 without it.
+printf '#!/usr/bin/env bash\nif [ "$*" = --all ]; then echo 3; else echo 1; fi\n' > "$BIN/nproc"; chmod +x "$BIN/nproc"
+newlog cpus; C true
+assert_contains "default CPU cap: 60% of all the CPUs" "$(cat "$LOG")" "MemorySwapMax=0 CPUQuota=180%"
+newlog cpusomp; OMP_NUM_THREADS=1 C true
+assert_contains "default CPU cap: OMP_NUM_THREADS doesn't lower it" "$(cat "$LOG")" "MemorySwapMax=0 CPUQuota=180%"
+newlog cpusfail; printf '#!/usr/bin/env bash\nexit 1\n' > "$BIN/nproc"
 C true; rm "$BIN/nproc"
-assert_contains "default CPU cap: 60% of the CPUs" "$(cat "$LOG")" "MemorySwapMax=0 CPUQuota=180%"
+assert_contains "default CPU cap: nproc fails, 2 CPUs" "$(cat "$LOG")" "MemorySwapMax=0 CPUQuota=120%"
 assert_contains "arguments kept as they are" "$(C printf '%s|' 'a b' '' c)" "a b||c|"
 # A newer systemd-run: --expand-environment=no, in the check and the real call, so ${...} and $$ stay as they are.
 newlog expand; touch "$EXPANDS"
@@ -233,7 +239,7 @@ if [ -z "$(env -u CAP_OFF bash "$ROOT/scripts/capped.sh" true 2>&1)" ]; then
   assert_contains "real: the overall cap applies" "$out" "slice=capped.slice pids.max=4000 memory.max=5368709120 swap.max=0"
   # With the cpu controller delegated (setup.sh caps), the overall CPU cap applies: 60% of the CPUs per 100 ms
   if [[ "$out" != *"slice: no cpu controller"* ]]; then
-    assert_contains "real: the overall CPU cap applies" "$out" "slice cpu.max=$(($(nproc) * 60000)) 100000"
+    assert_contains "real: the overall CPU cap applies" "$out" "slice cpu.max=$(($(nproc --all) * 60000)) 100000"
   fi
   assert_contains "real: a nested call, in capped.slice too" "$out" "nested: a scope of its own in capped.slice"
   assert_contains "real: \${...} and \$\$ kept"  "$(env -u CAP_OFF bash "$ROOT/scripts/capped.sh" printf '%s|' '${HOME}' 'a$$b')" '${HOME}|a$$b|'

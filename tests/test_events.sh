@@ -54,6 +54,14 @@ emit checks_finished failed:list="$(seq 5000)" detail="$long"
 assert "long: one line"                      test "$(wc -l < "$EV")" = 1
 assert "long: under 4 KB"                    test "$(wc -c < "$EV")" -lt 4096
 assert_contains "long: marked truncated"     "$(jq_py "$EV" 'recs[0]["truncated"], recs[0]["event"]')" "(True, 'checks_finished')"
+# Still over 4 KB after the 256 cut (20 items of 210 characters): written, with the items cut to 64.
+rm -f "$EV"; items="$(for i in $(seq 25); do printf "%03d%s\n" "$i" "${long:0:207}"; done)"
+emit checks_finished failed:list="$items"
+assert "64 cut: one line"                    test "$(wc -l < "$EV")" = 1
+assert "64 cut: under 4 KB"                  test "$(wc -c < "$EV")" -lt 4096
+assert_contains "64 cut: 20 items of 64 characters, the first ones" \
+  "$(jq_py "$EV" 'len(recs[0]["failed"]), {len(x) for x in recs[0]["failed"]}, recs[0]["failed"][0][:3], recs[0]["failed"][-1][:3], recs[0]["truncated"]')" \
+  "(20, {64}, '001', '020', True)"
 # Too many fields to cut under 4 KB: no line rather than one that a concurrent write could split.
 rm -f "$EV"; many=(); for i in $(seq 300); do many+=("field$i=${long:0:64}"); done
 emit job_started "${many[@]}"

@@ -68,13 +68,15 @@ sha="$(git rev-parse HEAD)"
 printf 'Full end-to-end suite passed locally on `%s` (1 passed).\n' "$sha"
 EOF
 # npm run test:e2e:full: records whether it ran under the e2e lock (and if it got PR_QUEUE_CHILD), then passes
-# unless $TQ/e2e_fail exists. $TQ/on_e2e: a script run once, first.
+# unless $TQ/e2e_fail exists. $TQ/on_e2e: a script run once, first. $TQ/e2e_nopass: it passes, but records no
+# pass (so e2e-gate.mjs pr-line fails).
 cat > "$TQ/bin/npm" <<'EOF'
 #!/usr/bin/env bash
 [ -f "$TQ/on_e2e" ] && { bash "$TQ/on_e2e"; rm -f "$TQ/on_e2e"; }
 if flock -n "$PR_QUEUE_DIR/e2e.lock" true; then echo "$* unlocked" >> "$TQ/npm.log"; else echo "$* locked" >> "$TQ/npm.log"; fi
 if [ -n "${PR_QUEUE_CHILD+set}" ]; then echo "inherited PR_QUEUE_CHILD" >> "$TQ/npm.log"; fi
 [ -f "$TQ/e2e_fail" ] && exit 1
+[ -f "$TQ/e2e_nopass" ] && exit 0
 touch "$TQ/passed/$(git rev-parse HEAD)"
 EOF
 # claude -p (run by review.sh): logs "code <prompt>" for a code review, "tests <first line>" for a test review,
@@ -110,6 +112,9 @@ chmod +x "$TQ/bin/"*
 
 # Origin, the main checkout R (with the repo's scripts), and a second clone O that moves main.
 git init -q --bare -b main "$TMP/origin.git"
+# With $TQ/push_reject, origin rejects every push.
+# shellcheck disable=SC2016  # $TQ expands when the hook runs
+printf '#!/usr/bin/env bash\n[ ! -f "$TQ/push_reject" ]\n' > "$TMP/origin.git/hooks/pre-receive"; chmod +x "$TMP/origin.git/hooks/pre-receive"
 R="$TMP/repo"; git clone -q "$TMP/origin.git" "$R" 2>/dev/null
 RQ="$PR_QUEUE_DIR/repos/repo"   # the queue of R's repo
 mkdir -p "$R/scripts"; touch "$R/scripts/e2e-gate.mjs"
@@ -133,7 +138,8 @@ mkwt() {
 }
 reset_pr() {
   rm -f "$TQ/pr_state" "$TQ/pr_body" "$TQ/pr_branch" "$TQ/checks_seq" "$TQ/e2e_fail" "$TQ/merge_fail" "$TQ/head_lag" "$TQ/on_checks" \
-    "$TQ/verdict" "$TQ/tests_verdict" "$TQ/judge_verdict" "$TQ/judge_hang" "$TQ/claude_fail" "$TQ/sync" "$TQ"/started-* "$TQ/sync.log"
+    "$TQ/verdict" "$TQ/tests_verdict" "$TQ/judge_verdict" "$TQ/judge_hang" "$TQ/claude_fail" "$TQ/sync" "$TQ"/started-* "$TQ/sync.log" \
+    "$TQ/e2e_nopass" "$TQ/push_reject"
   : > "$TQ/gh.log"; : > "$TQ/created.log"; : > "$TQ/npm.log"; : > "$TQ/claude.log"
 }
 # code_reviews / test_reviews: the review sessions claude.log shows since the last reset
@@ -358,6 +364,29 @@ reset_pr; touch "$TQ/e2e_fail"; mkwt e2efail
 Q add "$TMP/wt-e2efail" fix "E2e fail" >/dev/null; out="$(Q run)"
 assert_contains "e2e fail: job failed"       "$out" "FAILED fix/e2efail: the full e2e suite failed"
 assert "e2e fail: no PR opened"              test ! -s "$TQ/created.log"
+
+# --- the other failures before the PR: git fetch, no pass recorded after a passing e2e run, git push ---
+reset_pr; mkwt nofetch
+Q add --review none --tests none "$TMP/wt-nofetch" fix "No fetch" >/dev/null
+git -C "$R" remote set-url origin "$TMP/no-such-origin.git"; out="$(Q run)"; git -C "$R" remote set-url origin "$TMP/origin.git"
+assert_contains "fetch fails: job failed"    "$out" "FAILED fix/nofetch: git fetch failed"
+assert_contains "events: fetch fails at main" "$(ev fix/nofetch 'failed(), names()')" "('main/fetch', 'job_queued job_started job_failed')"
+reset_pr; touch "$TQ/e2e_nopass"; mkwt nopass
+Q add --review none --tests none "$TMP/wt-nopass" fix "No pass" >/dev/null; out="$(Q run)"
+assert_contains "no pass recorded: job failed" "$out" "FAILED fix/nopass: no local e2e pass recorded for"
+assert "no pass recorded: no PR opened"      test ! -s "$TQ/created.log"
+assert_contains "events: e2e passed, no pass recorded" "$(ev fix/nopass 'failed(), one("e2e_finished")["rc"]')" "('e2e/no_e2e_pass', 0)"
+# push fails on the open PR's path (a PR is open for the branch) and on gh's (no scripts/create-pr.sh)
+reset_pr; mkwt pushopen; echo OPEN > "$TQ/pr_state"; echo fix/pushopen > "$TQ/pr_branch"; echo body > "$TQ/pr_body"; touch "$TQ/push_reject"
+Q add --review none --tests none "$TMP/wt-pushopen" fix "Push open" >/dev/null; out="$(Q run)"
+assert_contains "push to the open PR fails: job failed" "$out" "FAILED fix/pushopen: git push failed"
+assert_contains "events: push to the open PR fails" "$(ev fix/pushopen 'failed()')" "pr/push"
+reset_pr; mkwt pushgh; git -C "$TMP/wt-pushgh" rm -q scripts/create-pr.sh; git -C "$TMP/wt-pushgh" commit -qm rm
+Q add --review none --tests none "$TMP/wt-pushgh" fix "Push gh" >/dev/null; touch "$TQ/push_reject"; out="$(Q run)"
+assert_contains "push before gh pr create fails: job failed" "$out" "FAILED fix/pushgh: git push failed"
+assert "push before gh pr create fails: no PR" test ! -s "$TQ/created.log"
+assert_contains "events: push before gh pr create fails" "$(ev fix/pushgh 'failed()')" "pr/push"
+rm -f "$TQ/push_reject"
 assert_contains "events: e2e fails" "$(ev fix/e2efail 'failed()')" "e2e/e2e"
 assert_contains "events: the e2e rc" "$(ev fix/e2efail 'one("e2e_finished")["rc"]')" "1"
 assert_contains "events: no PR after e2e" "$(ev fix/e2efail 'names()')" "e2e_waiting e2e_started e2e_finished job_failed"
@@ -511,15 +540,28 @@ assert_not_contains "events: left open, not merged" "$(ev fix/open 'names()')" "
 # --- events: e2e_waiting before the e2e lock, e2e_started once it's held; an up-to-date branch is "clean" ---
 reset_pr; mkwt e2ewait
 Q add --review none --tests none "$TMP/wt-e2ewait" fix "E2e wait" >/dev/null
-flock "$PR_QUEUE_DIR/e2e.lock" sleep 1.5 & sleep 0.3
+# The lock is held until the job's e2e_waiting is in the events file (at most 30 s), and 1 s more, in which an
+# e2e_started (sent without the lock) is noted in $TQ/started_early. Then it is released; the time of the release
+# (ms, as in ts) goes to $TQ/released. The queue can't send e2e_started while the lock is held, so no load makes
+# this fail: the 1 s only bounds how soon an e2e_started sent too early shows up.
+rm -f "$TQ/released" "$TQ/started_early"
+# shellcheck disable=SC2016  # expands in the holder
+flock "$PR_QUEUE_DIR/e2e.lock" bash -c 'seen() { grep "\"branch\":\"fix/e2ewait\"" "$1" 2>/dev/null | grep -q "\"event\":\"$2\""; }
+  for _ in $(seq 600); do seen "$1" e2e_waiting && break; sleep 0.05; done
+  for _ in $(seq 20); do seen "$1" e2e_started && { touch "$3"; break; }; sleep 0.05; done
+  date +%s%3N > "$2"' _ "$EVENTS" "$TQ/released" "$TQ/started_early" &
+for _ in $(seq 600); do flock -n "$PR_QUEUE_DIR/e2e.lock" true || break; sleep 0.05; done   # until it is held
 out="$(Q run)"; wait
 assert_contains "events: waited, then merged" "$out" "MERGED fix/e2ewait"
 assert_contains "events: no reviews, no review events" "$(ev fix/e2ewait 'names()')" "job_queued job_started main_merged e2e_waiting e2e_started"
 assert_contains "events: clean when main is in" "$(ev fix/e2ewait 'one("main_merged")["result"]')" "clean"
 assert_contains "events: --review/--tests none queued" "$(ev fix/e2ewait 'one("job_queued")["review"], one("job_queued")["tests"]')" "('none', 'none')"
-# ts is ISO 8601 with ms in UTC: the same day, so the time of day compares as text.
-assert "events: e2e_started only once the lock was free (0.9 s+ after e2e_waiting)" \
-  test "$(ev fix/e2ewait '(lambda s: s(one("e2e_started")) - s(one("e2e_waiting")) >= 0.9)(lambda r: __import__("datetime").datetime.fromisoformat(r["ts"].replace("Z", "+00:00")).timestamp())')" = True
+assert "events: the lock was released after e2e_waiting" test -s "$TQ/released"
+assert "events: no e2e_started while the lock was held" test ! -e "$TQ/started_early"
+# ts (ms) of an event, in ms since the epoch, against the release: e2e_waiting before it, e2e_started after.
+ms='(lambda r: round(__import__("datetime").datetime.fromisoformat(r["ts"].replace("Z", "+00:00")).timestamp() * 1000))'
+assert_contains "events: e2e_waiting while the lock was held, e2e_started once it was free" \
+  "$(ev fix/e2ewait "($ms(one('e2e_waiting')) <= $(cat "$TQ/released"), $ms(one('e2e_started')) >= $(cat "$TQ/released"))")" "(True, True)"
 
 # --- an events path the queue can't write to changes no outcome ---
 mkdir -p "$TMP/evdir"

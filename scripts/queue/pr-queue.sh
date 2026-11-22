@@ -51,6 +51,11 @@
 # repo's jobs (queue, running, done, failed), logs, results.log and run.lock; e2e.lock and reviews/ are shared.
 # Jobs of the old single queue ($PR_QUEUE_DIR/queue, ...) move to their repo's queue once no runner of the
 # old version holds $PR_QUEUE_DIR/run.lock.
+# Each step also appends a stats event (scripts/queue/events.sh: one JSON line, ids and numbers only) to
+# $STATS_EVENTS_FILE (default $PR_QUEUE_DIR/events.jsonl), for the local stats collector; STATS_EVENTS=0 turns
+# them off. An event that can't be written is skipped, and never changes what the queue does. A job ends with
+# merged, job_ready (PR_QUEUE_MERGE=0) or job_failed {step, reason} (the reasons: see failjob); job_failed of a
+# review or a judge also has found, the reviews that found changes (code, tests).
 set -uo pipefail
 
 STATE="${PR_QUEUE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/pr-queue}"
@@ -63,6 +68,10 @@ CHECKS_WAIT="${PR_QUEUE_CHECKS_WAIT:-30}"
 REVIEWS="${REVIEW_DIR:-$STATE/reviews}"
 HERE="$(dirname "$(readlink -f "$0")")"
 CHECKS_TIMEOUT="${PR_QUEUE_CHECKS_TIMEOUT:-3600}"
+# Stats events (emit), for the local stats collector; without events.sh, emit does nothing.
+EV_REPO=""; EV_BRANCH=""; EV_JOB_ID=""; EV_SHA=""
+# shellcheck source=scripts/queue/events.sh
+source "$HERE/events.sh" 2>/dev/null || emit() { :; }
 
 die() { echo "pr-queue: $*" >&2; exit 1; }
 usage() { sed -n 's/^#   \(pr-queue\.sh .*\)/  \1/p' "$0"; exit 1; }
@@ -168,6 +177,8 @@ add() {
   file="$QUEUE/$(date +%s%N)-${branch//\//-}"
   if [ -n "$body" ]; then cp "$body" "$file.body"; fi
   printf 'worktree=%s\nbranch=%s\ntype=%s\ndescription=%s\nreview=%s\ntests=%s\n' "$wt" "$branch" "$type" "$desc" "$review" "$tests" > "$file.job"
+  EV_REPO="$REPO" EV_BRANCH="$branch" EV_JOB_ID="$(basename "$file")" EV_SHA="$(git -C "$wt" rev-parse HEAD 2>/dev/null)" \
+    emit job_queued review:opt="$review" tests:opt="$tests" type="$type"
   echo "pr-queue: queued $branch ($(find "$QUEUE" -name '*.job' | wc -l) in the queue of $REPO)"
 }
 
@@ -178,23 +189,39 @@ with_line() {
   if [ -n "$2" ]; then printf '\n%s\n\n%s\n' "$PASS_HEADING" "$2"; fi
 }
 
-# Logs a step's output; on failure records the reason, moves the job to failed/ and returns 1.
+# failjob <step> <reason> <message> [<emit field>...]: records the message, moves the job to failed/ and
+# returns 1. The step, the reason and the fields go to the job_failed event. Reasons: not_ready (the worktree is
+# gone, off the branch or dirty), fetch, conflict, review_code, review_tests, review_error, judge, e2e,
+# no_e2e_pass, moved (commits after the review), push, pr, head, checks_failed, checks_timeout, merge; and
+# abandoned, for a job a dead runner left in running/ (step start) or whose process ended without failjob (step
+# unknown), both in run_repo.
 JOB=""; LOG=""; BRANCH=""
 failjob() {
-  echo "$(date '+%F %T') FAILED $BRANCH: $1 (log: $LOG)" | tee -a "$RESULTS"
+  emit job_failed step="$1" reason="$2" "${@:4}"
+  echo "$(date '+%F %T') FAILED $BRANCH: $3 (log: $LOG)" | tee -a "$RESULTS"
   mv "$JOB.job" "$RQ/failed/" 2>/dev/null
   if [ -f "$JOB.body" ]; then mv "$JOB.body" "$RQ/failed/"; fi
   return 1
 }
 finishjob() { mv "$JOB.job" "$RQ/done/"; rm -f "$JOB.body"; }
-# review_result <name> <output file> <exit code>: logs a review.sh run, and adds to $problems why it failed.
+# review_result <name> <output file> <exit code> <kind> <level>: logs a review.sh run, and adds to $problems why it failed.
 review_result() {
   local out file
   out="$(cat "$2")"; printf '%s\n' "$out" >> "$LOG"
   if grep -qx 'already reviewed as ready' <<<"$out"; then echo "   $1: already reviewed as ready" | tee -a "$LOG"; fi
   file="$(sed -n 's/^(saved to \(.*\))$/\1/p' <<<"$out" | tail -1)"
-  if [ "$3" -eq 1 ] && [ -n "$file" ]; then found+=("$file"); findings+="; the $1 found changes to make ($1: $file)"
+  review_finished "$4" "$5" "$3" "$out"
+  if [ "$3" -eq 1 ] && [ -n "$file" ]; then found+=("$file"); findings+="; the $1 found changes to make ($1: $file)"; found_kinds+="$4"$'\n'
   elif [ "$3" -ne 0 ]; then problems+="; the $1 didn't run: $(tail -1 <<<"$out")"; fi
+}
+# review_finished <kind> <level> <exit code> <review.sh output>: the review_finished event. The verdict is the
+# exit code's: 0 ready, 1 needs changes, 3 escalate, else error.
+review_finished() {
+  local verdict file
+  case "$3" in 0) verdict=ready ;; 1) verdict="needs changes" ;; 3) verdict=escalate ;; *) verdict=error ;; esac
+  file="$(sed -n 's/^(saved to \(.*\))$/\1/p' <<<"$4" | tail -1)"
+  emit review_finished kind="$1" level:opt="$2" exit:int="$3" verdict="$verdict" review_file:opt="${file##*/}" \
+    cached:bool="$(grep -qx 'already \(reviewed\|judged\) as ready' <<<"$4" && echo 1)"
 }
 # stop_reviews <signal>: a Ctrl-C, hangup or TERM to the process group during step 2 stops both reviews
 # (review.sh then stops its claude -p session and waits for it) and removes their output files. Then this job's
@@ -213,24 +240,31 @@ process() {
   local wt type desc pr sha line main_dir merged level review_rc reviewed="" tries=0
   wt="$(field worktree "$1")"; BRANCH="$(field branch "$1")"; type="$(field type "$1")"; desc="$(field description "$1")"
   LOG="$LOGS/$BRANCH.log"; mkdir -p "$(dirname "$LOG")"
+  EV_REPO="$REPO"; EV_BRANCH="$BRANCH"; EV_JOB_ID="$(basename "$JOB")"; EV_SHA="$(git -C "$wt" rev-parse HEAD 2>/dev/null)"
+  emit job_started
   echo "== $(date '+%F %T') $BRANCH" | tee -a "$LOG"
-  cd "$wt" 2>/dev/null || { failjob "worktree $wt is gone"; return; }
-  [ "$(git branch --show-current)" = "$BRANCH" ] || { failjob "$wt is no longer on $BRANCH"; return; }
-  [ -z "$(git status --porcelain)" ] || { failjob "uncommitted changes in $wt"; return; }
+  cd "$wt" 2>/dev/null || { failjob start not_ready "worktree $wt is gone"; return; }
+  [ "$(git branch --show-current)" = "$BRANCH" ] || { failjob start not_ready "$wt is no longer on $BRANCH"; return; }
+  [ -z "$(git status --porcelain)" ] || { failjob start not_ready "uncommitted changes in $wt"; return; }
 
   # 1. Up to date with main.
-  git fetch -q origin >>"$LOG" 2>&1 || { failjob "git fetch failed"; return; }
+  git fetch -q origin >>"$LOG" 2>&1 || { failjob main fetch "git fetch failed"; return; }
   if ! git merge-base --is-ancestor origin/main HEAD; then
     if ! git merge --no-edit -q origin/main >>"$LOG" 2>&1; then
-      local files; files="$(git diff --name-only --diff-filter=U | tr '\n' ' ')"
+      local files; files="$(git diff --name-only --diff-filter=U)"
       git merge --abort >>"$LOG" 2>&1
-      failjob "merge conflict with origin/main in: ${files% }"; return
+      emit main_merged result=conflict files:list="$files"
+      files="$(tr '\n' ' ' <<<"$files")"
+      failjob main conflict "merge conflict with origin/main in: ${files% }"; return
     fi
+    EV_SHA="$(git rev-parse HEAD)"; emit main_merged result=merged
     echo "   merged origin/main" | tee -a "$LOG"
+  else
+    emit main_merged result=clean
   fi
 
   # 2. Review the code and the tests, in fresh sessions at the same time, before the e2e run is spent on it.
-  local tests code_pid="" tests_pid="" code_out="" tests_out="" judge_out="" problems="" findings="" found=() judged
+  local tests code_pid="" tests_pid="" code_out="" tests_out="" judge_out="" problems="" findings="" found=() found_kinds="" judged
   level="$(field review "$1")"; tests="$(field tests "$1")"
   if [ "$level" = none ]; then
     echo "   not reviewed (queued with --review none)" | tee -a "$LOG"; level=""
@@ -250,40 +284,51 @@ process() {
     trap 'stop_reviews INT' INT; trap 'stop_reviews TERM' TERM; trap 'stop_reviews HUP' HUP
     if [ -n "$level" ]; then
       echo "   reviewing $(git rev-parse --short HEAD) (/code-review $level)" | tee -a "$LOG"
+      emit review_started kind=code level="$level"
       REVIEW_DIR="$REVIEWS" REVIEW_SKIP_TESTS="${tests:+1}" "$HERE/review.sh" "$wt" "$level" >"$code_out" 2>&1 &
       code_pid=$!
     fi
     if [ -n "$tests" ]; then
       echo "   reviewing the tests of $(git rev-parse --short HEAD)" | tee -a "$LOG"
+      emit review_started kind=tests level:opt=
       REVIEW_DIR="$REVIEWS" "$HERE/review.sh" --tests "$wt" >"$tests_out" 2>&1 &
       tests_pid=$!
     fi
-    if [ -n "$code_pid" ]; then wait "$code_pid"; review_rc=$?; review_result review "$code_out" "$review_rc"; fi
-    if [ -n "$tests_pid" ]; then wait "$tests_pid"; review_rc=$?; review_result "test review" "$tests_out" "$review_rc"; fi
+    if [ -n "$code_pid" ]; then wait "$code_pid"; review_rc=$?; review_result review "$code_out" "$review_rc" code "$level"; fi
+    if [ -n "$tests_pid" ]; then wait "$tests_pid"; review_rc=$?; review_result "test review" "$tests_out" "$review_rc" tests ""; fi
     rm -f "$code_out" "$tests_out"
-    if [ -n "$problems" ]; then trap - INT TERM HUP; failjob "${problems#; }$findings"; return; fi
+    if [ -n "$problems" ]; then trap - INT TERM HUP; failjob review review_error "${problems#; }$findings" found:list="${found_kinds%$'\n'}"; return; fi
     if [ ${#found[@]} -gt 0 ] && [ "${PR_QUEUE_JUDGE:-1}" = 0 ]; then
-      trap - INT TERM HUP; failjob "${findings#; }"; return
+      # Both reviews' findings: the code's is named as the reason, and both kinds are in found.
+      trap - INT TERM HUP
+      local reason=review_tests; if grep -qx code <<<"$found_kinds"; then reason=review_code; fi
+      failjob review "$reason" "${findings#; }" found:list="${found_kinds%$'\n'}"; return
     fi
     if [ ${#found[@]} -gt 0 ]; then
       echo "   judging the findings (review.sh --judge)" | tee -a "$LOG"
+      emit review_started kind=judge level:opt=
       judge_out="$(mktemp)"
       REVIEW_DIR="$REVIEWS" "$HERE/review.sh" --judge "$wt" "${found[@]}" >"$judge_out" 2>&1 &
       wait $!; review_rc=$?
       trap - INT TERM HUP
       judged="$(cat "$judge_out")"; rm -f "$judge_out"; printf '%s\n' "$judged" >> "$LOG"
+      review_finished judge "" "$review_rc" "$judged"
       local jfile; jfile="$(sed -n 's/^(saved to \(.*\))$/\1/p' <<<"$judged" | tail -1)"
       case "$review_rc" in
         0) echo "   the judge found nothing to fix (judge: $jfile)" | tee -a "$LOG" ;;
-        1) failjob "${findings#; }; the judge confirmed changes to make (judge: $jfile)"; return ;;
+        1) failjob judge judge "${findings#; }; the judge confirmed changes to make (judge: $jfile)" found:list="${found_kinds%$'\n'}"; return ;;
         3)
           if grep -q 'two judged rounds' <<<"$judged"; then
-            failjob "needs your decision: the branch still had changes to make after two judged rounds (judge: $jfile)"
+            emit escalated reason=two_rounds review_file:opt="${jfile##*/}"
+            failjob judge judge "needs your decision: the branch still had changes to make after two judged rounds (judge: $jfile)" \
+              found:list="${found_kinds%$'\n'}"
           else
-            failjob "needs your decision: the judge rejected a finding that would be critical if real (judge: $jfile)"
+            emit escalated reason=critical_finding review_file:opt="${jfile##*/}"
+            failjob judge judge "needs your decision: the judge rejected a finding that would be critical if real (judge: $jfile)" \
+              found:list="${found_kinds%$'\n'}"
           fi
           return ;;
-        *) failjob "${findings#; }; the judge didn't run: $(tail -1 <<<"$judged")"; return ;;
+        *) failjob judge review_error "${findings#; }; the judge didn't run: $(tail -1 <<<"$judged")" found:list="${found_kinds%$'\n'}"; return ;;
       esac
     fi
     trap - INT TERM HUP
@@ -294,26 +339,33 @@ process() {
   if [ -f scripts/e2e-gate.mjs ]; then
     if ! node scripts/e2e-gate.mjs pr-line >/dev/null 2>&1; then
       echo "   running the full e2e suite on $(git rev-parse --short HEAD)" | tee -a "$LOG"
-      flock "$STATE/e2e.lock" npm run test:e2e:full >>"$LOG" 2>&1 || { failjob "the full e2e suite failed"; return; }
+      # The e2e lock is held on fd 8 for the subshell, so that e2e_started is emitted once it is held.
+      emit e2e_waiting
+      ( flock 8 || exit 1; emit e2e_started; npm run test:e2e:full ) 8>"$STATE/e2e.lock" >>"$LOG" 2>&1
+      local e2e_rc=$?
+      emit e2e_finished rc:int="$e2e_rc"
+      [ "$e2e_rc" -eq 0 ] || { failjob e2e e2e "the full e2e suite failed"; return; }
     fi
-    line="$(node scripts/e2e-gate.mjs pr-line 2>>"$LOG")" || { failjob "no local e2e pass recorded for $(git rev-parse --short HEAD)"; return; }
+    line="$(node scripts/e2e-gate.mjs pr-line 2>>"$LOG")" || { failjob e2e no_e2e_pass "no local e2e pass recorded for $(git rev-parse --short HEAD)"; return; }
   fi
   sha="$(git rev-parse HEAD)"
   if [ -n "$reviewed" ] && [ "$sha" != "$reviewed" ]; then
-    failjob "$BRANCH got commits after the review; queue it again to review them"; return
+    EV_SHA="$sha"; failjob e2e moved "$BRANCH got commits after the review; queue it again to review them"; return
   fi
+  EV_SHA="$sha"
 
   # 4. Open the PR, or update the open one. The body goes first: CI reads it when the push arrives.
   pr="$(gh pr view "$BRANCH" --json number,state -q 'select(.state=="OPEN") | .number' 2>/dev/null)"
+  local new_pr=""; [ -n "$pr" ] || new_pr=1
   if [ -n "$pr" ]; then
     if [ -f "$JOB.body" ]; then cp "$JOB.body" "$JOB.base"; else gh pr view "$pr" --json body -q .body > "$JOB.base" 2>>"$LOG"; fi
     with_line "$JOB.base" "$line" > "$JOB.newbody"
     gh pr edit "$pr" --body-file "$JOB.newbody" >>"$LOG" 2>&1 || echo "   could not set the body of #$pr" | tee -a "$LOG"
     rm -f "$JOB.base" "$JOB.newbody"
-    git push -q origin "$sha:refs/heads/$BRANCH" >>"$LOG" 2>&1 || { failjob "git push failed"; return; }
+    git push -q origin "$sha:refs/heads/$BRANCH" >>"$LOG" 2>&1 || { failjob pr push "git push failed"; return; }
   elif [ -x scripts/create-pr.sh ]; then
     GH_BROWSER=true BROWSER=true scripts/create-pr.sh "$type" "$desc" </dev/null >>"$LOG" 2>&1 \
-      || { failjob "scripts/create-pr.sh failed"; return; }
+      || { failjob pr pr "scripts/create-pr.sh failed"; return; }
     pr="$(gh pr view "$BRANCH" --json number -q .number 2>/dev/null)"
     if [ -n "$pr" ] && [ -f "$JOB.body" ]; then
       with_line "$JOB.body" "$line" > "$JOB.newbody"
@@ -321,54 +373,67 @@ process() {
       rm -f "$JOB.newbody"
     fi
   else
-    git push -q origin "$sha:refs/heads/$BRANCH" >>"$LOG" 2>&1 || { failjob "git push failed"; return; }
+    git push -q origin "$sha:refs/heads/$BRANCH" >>"$LOG" 2>&1 || { failjob pr push "git push failed"; return; }
     if [ -f "$JOB.body" ]; then with_line "$JOB.body" "$line"; else with_line /dev/null "$line"; fi > "$JOB.newbody"
     gh pr create --base main --head "$BRANCH" --title "$type: $desc" --body-file "$JOB.newbody" >>"$LOG" 2>&1
     local rc=$?; rm -f "$JOB.newbody"
-    [ $rc -eq 0 ] || { failjob "gh pr create failed"; return; }
+    [ $rc -eq 0 ] || { failjob pr pr "gh pr create failed"; return; }
   fi
   pr="$(gh pr view "$BRANCH" --json number -q .number 2>/dev/null)"
-  [ -n "$pr" ] || { failjob "no PR found for $BRANCH"; return; }
+  [ -n "$pr" ] || { failjob pr pr "no PR found for $BRANCH"; return; }
+  emit pr_opened pr:int="$pr" new:bool="$new_pr"
 
   # 5. Checks of this commit, not of the PR's previous head.
   until [ "$(gh pr view "$pr" --json headRefOid -q .headRefOid 2>/dev/null)" = "$sha" ]; do
-    tries=$((tries + 1)); [ $tries -lt 10 ] || { failjob "#$pr does not show $sha as its head"; return; }
+    tries=$((tries + 1)); [ $tries -lt 10 ] || { failjob checks head "#$pr does not show $sha as its head"; return; }
     sleep "$CHECKS_WAIT"
   done
   echo "   PR #$pr, waiting for the checks" | tee -a "$LOG"
   # Done when some are reported and none is pending, twice in a row (a workflow can start late).
   # A check that stays pending (a stuck runner, a workflow that never starts) fails the job at the deadline,
   # so it can't block the queue.
-  local checks bad pending passes=0 deadline=$((SECONDS + CHECKS_TIMEOUT)) waited; tries=0
+  local checks bad pending passes=0 deadline=$((SECONDS + CHECKS_TIMEOUT)) waited polls=0; tries=0
   if [ $((CHECKS_TIMEOUT % 60)) -eq 0 ]; then waited="$((CHECKS_TIMEOUT / 60))m"; else waited="${CHECKS_TIMEOUT}s"; fi
   while :; do
-    checks="$(gh pr checks "$pr" --json name,bucket -q '.[] | "\(.bucket)\t\(.name)"' 2>>"$LOG")"
+    checks="$(gh pr checks "$pr" --json name,bucket -q '.[] | "\(.bucket)\t\(.name)"' 2>>"$LOG")"; polls=$((polls + 1))
     [ -n "$checks" ] && echo "$checks" >> "$LOG"
-    bad="$(awk -F'\t' '$1 == "fail" || $1 == "cancel" { print $2 }' <<<"$checks" | sort -u | paste -sd, -)"
-    [ -z "$bad" ] || { failjob "checks failed on #$pr: $bad"; return; }
+    bad="$(awk -F'\t' '$1 == "fail" || $1 == "cancel" { print $2 }' <<<"$checks" | sort -u)"
+    if [ -n "$bad" ]; then
+      emit checks_finished result=fail failed:list="$bad" polls:int="$polls"
+      bad="$(paste -sd, - <<<"$bad")"
+      failjob checks checks_failed "checks failed on #$pr: $bad"; return
+    fi
     if [ -z "$checks" ]; then
       passes=0; tries=$((tries + 1))
-      [ $tries -lt 10 ] || { failjob "no checks reported on #$pr"; return; }
+      if [ $tries -ge 10 ]; then
+        emit checks_finished result=none failed:list= polls:int="$polls"
+        failjob checks checks_timeout "no checks reported on #$pr"; return
+      fi
     elif grep -q '^pending' <<<"$checks"; then
       passes=0
       if [ "$SECONDS" -ge "$deadline" ]; then
-        pending="$(awk -F'\t' '$1 == "pending" { print $2 }' <<<"$checks" | sort -u | paste -sd, -)"
-        failjob "checks still pending on #$pr after $waited: $pending"; return
+        pending="$(awk -F'\t' '$1 == "pending" { print $2 }' <<<"$checks" | sort -u)"
+        emit checks_finished result=timeout failed:list= pending:list="$pending" polls:int="$polls"
+        pending="$(paste -sd, - <<<"$pending")"
+        failjob checks checks_timeout "checks still pending on #$pr after $waited: $pending"; return
       fi
     else
-      passes=$((passes + 1)); [ $passes -lt 2 ] || break
+      passes=$((passes + 1))
+      if [ $passes -ge 2 ]; then emit checks_finished result=pass failed:list= polls:int="$polls"; break; fi
     fi
     sleep "$CHECKS_WAIT"
   done
 
   # 6. Merge exactly the tested commit, and clean up.
   if [ "${PR_QUEUE_MERGE:-1}" = 0 ]; then
+    emit job_ready pr:int="$pr"
     echo "$(date '+%F %T') READY $BRANCH: #$pr passed, left open (PR_QUEUE_MERGE=0)" | tee -a "$RESULTS"
     finishjob; return
   fi
   gh pr merge "$pr" --squash --match-head-commit "$sha" >>"$LOG" 2>&1
-  [ "$(gh pr view "$pr" --json state -q .state 2>/dev/null)" = MERGED ] || { failjob "merging #$pr failed"; return; }
+  [ "$(gh pr view "$pr" --json state -q .state 2>/dev/null)" = MERGED ] || { failjob merge merge "merging #$pr failed"; return; }
   merged="$(gh pr view "$pr" --json mergeCommit -q .mergeCommit.oid 2>/dev/null)"
+  emit merged pr:int="$pr" merge_sha:opt="$merged"
   main_dir="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
   cd "$main_dir" || return
   if [ "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" = "$sha" ]; then
@@ -466,6 +531,8 @@ run_repo() {
   for job in "$RUNNING"/*.job; do
     [ -f "$job" ] || continue
     echo "pr-queue: $REPO: $(field branch "$job") was left unfinished by an earlier runner; moved to failed/"
+    EV_REPO="$REPO" EV_BRANCH="$(field branch "$job")" EV_JOB_ID="$(basename "${job%.job}")" \
+      EV_SHA="$(git -C "$(field worktree "$job")" rev-parse HEAD 2>/dev/null)" emit job_failed step=start reason=abandoned
     mv "${job%.job}".* "$RQ/failed/"
   done
   while job="$(find "$QUEUE" -name '*.job' | sort | head -1)"; [ -n "$job" ]; do
@@ -474,7 +541,10 @@ run_repo() {
     ( process "$RUNNING/$name.job" ) || true
     # A job that left its file behind (a crash) must not loop forever.
     if [ -f "$RUNNING/$name.job" ]; then
-      echo "pr-queue: $REPO: $name did not finish; moved to failed/"; mv "$RUNNING/$name".* "$RQ/failed/"
+      echo "pr-queue: $REPO: $name did not finish; moved to failed/"
+      EV_REPO="$REPO" EV_BRANCH="$(field branch "$RUNNING/$name.job")" EV_JOB_ID="$name" \
+        EV_SHA="$(git -C "$(field worktree "$RUNNING/$name.job")" rev-parse HEAD 2>/dev/null)" emit job_failed step=unknown reason=abandoned
+      mv "$RUNNING/$name".* "$RQ/failed/"
     fi
   done
   exec 9>&-

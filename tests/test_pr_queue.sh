@@ -805,7 +805,7 @@ flock "$RQ/run.lock" sleep 3 & sleep 0.3
 out="$(PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 Q run)"; touch "$TQ/e2e_fail"
 wait
 assert_contains "repos: the busy repo is skipped" "$out" "repo: a runner is already working on the queue"
-assert_contains "repos: and named at the end" "$out" "jobs left in the queue of: repo (see above)"
+assert_contains "repos: and named at the end, once" "$out" "jobs left in the queue of: repo (see above)"
 assert_contains "repos: the other repo's job ran" "$out" "fix/two"
 assert "repos: its result in its own log"    grep -q "fix/two" "$RQ2/results.log"
 assert "repos: not in the other repo's log"  test -z "$(grep "fix/two" "$RQ/results.log")"
@@ -868,6 +868,19 @@ assert "ended runner: while the other repo's job still works" test -n "$(find "$
 assert_not_contains "ended runner: no working repo left out" "$(cat "$TQ/ended.out")" "a runner is already working"
 kill -TERM "$rpid"; { wait "$rpid"; } 2>/dev/null
 rm -f "$TQ/hang" "$RQ"/running/*
+# A repo whose queue another runner has when this one starts gets a runner of this one once that runner ends,
+# while this one still works on another repo (its e2e run outlasts the other runner's lock), and is said once.
+reset_pr; touch "$TQ/e2e_fail"; mkwt work; mkwt2 held
+echo 'sleep 2' > "$TQ/on_e2e"
+Q add "$TMP/wt-work" fix "Work" >/dev/null; Q add --review none --tests none "$TMP/wt2-held" fix "Held" >/dev/null
+flock "$RQ2/run.lock" sleep 1 & lpid=$!; sleep 0.3
+out="$(PR_QUEUE_POLL=0.2 PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 Q run)"
+wait "$lpid"; rm -f "$TQ/on_e2e"
+assert_contains "busy repo: said it was busy" "$out" "repo2: a runner is already working on the queue"
+assert "busy repo: said once"                test "$(grep -c "repo2: a runner is already working" <<<"$out")" = 1
+assert "busy repo: its job ran once the lock was free" grep -q "fix/held" "$RQ2/results.log"
+assert_not_contains "busy repo: not left out at the end" "$out" "jobs left in the queue of"
+assert "busy repo: no job left queued"       test -z "$(find "$RQ/queue" "$RQ2/queue" -name '*.job')"
 # A job queued in another repo while the runner works is run too.
 reset_pr; touch "$TQ/e2e_fail"; mkwt early; mkwt2 late
 printf 'PATH=%q bash %q add %q fix Late >/dev/null\n' "$TQ/bin:$PATH" "$ROOT/scripts/queue/pr-queue.sh" "$TMP/wt2-late" > "$TQ/on_e2e"

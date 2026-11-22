@@ -68,13 +68,15 @@ sha="$(git rev-parse HEAD)"
 printf 'Full end-to-end suite passed locally on `%s` (1 passed).\n' "$sha"
 EOF
 # npm run test:e2e:full: records whether it ran under the e2e lock (and if it got PR_QUEUE_CHILD), then passes
-# unless $TQ/e2e_fail exists. $TQ/on_e2e: a script run once, first.
+# unless $TQ/e2e_fail exists. $TQ/on_e2e: a script run once, first. $TQ/e2e_nopass: it passes, but records no
+# pass (so e2e-gate.mjs pr-line fails).
 cat > "$TQ/bin/npm" <<'EOF'
 #!/usr/bin/env bash
 [ -f "$TQ/on_e2e" ] && { bash "$TQ/on_e2e"; rm -f "$TQ/on_e2e"; }
 if flock -n "$PR_QUEUE_DIR/e2e.lock" true; then echo "$* unlocked" >> "$TQ/npm.log"; else echo "$* locked" >> "$TQ/npm.log"; fi
 if [ -n "${PR_QUEUE_CHILD+set}" ]; then echo "inherited PR_QUEUE_CHILD" >> "$TQ/npm.log"; fi
 [ -f "$TQ/e2e_fail" ] && exit 1
+[ -f "$TQ/e2e_nopass" ] && exit 0
 touch "$TQ/passed/$(git rev-parse HEAD)"
 EOF
 # claude -p (run by review.sh): logs "code <prompt>" for a code review, "tests <first line>" for a test review,
@@ -110,6 +112,9 @@ chmod +x "$TQ/bin/"*
 
 # Origin, the main checkout R (with the repo's scripts), and a second clone O that moves main.
 git init -q --bare -b main "$TMP/origin.git"
+# With $TQ/push_reject, origin rejects every push.
+# shellcheck disable=SC2016  # $TQ expands when the hook runs
+printf '#!/usr/bin/env bash\n[ ! -f "$TQ/push_reject" ]\n' > "$TMP/origin.git/hooks/pre-receive"; chmod +x "$TMP/origin.git/hooks/pre-receive"
 R="$TMP/repo"; git clone -q "$TMP/origin.git" "$R" 2>/dev/null
 RQ="$PR_QUEUE_DIR/repos/repo"   # the queue of R's repo
 mkdir -p "$R/scripts"; touch "$R/scripts/e2e-gate.mjs"
@@ -133,7 +138,8 @@ mkwt() {
 }
 reset_pr() {
   rm -f "$TQ/pr_state" "$TQ/pr_body" "$TQ/pr_branch" "$TQ/checks_seq" "$TQ/e2e_fail" "$TQ/merge_fail" "$TQ/head_lag" "$TQ/on_checks" \
-    "$TQ/verdict" "$TQ/tests_verdict" "$TQ/judge_verdict" "$TQ/judge_hang" "$TQ/claude_fail" "$TQ/sync" "$TQ"/started-* "$TQ/sync.log"
+    "$TQ/verdict" "$TQ/tests_verdict" "$TQ/judge_verdict" "$TQ/judge_hang" "$TQ/claude_fail" "$TQ/sync" "$TQ"/started-* "$TQ/sync.log" \
+    "$TQ/e2e_nopass" "$TQ/push_reject"
   : > "$TQ/gh.log"; : > "$TQ/created.log"; : > "$TQ/npm.log"; : > "$TQ/claude.log"
 }
 # code_reviews / test_reviews: the review sessions claude.log shows since the last reset
@@ -144,6 +150,26 @@ test_reviews() { grep '^tests ' "$TQ/claude.log"; }
 in_done() { test -n "$(find "$RQ/done" -name "*$1.job")"; }
 # shellcheck disable=SC2329
 in_failed() { test -n "$(find "$RQ/failed" -name "*$1.job")"; }
+# Stats events (events.sh) go to the default file, $PR_QUEUE_DIR/events.jsonl.
+unset STATS_EVENTS STATS_EVENTS_FILE
+EVENTS="$PR_QUEUE_DIR/events.jsonl"
+# ev <branch> <python expression>: the expression over `evs`, the events of the branch's latest job (every line
+# of the file must be JSON). E.g. ev fix/a 'names()' or ev fix/a 'one("merged")["pr"]'.
+ev() {
+  python3 -I -c '
+import json, sys
+recs = [json.loads(l) for l in open(sys.argv[1])]
+mine = [r for r in recs if r["branch"] == sys.argv[2]]
+last = mine[-1]["job_id"] if mine else None
+evs = [r for r in mine if r["job_id"] == last]
+names = lambda: " ".join(r["event"] for r in evs)
+def one(name):
+    found = [r for r in evs if r["event"] == name]
+    assert len(found) == 1, (name, len(found))
+    return found[0]
+failed = lambda: "%s/%s" % (one("job_failed")["step"], one("job_failed")["reason"])
+print(eval(sys.argv[3]))' "$EVENTS" "$1" "$2" 2>&1
+}
 
 # --- add ---
 out="$(Q add "$TMP/nope" fix x)";            assert_contains "add: missing dir refused"   "$out" "no such directory"
@@ -189,6 +215,24 @@ assert "happy: main checkout pulled"         test -f "$R/unrelated.txt"
 assert "happy: job moved to done"            in_done happy
 assert "happy: nothing left running"         test -z "$(find "$RQ/running" -type f)"
 assert_contains "empty queue says so"        "$out" "the queue is empty"
+assert_contains "events: a merged job's sequence" "$(ev fix/happy 'names()')" \
+  "job_queued job_started main_merged review_started review_started review_finished review_finished e2e_waiting e2e_started e2e_finished pr_opened checks_finished merged"
+job_id="$(basename "$(find "$RQ/done" -name '*happy.job')" .job)"
+assert_contains "events: common fields"      "$(ev fix/happy '{(r["v"], r["repo"], r["job_id"], type(r["pid"]).__name__) for r in evs}')" "{(1, 'repo', '$job_id', 'int')}"
+assert_contains "events: job_queued's fields" "$(ev fix/happy 'one("job_queued")["type"], one("job_queued")["review"], one("job_queued")["tests"]')" "('fix', None, None)"
+assert_contains "events: main merged in"     "$(ev fix/happy 'one("main_merged")["result"]')" "merged"
+assert "events: from the merge of main on, the merged commit's sha" \
+  test "$(ev fix/happy 'len({r["sha"] for r in evs[2:]}) == 1 and evs[0]["sha"] == evs[1]["sha"] != evs[2]["sha"] and len(evs[2]["sha"]) == 40')" = True
+assert_contains "events: the reviews started" "$(ev fix/happy '[(r["kind"], r["level"]) for r in evs if r["event"] == "review_started"]')" "[('code', 'medium'), ('tests', None)]"
+code_file="$(basename "$(find "$PR_QUEUE_DIR/reviews" -name 'fix-happy-*-medium-notests.md')")"
+tests_file="$(basename "$(find "$PR_QUEUE_DIR/reviews" -name 'fix-happy-*-tests.md')")"
+assert_contains "events: the reviews finished, with their files" \
+  "$(ev fix/happy '[(r["kind"], r["level"], r["exit"], r["verdict"], r["review_file"], r["cached"]) for r in evs if r["event"] == "review_finished"]')" \
+  "[('code', 'medium', 0, 'ready', '$code_file', False), ('tests', None, 0, 'ready', '$tests_file', False)]"
+assert_contains "events: e2e rc"             "$(ev fix/happy 'one("e2e_finished")["rc"]')" "0"
+assert_contains "events: pr_opened"          "$(ev fix/happy 'one("pr_opened")["pr"], one("pr_opened")["new"]')" "(7, True)"
+assert_contains "events: checks_finished"    "$(ev fix/happy 'one("checks_finished")["result"], one("checks_finished")["failed"], one("checks_finished")["polls"]')" "('pass', [], 2)"
+assert_contains "events: merged"             "$(ev fix/happy 'one("merged")["pr"], one("merged")["merge_sha"]')" "(7, '1234567890abcdef')"
 
 # --- merge conflict: aborted, no PR ---
 reset_pr
@@ -198,6 +242,10 @@ assert_contains "conflict: failed with files" "$out" "merge conflict with origin
 assert "conflict: merge aborted"             test -z "$(git -C "$TMP/wt-conflict" status --porcelain)"
 assert "conflict: no PR opened"              test ! -s "$TQ/created.log"
 assert "conflict: job in failed/"            in_failed conflict
+assert_contains "events: a conflict fails at main" "$(ev fix/conflict 'failed()')" "main/conflict"
+assert_contains "events: no found before the reviews" "$(ev fix/conflict '"found" in one("job_failed")')" "False"
+assert_contains "events: the conflict and its files" "$(ev fix/conflict 'one("main_merged")["result"], one("main_merged")["files"]')" "('conflict', ['shared.txt'])"
+assert_contains "events: a failed job ends with job_failed" "$(ev fix/conflict 'names()')" "job_queued job_started main_merged job_failed"
 assert_contains "results log has it"         "$(Q status)" "FAILED fix/conflict"
 
 # --- review: "needs changes" or no review -> no e2e, no PR; --review sets the level; a ready commit isn't reviewed twice ---
@@ -208,6 +256,9 @@ assert_contains "review: --review high"      "$(cat "$TQ/claude.log")" 'args "hi
 assert "review: no e2e run"                  test ! -s "$TQ/npm.log"
 assert "review: no PR opened"                test ! -s "$TQ/created.log"
 assert "review: job in failed/"              in_failed bad
+assert_contains "events: review needs changes, the judge confirms" "$(ev fix/bad 'failed()')" "judge/judge"
+assert_contains "events: the judge's review events" "$(ev fix/bad '[(r["event"], r["kind"], r.get("verdict"), r.get("exit")) for r in evs if r["event"].startswith("review_") and r["kind"] == "judge"]')" "[('review_started', 'judge', None, None), ('review_finished', 'judge', 'needs changes', 1)]"
+assert_contains "events: queued with --review high" "$(ev fix/bad 'one("job_queued")["review"]')" "high"
 rm -f "$TQ/verdict"; : > "$TQ/claude.log"
 out="$(Q add "$TMP/wt-bad" fix "Bad")";      assert_contains "re-queue keeps --review" "$out" "keeping --review high"
 out="$(Q run)"
@@ -217,6 +268,8 @@ reset_pr; touch "$TQ/claude_fail"; mkwt noreview
 Q add "$TMP/wt-noreview" fix "No review" >/dev/null; out="$(Q run)"
 assert_contains "review: claude fails"       "$out" "FAILED fix/noreview: the review didn't run"
 assert_contains "review: claude fails, the test review too" "$out" "; the test review didn't run: review: claude -p failed"
+assert_contains "events: a review that didn't run" "$(ev fix/noreview 'failed()')" "review/review_error"
+assert_contains "events: its verdict is error" "$(ev fix/noreview '[(r["kind"], r["verdict"], r["exit"], r["review_file"]) for r in evs if r["event"] == "review_finished"]')" "[('code', 'error', 2, None), ('tests', 'error', 2, None)]"
 reset_pr; echo fail > "$TQ/checks_seq"; mkwt again
 Q add "$TMP/wt-again" fix "Again" >/dev/null; Q run >/dev/null
 rm -f "$TQ/checks_seq"; : > "$TQ/claude.log"
@@ -224,11 +277,14 @@ Q add "$TMP/wt-again" fix "Again" >/dev/null; out="$(Q run)"
 assert_contains "review: same commit not reviewed again" "$out" "already reviewed"
 assert "review: no second claude run"        test ! -s "$TQ/claude.log"
 assert_contains "review: then merged"        "$out" "MERGED fix/again"
+assert_contains "events: a cached review" "$(ev fix/again '[(r["kind"], r["verdict"], r["cached"]) for r in evs if r["event"] == "review_finished"]')" "[('code', 'ready', True), ('tests', 'ready', True)]"
 reset_pr; mkwt late2
 echo "echo more >> '$TMP/wt-late2/late2.txt'; git -C '$TMP/wt-late2' commit -qam more" > "$TQ/on_e2e"
 Q add "$TMP/wt-late2" fix "Late commit" >/dev/null; out="$(Q run)"
 assert_contains "review: a commit after the review fails the job" "$out" "fix/late2 got commits after the review"
 assert "review: so no PR"                    test ! -s "$TQ/created.log"
+assert_contains "events: commits after the review" "$(ev fix/late2 'failed()')" "e2e/moved"
+assert_contains "events: moved, with the new HEAD's sha" "$(ev fix/late2 'one("job_failed")["sha"]')" "$(git -C "$TMP/wt-late2" rev-parse HEAD)"
 reset_pr; mkwt skip
 Q add "$TMP/wt-skip" fix "Skip" >/dev/null; out="$(PR_QUEUE_REVIEW=0 Q run)"
 assert "review: PR_QUEUE_REVIEW=0 skips it"  test -z "$(code_reviews)"
@@ -258,6 +314,7 @@ assert_contains "tests: needs changes fails the job" "$out" \
 assert_contains "tests: names the saved test review" "$out" "-tests.md)"
 assert "tests: no e2e run"                   test ! -s "$TQ/npm.log"
 assert "tests: no PR opened"                 test ! -s "$TQ/created.log"
+assert_contains "events: the test review's changes, confirmed" "$(ev fix/weak 'failed()')" "judge/judge"
 reset_pr; echo "needs changes" > "$TQ/verdict"; echo "needs changes" > "$TQ/tests_verdict"; mkwt worse
 Q add "$TMP/wt-worse" fix "Worse" >/dev/null; out="$(Q run)"
 assert_contains "tests: both need changes, both named" "$out" \
@@ -308,16 +365,45 @@ Q add "$TMP/wt-e2efail" fix "E2e fail" >/dev/null; out="$(Q run)"
 assert_contains "e2e fail: job failed"       "$out" "FAILED fix/e2efail: the full e2e suite failed"
 assert "e2e fail: no PR opened"              test ! -s "$TQ/created.log"
 
+# --- the other failures before the PR: git fetch, no pass recorded after a passing e2e run, git push ---
+reset_pr; mkwt nofetch
+Q add --review none --tests none "$TMP/wt-nofetch" fix "No fetch" >/dev/null
+git -C "$R" remote set-url origin "$TMP/no-such-origin.git"; out="$(Q run)"; git -C "$R" remote set-url origin "$TMP/origin.git"
+assert_contains "fetch fails: job failed"    "$out" "FAILED fix/nofetch: git fetch failed"
+assert_contains "events: fetch fails at main" "$(ev fix/nofetch 'failed(), names()')" "('main/fetch', 'job_queued job_started job_failed')"
+reset_pr; touch "$TQ/e2e_nopass"; mkwt nopass
+Q add --review none --tests none "$TMP/wt-nopass" fix "No pass" >/dev/null; out="$(Q run)"
+assert_contains "no pass recorded: job failed" "$out" "FAILED fix/nopass: no local e2e pass recorded for"
+assert "no pass recorded: no PR opened"      test ! -s "$TQ/created.log"
+assert_contains "events: e2e passed, no pass recorded" "$(ev fix/nopass 'failed(), one("e2e_finished")["rc"]')" "('e2e/no_e2e_pass', 0)"
+# push fails on the open PR's path (a PR is open for the branch) and on gh's (no scripts/create-pr.sh)
+reset_pr; mkwt pushopen; echo OPEN > "$TQ/pr_state"; echo fix/pushopen > "$TQ/pr_branch"; echo body > "$TQ/pr_body"; touch "$TQ/push_reject"
+Q add --review none --tests none "$TMP/wt-pushopen" fix "Push open" >/dev/null; out="$(Q run)"
+assert_contains "push to the open PR fails: job failed" "$out" "FAILED fix/pushopen: git push failed"
+assert_contains "events: push to the open PR fails" "$(ev fix/pushopen 'failed()')" "pr/push"
+reset_pr; mkwt pushgh; git -C "$TMP/wt-pushgh" rm -q scripts/create-pr.sh; git -C "$TMP/wt-pushgh" commit -qm rm
+Q add --review none --tests none "$TMP/wt-pushgh" fix "Push gh" >/dev/null; touch "$TQ/push_reject"; out="$(Q run)"
+assert_contains "push before gh pr create fails: job failed" "$out" "FAILED fix/pushgh: git push failed"
+assert "push before gh pr create fails: no PR" test ! -s "$TQ/created.log"
+assert_contains "events: push before gh pr create fails" "$(ev fix/pushgh 'failed()')" "pr/push"
+rm -f "$TQ/push_reject"
+assert_contains "events: e2e fails" "$(ev fix/e2efail 'failed()')" "e2e/e2e"
+assert_contains "events: the e2e rc" "$(ev fix/e2efail 'one("e2e_finished")["rc"]')" "1"
+assert_contains "events: no PR after e2e" "$(ev fix/e2efail 'names()')" "e2e_waiting e2e_started e2e_finished job_failed"
+
 # --- checks fail: PR left open, not merged; a fix is re-queued, pushed to the same PR with a fresh pass line ---
 reset_pr; echo fail > "$TQ/checks_seq"; mkwt ci
 old="$(git -C "$TMP/wt-ci" rev-parse HEAD)"
 Q add "$TMP/wt-ci" fix "Ci" >/dev/null; out="$(Q run)"
 assert_contains "checks fail: names the check" "$out" "checks failed on #7: Checks"
 assert_not_contains "checks fail: not merged" "$(cat "$TQ/gh.log")" "pr merge"
+assert_contains "events: a failed check" "$(ev fix/ci 'failed()')" "checks/checks_failed"
+assert_contains "events: names the failed check" "$(ev fix/ci 'one("checks_finished")["result"], one("checks_finished")["failed"]')" "('fail', ['Checks'])"
 rm -f "$TQ/checks_seq"; echo fix >> "$TMP/wt-ci/ci.txt"; git -C "$TMP/wt-ci" commit -qam fix
 new="$(git -C "$TMP/wt-ci" rev-parse HEAD)"
 Q add "$TMP/wt-ci" fix "Ci" >/dev/null; out="$(Q run)"
 assert_contains "requeue: merged"            "$out" "MERGED fix/ci: #7"
+assert_contains "events: pushed to the open PR" "$(ev fix/ci 'one("pr_opened")["new"]')" "False"
 assert "requeue: pushed, not a second PR"    test "$(grep -c '^fix Ci$' "$TQ/created.log")" = 1
 assert_contains "requeue: pass line for the new commit" "$(cat "$TQ/pr_body")" "$new"
 assert_not_contains "requeue: old pass line gone" "$(cat "$TQ/pr_body")" "$old"
@@ -328,16 +414,25 @@ reset_pr; printf 'none\npending\npass\n' > "$TQ/checks_seq"; mkwt slow
 Q add "$TMP/wt-slow" fix "Slow" >/dev/null; out="$(Q run)"
 assert_contains "slow checks: merged"        "$out" "MERGED fix/slow"
 assert "slow checks: polled until done"      test "$(grep -c '^pr checks' "$TQ/gh.log")" -ge 4
+# none, pending, pass, pass: polls counts every poll (4), not the passing ones (2).
+assert_contains "events: slow checks, every poll counted" \
+  "$(ev fix/slow 'one("checks_finished")["result"], one("checks_finished")["polls"]')" "('pass', $(grep -c '^pr checks' "$TQ/gh.log"))"
+assert_contains "events: slow checks, 4 polls" "$(ev fix/slow 'one("checks_finished")["polls"]')" "4"
 reset_pr; printf 'pass\npending\npass\n' > "$TQ/checks_seq"; mkwt late
 Q add "$TMP/wt-late" fix "Late" >/dev/null; out="$(Q run)"
 assert_contains "late check: waited for it"  "$out" "MERGED fix/late"
 assert "late check: polled after the pending" test "$(grep -c '^pr checks' "$TQ/gh.log")" -ge 4
+assert_contains "events: late check, every poll counted" \
+  "$(ev fix/late 'one("checks_finished")["result"], one("checks_finished")["polls"]')" "('pass', $(grep -c '^pr checks' "$TQ/gh.log"))"
 reset_pr; echo cancel > "$TQ/checks_seq"; mkwt cancel
 Q add "$TMP/wt-cancel" fix "Cancel" >/dev/null; out="$(Q run)"
 assert_contains "cancelled check: failed"    "$out" "checks failed on #7: Checks"
+assert_contains "events: a cancelled check" "$(ev fix/cancel 'failed()')" "checks/checks_failed"
 reset_pr; echo none > "$TQ/checks_seq"; mkwt nochecks
 Q add "$TMP/wt-nochecks" fix "No checks" >/dev/null; out="$(Q run)"
 assert_contains "no checks: gives up"        "$out" "no checks reported on #7"
+assert_contains "events: no checks" "$(ev fix/nochecks 'failed()')" "checks/checks_timeout"
+assert_contains "events: no checks, 10 polls" "$(ev fix/nochecks 'one("checks_finished")["result"], one("checks_finished")["polls"]')" "('none', 10)"
 # A check that never leaves pending fails the job at PR_QUEUE_CHECKS_TIMEOUT (timeout 30 guards against a hang)
 reset_pr; echo pending > "$TQ/checks_seq"; mkwt hang
 Q add "$TMP/wt-hang" fix "Hang" >/dev/null
@@ -345,6 +440,8 @@ out="$(PR_QUEUE_CHECKS_TIMEOUT=1 PATH="$TQ/bin:$PATH" timeout 30 bash "$ROOT/scr
 assert "stuck pending: runner exits"         test "$rc" -ne 124
 assert_contains "stuck pending: gives up, names the check" "$out" "checks still pending on #7 after 1s: Checks"
 assert "stuck pending: job in failed/"       in_failed hang
+assert_contains "events: checks still pending" "$(ev fix/hang 'failed()')" "checks/checks_timeout"
+assert_contains "events: names the pending check" "$(ev fix/hang 'one("checks_finished")["result"], one("checks_finished")["pending"]')" "('timeout', ['Checks'])"
 assert_not_contains "stuck pending: not merged" "$(cat "$TQ/gh.log")" "pr merge"
 
 # --- the PR's head lags behind the push: checks are read only once it shows the pushed commit ---
@@ -357,6 +454,7 @@ assert "head lag: checks after the head moved" test "$last_head" -lt "$first_che
 reset_pr; echo 99 > "$TQ/head_lag"; mkwt stuck
 Q add "$TMP/wt-stuck" fix "Stuck" >/dev/null; out="$(Q run)"
 assert_contains "head never moves: fails"    "$out" "does not show"
+assert_contains "events: the head never moves" "$(ev fix/stuck 'failed()')" "checks/head"
 
 # --- a commit made while the job runs is kept, not deleted with the branch ---
 reset_pr; mkwt busy; sha="$(git -C "$TMP/wt-busy" rev-parse HEAD)"
@@ -384,6 +482,8 @@ Q add "$TMP/wt-nomerge" fix "No merge" >/dev/null; out="$(Q run)"
 assert_contains "merge fails: job failed"    "$out" "merging #7 failed"
 assert "merge fails: worktree kept"          test -d "$TMP/wt-nomerge"
 assert "merge fails: job in failed/"         in_failed nomerge
+assert_contains "events: the merge fails" "$(ev fix/nomerge 'failed()')" "merge/merge"
+assert_not_contains "events: no merged event" "$(ev fix/nomerge 'names()')" " merged"
 
 # --- no scripts/create-pr.sh: gh pr create, with or without a body file ---
 reset_pr; mkwt nocreate; git -C "$TMP/wt-nocreate" rm -q scripts/create-pr.sh; git -C "$TMP/wt-nocreate" commit -qm rm
@@ -396,6 +496,19 @@ Q add "$TMP/wt-nocreate2" fix "No create" "$TQ/body.md" >/dev/null; out="$(Q run
 assert_contains "gh create + body: merged"   "$out" "MERGED fix/nocreate2"
 assert_contains "gh create + body: body"     "$(cat "$TQ/pr_body")" "My summary"
 
+# --- events: a job whose worktree is gone, off its branch or dirty when it starts is not_ready ---
+reset_pr; mkwt gone; mkwt offbranch; mkwt dirtied
+for b in gone offbranch dirtied; do Q add --review none --tests none "$TMP/wt-$b" fix "$b" >/dev/null; done
+rm -rf "$TMP/wt-gone"; git -C "$TMP/wt-offbranch" checkout -q -b other; echo x >> "$TMP/wt-dirtied/dirtied.txt"
+out="$(Q run)"
+assert_contains "not ready: worktree gone"   "$out" "worktree $TMP/wt-gone is gone"
+assert_contains "not ready: off its branch"  "$out" "is no longer on fix/offbranch"
+assert_contains "not ready: dirty"           "$out" "uncommitted changes in $TMP/wt-dirtied"
+for b in gone offbranch dirtied; do
+  assert_contains "events: fix/$b is not_ready" "$(ev "fix/$b" 'failed(), names()')" "('start/not_ready', 'job_queued job_started job_failed')"
+done
+git -C "$R" worktree prune; git -C "$TMP/wt-dirtied" checkout -q -- .
+
 # --- add from a subdirectory queues the worktree's root ---
 reset_pr; mkwt sub; mkdir "$TMP/wt-sub/src"
 Q add "$TMP/wt-sub/src" fix "Sub" >/dev/null; out="$(Q run)"
@@ -407,7 +520,15 @@ assert "subdir: worktree removed"            test ! -d "$TMP/wt-sub"
 reset_pr; mkwt login; mkwt login2 login.txt x login
 Q add "$TMP/wt-login" fix "Fix login" >/dev/null
 Q add "$TMP/wt-login2" fix "Login" >/dev/null
+replaced_id="$(basename "$(find "$RQ/queue" -name '*-login.job' ! -name '*-fix-login.job')" .job)"
 Q add "$TMP/wt-login2" fix "Login again" >/dev/null
+assert "requeue: the old job is gone"         test ! -e "$RQ/queue/$replaced_id.job"
+# shellcheck disable=SC2016  # python, not shell
+assert_contains "events: the replaced job ends with job_failed, replaced" \
+  "$(python3 -I -c 'import json, sys; print([(r["event"], r.get("step"), r.get("reason"), r["branch"], r["sha"]) for r in map(json.loads, open(sys.argv[1])) if r["job_id"] == sys.argv[2]])' "$EVENTS" "$replaced_id")" \
+  "[('job_queued', None, None, 'login', '$(git -C "$TMP/wt-login2" rev-parse HEAD)'), ('job_failed', 'queue', 'replaced', 'login', None)]"
+assert_contains "events: the new job is just queued" "$(ev login 'names()')" "job_queued"
+assert_not_contains "events: the other branch's job isn't replaced" "$(ev fix/login 'names()')" "job_failed"
 out="$(Q status)"
 assert_contains "similar names: fix/login still queued" "$out" "fix/login"
 assert "similar names: one job each"         test "$(find "$RQ/queue" -name '*.job' | wc -l)" = 2
@@ -419,6 +540,57 @@ Q add "$TMP/wt-open" fix "Open" >/dev/null; out="$(PR_QUEUE_MERGE=0 Q run)"
 assert_contains "no-merge: ready"            "$out" "READY fix/open: #7 passed, left open"
 assert "no-merge: PR still open"             test "$(cat "$TQ/pr_state")" = OPEN
 assert "no-merge: worktree kept"             test -d "$TMP/wt-open"
+assert_contains "events: left open ends with job_ready" "$(ev fix/open 'names().split()[-2:], one("job_ready")["pr"]')" "(['checks_finished', 'job_ready'], 7)"
+assert_not_contains "events: left open, not merged" "$(ev fix/open 'names()')" " merged"
+
+# --- events: e2e_waiting before the e2e lock, e2e_started once it's held; an up-to-date branch is "clean" ---
+reset_pr; mkwt e2ewait
+Q add --review none --tests none "$TMP/wt-e2ewait" fix "E2e wait" >/dev/null
+# The lock is held until the job's e2e_waiting is in the events file (at most 30 s), and 1 s more, in which an
+# e2e_started (sent without the lock) is noted in $TQ/started_early. Then it is released; the time of the release
+# (ms, as in ts) goes to $TQ/released. The queue can't send e2e_started while the lock is held, so no load makes
+# this fail: the 1 s only bounds how soon an e2e_started sent too early shows up.
+rm -f "$TQ/released" "$TQ/started_early"
+# shellcheck disable=SC2016  # expands in the holder
+flock "$PR_QUEUE_DIR/e2e.lock" bash -c 'seen() { grep "\"branch\":\"fix/e2ewait\"" "$1" 2>/dev/null | grep -q "\"event\":\"$2\""; }
+  for _ in $(seq 600); do seen "$1" e2e_waiting && break; sleep 0.05; done
+  for _ in $(seq 20); do seen "$1" e2e_started && { touch "$3"; break; }; sleep 0.05; done
+  date +%s%3N > "$2"' _ "$EVENTS" "$TQ/released" "$TQ/started_early" &
+for _ in $(seq 600); do flock -n "$PR_QUEUE_DIR/e2e.lock" true || break; sleep 0.05; done   # until it is held
+out="$(Q run)"; wait
+assert_contains "events: waited, then merged" "$out" "MERGED fix/e2ewait"
+assert_contains "events: no reviews, no review events" "$(ev fix/e2ewait 'names()')" "job_queued job_started main_merged e2e_waiting e2e_started"
+assert_contains "events: clean when main is in" "$(ev fix/e2ewait 'one("main_merged")["result"]')" "clean"
+assert_contains "events: --review/--tests none queued" "$(ev fix/e2ewait 'one("job_queued")["review"], one("job_queued")["tests"]')" "('none', 'none')"
+assert "events: the lock was released after e2e_waiting" test -s "$TQ/released"
+assert "events: no e2e_started while the lock was held" test ! -e "$TQ/started_early"
+# ts (ms) of an event, in ms since the epoch, against the release: e2e_waiting before it, e2e_started after.
+ms='(lambda r: round(__import__("datetime").datetime.fromisoformat(r["ts"].replace("Z", "+00:00")).timestamp() * 1000))'
+assert_contains "events: e2e_waiting while the lock was held, e2e_started once it was free" \
+  "$(ev fix/e2ewait "($ms(one('e2e_waiting')) <= $(cat "$TQ/released"), $ms(one('e2e_started')) >= $(cat "$TQ/released"))")" "(True, True)"
+
+# --- an events path the queue can't write to changes no outcome ---
+mkdir -p "$TMP/evdir"
+reset_pr; mkwt evok
+Q add "$TMP/wt-evok" fix "Events dir" >/dev/null; out="$(STATS_EVENTS_FILE="$TMP/evdir" Q run)"
+assert_contains "events dir: still merged"   "$out" "MERGED fix/evok: #7 as 1234567"
+assert_not_contains "events dir: no error printed" "$out" "Error"
+assert "events dir: worktree removed"        test ! -d "$TMP/wt-evok"
+reset_pr; echo "needs changes" > "$TQ/verdict"; echo escalate > "$TQ/judge_verdict"; mkwt evfail
+Q add "$TMP/wt-evfail" fix "Events dir fail" >/dev/null; out="$(STATS_EVENTS_FILE="$TMP/evdir" Q run)"
+assert_contains "events dir: still escalated" "$out" "FAILED fix/evfail: needs your decision: the judge rejected a finding"
+assert "events dir: job in failed/"          in_failed evfail
+reset_pr; touch "$TQ/e2e_fail"; mkwt evfail2
+Q add --review none --tests none "$TMP/wt-evfail2" fix "Events dir e2e" >/dev/null; out="$(STATS_EVENTS_FILE="$TMP/evdir" Q run)"
+assert_contains "events dir: e2e still fails" "$out" "FAILED fix/evfail2: the full e2e suite failed"
+for b in evok evfail evfail2; do
+  assert "events dir: fix/$b's run wrote nothing (only add's event)" test "$(ev "fix/$b" 'names()')" = job_queued
+done
+assert "events dir: still a directory"       test -d "$TMP/evdir" -a -z "$(ls -A "$TMP/evdir")"
+reset_pr; mkwt evoff
+Q add "$TMP/wt-evoff" fix "Events off" >/dev/null; out="$(STATS_EVENTS=0 Q run)"
+assert_contains "STATS_EVENTS=0: still merged" "$out" "MERGED fix/evoff"
+assert "STATS_EVENTS=0: only the add's events" test "$(ev fix/evoff 'names()')" = job_queued
 
 # --- a Ctrl-C of the runner, or a TERM to its process group, during the reviews stops both claude -p sessions
 # and leaves no temp files; the job stays in running/, where the next run moves it to failed/ ---
@@ -476,6 +648,15 @@ assert_not_contains "judge: not given the ready test review" "$(judge_line)" "-t
 assert_contains "judge: nothing to fix, says so" "$out" "the judge found nothing to fix (judge: $PR_QUEUE_DIR/reviews/fix-falsealarm-"
 assert "judge: nothing to fix, e2e runs"     test -s "$TQ/npm.log"
 assert_contains "judge: nothing to fix, merged" "$out" "MERGED fix/falsealarm"
+# A judge's ready on the same reviews of the same commit is reused: its review_finished is cached.
+reset_pr; echo "needs changes" > "$TQ/verdict"; echo ready > "$TQ/judge_verdict"; echo fail > "$TQ/checks_seq"; mkwt judgedtwice
+Q add "$TMP/wt-judgedtwice" fix "Judged twice" >/dev/null; Q run >/dev/null
+assert_contains "events: a judge run is not cached" "$(ev fix/judgedtwice '[r["cached"] for r in evs if r["event"] == "review_finished" and r["kind"] == "judge"]')" "[False]"
+rm -f "$TQ/checks_seq"; : > "$TQ/claude.log"
+Q add "$TMP/wt-judgedtwice" fix "Judged twice" >/dev/null; out="$(Q run)"
+assert_contains "judge: already judged as ready" "$out" "MERGED fix/judgedtwice"
+assert "judge: not judged again"             test -z "$(judge_line)"
+assert_contains "events: a cached judge" "$(ev fix/judgedtwice '[(r["verdict"], r["cached"], r["review_file"].endswith("-judge.md")) for r in evs if r["event"] == "review_finished" and r["kind"] == "judge"]')" "[('ready', True, True)]"
 
 reset_pr; echo "needs changes" > "$TQ/verdict"; echo "needs changes" > "$TQ/tests_verdict"; mkwt real
 Q add "$TMP/wt-real" fix "Real" >/dev/null; out="$(Q run)"
@@ -485,12 +666,17 @@ assert_contains "judge: names its file"      "$out" "-judge.md)"
 assert "judge: confirmed changes, no e2e"    test ! -s "$TQ/npm.log"
 assert "judge: confirmed changes, no PR"     test ! -s "$TQ/created.log"
 assert "judge: confirmed changes, job in failed/" in_failed real
+assert_contains "events: the judge confirms" "$(ev fix/real 'failed()')" "judge/judge"
+assert_contains "events: found: both, for the judge" "$(ev fix/real 'one("job_failed")["found"]')" "['code', 'tests']"
+assert_not_contains "events: confirmed changes are not escalated" "$(ev fix/real 'names()')" "escalated"
 # A second judged round with changes to make goes to the user.
 echo second >> "$TMP/wt-real/real.txt"; git -C "$TMP/wt-real" commit -q -am second
 : > "$TQ/claude.log"; Q add "$TMP/wt-real" fix "Real" >/dev/null; out="$(Q run)"
 assert_contains "judge: two judged rounds need the user" "$out" \
   "FAILED fix/real: needs your decision: the branch still had changes to make after two judged rounds (judge: $PR_QUEUE_DIR/reviews/fix-real-"
 assert "judge: two rounds, no PR"            test ! -s "$TQ/created.log"
+assert_contains "events: two judged rounds" "$(ev fix/real 'failed()')" "judge/judge"
+assert_contains "events: two rounds escalated" "$(ev fix/real 'one("escalated")["reason"], one("escalated")["review_file"].endswith("-judge.md")')" "('two_rounds', True)"
 
 reset_pr; echo "needs changes" > "$TQ/verdict"; echo escalate > "$TQ/judge_verdict"; mkwt critical
 Q add "$TMP/wt-critical" fix "Critical" >/dev/null; out="$(Q run)"
@@ -498,6 +684,9 @@ assert_contains "judge: an escalation needs the user" "$out" \
   "FAILED fix/critical: needs your decision: the judge rejected a finding that would be critical if real (judge: $PR_QUEUE_DIR/reviews/fix-critical-"
 assert "judge: escalation, no e2e"           test ! -s "$TQ/npm.log"
 assert "judge: escalation, job in failed/"   in_failed critical
+assert_contains "events: an escalation" "$(ev fix/critical 'failed()')" "judge/judge"
+assert_contains "events: found: the code review, escalated" "$(ev fix/critical 'one("job_failed")["found"]')" "['code']"
+assert_contains "events: escalated" "$(ev fix/critical 'one("escalated")["reason"], [r["verdict"] for r in evs if r.get("kind") == "judge" and r["event"] == "review_finished"]')" "('critical_finding', ['escalate'])"
 
 # A judge that didn't run fails the job too, before e2e, naming the reviews' findings and why.
 reset_pr; echo "needs changes" > "$TQ/verdict"; echo failed > "$TQ/judge_verdict"; mkwt nojudge
@@ -508,6 +697,8 @@ assert_contains "judge: didn't run, says so" "$out" "; the judge didn't run: rev
 assert "judge: didn't run, no e2e"           test ! -s "$TQ/npm.log"
 assert "judge: didn't run, no PR"            test ! -s "$TQ/created.log"
 assert "judge: didn't run, job in failed/"   in_failed nojudge
+assert_contains "events: a judge that didn't run" "$(ev fix/nojudge 'failed()')" "judge/review_error"
+assert_contains "events: found: the code review, the judge didn't run" "$(ev fix/nojudge 'one("job_failed")["found"]')" "['code']"
 
 # No judge when a review didn't run, or with PR_QUEUE_JUDGE=0.
 reset_pr; echo garbage > "$TQ/verdict"; echo "needs changes" > "$TQ/tests_verdict"; mkwt halfrun
@@ -515,12 +706,23 @@ Q add "$TMP/wt-halfrun" fix "Half run" >/dev/null; out="$(Q run)"
 assert "judge: not when a review didn't run" test -z "$(judge_line)"
 assert_contains "judge: that review named"   "$out" "FAILED fix/halfrun: the review didn't run"
 assert_contains "judge: and the other's findings" "$out" "; the test review found changes to make (test review: $PR_QUEUE_DIR/reviews/fix-halfrun-"
+assert_contains "events: one review didn't run" "$(ev fix/halfrun 'failed()')" "review/review_error"
+assert_contains "events: found: only the review that ran and found changes" "$(ev fix/halfrun 'one("job_failed")["found"]')" "['tests']"
 reset_pr; echo "needs changes" > "$TQ/verdict"; mkwt plain
 Q add "$TMP/wt-plain" fix "Plain" >/dev/null; out="$(PR_QUEUE_JUDGE=0 Q run)"
 assert "PR_QUEUE_JUDGE=0: no judge"          test -z "$(judge_line)"
 assert_contains "PR_QUEUE_JUDGE=0: the review fails the job" "$out" "FAILED fix/plain: the review found changes to make (review: "
 assert_not_contains "PR_QUEUE_JUDGE=0: no judging" "$out" "judging"
 assert_not_contains "PR_QUEUE_JUDGE=0: no judgement named" "$out" "judge:"
+assert_contains "events: PR_QUEUE_JUDGE=0, the code review's changes" "$(ev fix/plain 'failed()')" "review/review_code"
+assert_contains "events: found: the code review" "$(ev fix/plain 'one("job_failed")["found"]')" "['code']"
+reset_pr; echo "needs changes" > "$TQ/tests_verdict"; mkwt plaintests
+Q add "$TMP/wt-plaintests" fix "Plain tests" >/dev/null; PR_QUEUE_JUDGE=0 Q run >/dev/null
+assert_contains "events: PR_QUEUE_JUDGE=0, the test review's changes" "$(ev fix/plaintests 'failed()')" "review/review_tests"
+assert_contains "events: found: the test review" "$(ev fix/plaintests 'one("job_failed")["found"]')" "['tests']"
+reset_pr; echo "needs changes" > "$TQ/verdict"; echo "needs changes" > "$TQ/tests_verdict"; mkwt plainboth
+Q add "$TMP/wt-plainboth" fix "Plain both" >/dev/null; PR_QUEUE_JUDGE=0 Q run >/dev/null
+assert_contains "events: PR_QUEUE_JUDGE=0, both reviews' changes" "$(ev fix/plainboth 'failed(), one("job_failed")["found"]')" "('review/review_code', ['code', 'tests'])"
 out="$(PR_QUEUE_JUDGE=maybe Q run)";         assert_contains "run: bad PR_QUEUE_JUDGE refused" "$out" "PR_QUEUE_JUDGE must be 0"
 
 # A TERM to the runner's process group while the judge works stops the judge's session too.
@@ -543,9 +745,35 @@ assert "judge stopped: the job stayed in running/" test -n "$(find "$RQ/running"
 rm -f "$TQ/judge_hang" "$RQ"/running/*
 
 # --- a job left in running/ by a dead runner goes to failed/ ---
-printf 'worktree=/x\nbranch=fix/dead\n' > "$RQ/running/1-fix-dead.job"
+mkwt dead; printf 'worktree=%s\nbranch=fix/dead\n' "$TMP/wt-dead" > "$RQ/running/1-fix-dead.job"
 out="$(Q run)";                              assert_contains "dead runner: reported" "$out" "fix/dead was left unfinished"
 assert "dead runner: job in failed/"         in_failed dead
+assert_contains "events: a dead runner's job is abandoned" "$(ev fix/dead 'failed(), one("job_failed")["job_id"], one("job_failed")["repo"]')" "('start/abandoned', '1-fix-dead', 'repo')"
+assert_contains "events: with its worktree's sha" "$(ev fix/dead 'one("job_failed")["sha"]')" "$(git -C "$TMP/wt-dead" rev-parse HEAD)"
+
+# --- a job whose process ends without failjob (here: a SIGKILL during its e2e run) goes to failed/, abandoned ---
+# on_e2e kills the job's process: of the pr-queue.sh processes above the npm stub, the one just below the runner of
+# `run <checkout>` (the topmost). With $TQ/kill_rm, it removes the worktree first.
+cat > "$TQ/kill_job" <<'EOF'
+p="$(awk '{ print $4 }' "/proc/$PPID/stat")"; chain=()   # from npm's parent up
+while [ "$p" -gt 1 ] && grep -q 'pr-queue\.sh' "/proc/$p/cmdline" 2>/dev/null; do chain+=("$p"); p="$(awk '{ print $4 }' "/proc/$p/stat")"; done
+[ -f "$TQ/kill_rm" ] && rm -rf "$(cat "$TQ/kill_rm")"
+kill -KILL "${chain[-2]}"
+EOF
+for gone in "" 1; do
+  reset_pr; mkwt "killed$gone"; sha="$(git -C "$TMP/wt-killed$gone" rev-parse HEAD)"
+  rm -f "$TQ/kill_rm"; [ -z "$gone" ] || echo "$TMP/wt-killed$gone" > "$TQ/kill_rm"
+  cp "$TQ/kill_job" "$TQ/on_e2e"
+  Q add --review none --tests none "$TMP/wt-killed$gone" fix "Killed" >/dev/null; out="$(Q run "$R")"
+  job_id="$(basename "$(find "$RQ/failed" -name "*killed$gone.job")" .job)"
+  assert_contains "killed${gone:+, worktree gone}: did not finish" "$out" "$job_id did not finish; moved to failed/"
+  assert "killed${gone:+, worktree gone}: job in failed/" in_failed "killed$gone"
+  want_sha="'$sha'"; [ -z "$gone" ] || want_sha=None
+  assert_contains "events: killed${gone:+, worktree gone}: abandoned at an unknown step" \
+    "$(ev "fix/killed$gone" 'evs[-1]["event"], failed(), evs[-1]["job_id"], evs[-1]["repo"], evs[-1]["sha"]')" \
+    "('job_failed', 'unknown/abandoned', '$job_id', 'repo', $want_sha)"
+done
+git -C "$R" worktree prune; rm -f "$TQ/kill_rm" "$TQ/kill_job"
 
 # --- one runner at a time per repo, and the lock command ---
 reset_pr; mkwt busy2; Q add "$TMP/wt-busy2" fix "Busy" >/dev/null

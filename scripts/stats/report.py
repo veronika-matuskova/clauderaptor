@@ -5,8 +5,8 @@
 
 --db defaults to stats.py's db ($CLAUDERAPTOR_STATS_DIR/stats.db, else
 ${XDG_STATE_HOME:-~/.local/state}/clauderaptor-stats/stats.db), --out to report.html next to it. The page is
-self-contained (inline CSS and SVG, no script, no fonts, no links to anything), so opening it makes no network
-requests. Like the db it stays on this machine: report.py refuses (exit 2) to write it into a git work tree,
+self-contained (inline CSS and SVG, the logo and icon inlined as data: PNGs, no script, no fonts, no links to
+anything), so opening it makes no network requests. Like the db it stays on this machine: report.py refuses (exit 2) to write it into a git work tree,
 and writes it 0600, atomically.
 --open then opens it in an Edge app window with its own profile (under WSL: msedge.exe through interop, the
 Windows user's %LOCALAPPDATA%\\clauderaptor-stats\\edge-profile). The Windows user is the only one under
@@ -17,6 +17,7 @@ The cost-and-tokens section reads stats.py's transcript views (v_tokens_by_role,
 v_subagent_share, v_cost_per_merged_branch) and says "no data yet" while a db doesn't have them.
 """
 import argparse
+import base64
 import datetime
 import html
 import importlib.util
@@ -50,6 +51,13 @@ TOP_REASON_SHARE = 0.40
 EDGE = "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
 EDGE_FOLDER = ("AppData", "Local", "Microsoft", "Edge")
 PROFILE_FOLDER = ("AppData", "Local", "clauderaptor-stats", "edge-profile")
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+
+def png_data(name):
+    """A PNG next to this script as a data: URI, so the page stays self-contained."""
+    with open(os.path.join(HERE, name), "rb") as f:
+        return "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
 
 
 def die(msg, code=2):
@@ -557,6 +565,7 @@ CSS = """
 --series-2:#d95926;--series-3:#199e70;--track:#184f95}
 body{margin:0;background:var(--page);color:var(--text-primary);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
 main{max-width:760px;margin:0 auto;padding:24px 16px 48px}
+header{display:flex;align-items:center;gap:14px}.logo{width:96px;height:96px;flex:none}
 h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:0 0 12px}h3{font-size:14px;margin:18px 0 6px}
 section{background:var(--surface-1);border:1px solid var(--border);border-radius:8px;padding:16px 18px;margin:16px 0}
 .sub,.n,.empty,.legend{color:var(--text-secondary)}.n{font-weight:400;font-size:12px;margin-left:6px}
@@ -590,11 +599,15 @@ def render(dbpath):
              s_hints(m), s_data(db, dbpath)]
     return ('<!DOCTYPE html>\n<html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
-            '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'">'
-            '<title>clauderaptor stats</title><style>%s</style></head><body class="viz-root"><main>'
+            '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; '
+            'img-src data:">'
+            '<link rel="icon" type="image/png" href="%s">'
+            '<title>clauderaptor stats</title><style>%s</style></head><body class="viz-root"><main><header>'
+            '<img class="logo" src="%s" alt=""><div>'
             '<h1>clauderaptor: how the PR queue is doing</h1><p class="sub">A round is one run of a branch through '
-            'the queue. Shares show their n; below %d they say "not enough data".</p>%s</main></body></html>\n'
-            % (CSS, MIN_N, "".join(parts)))
+            'the queue. Shares show their n; below %d they say "not enough data".</p></div></header>%s</main>'
+            '</body></html>\n'
+            % (png_data("icon.png"), CSS, png_data("logo.png"), MIN_N, "".join(parts)))
 
 
 def refuse_work_tree(path):

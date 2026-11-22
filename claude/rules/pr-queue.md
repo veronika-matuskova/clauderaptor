@@ -1,6 +1,7 @@
 # Parallel agents and tests
 
-- When agents work in parallel, merge their branches through `~/code/clauderaptor/scripts/pr-queue.sh`, one at a time. Agents
+- When agents work in parallel, merge their branches through `~/code/clauderaptor/scripts/pr-queue.sh`, one at a time per
+  repo (each repo has its own queue; `pr-queue.sh run` works on all of them side by side). Agents
   commit and queue; they don't push, open PRs or merge on their own, so they can't mess up each other's branches.
 - The queue reviews each branch before its e2e run, in two fresh `claude -p` sessions at the same time
   (`scripts/review.sh`): the code, with the built-in `/code-review`, and the tests (`review.sh --tests`: a mutation

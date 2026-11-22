@@ -841,6 +841,16 @@ assert "rule changes: the short sha" test "$(Q9 "SELECT sha FROM rule_changes WH
 assert "escaped: the queue's merged branches; a fix within 14 days on their files; a revert; not a chore, nor a fix 17 days later" \
   test "$(Q9 "SELECT group_concat(branch || ':' || ifnull(fixed_by, '-'), ' ') FROM (SELECT * FROM v_escaped_defects ORDER BY branch)")" \
   = "feat/x:$FIXX feat/y:- feat/z:$REV fix/x-bug:-"
+# git that fails only on the rules log: the repo keeps its rows, and the ingest goes on.
+mkdir -p "$TMP/gitstub"
+# shellcheck disable=SC2016  # the stub's own $a and $@, not this script's
+printf '#!/usr/bin/env bash\nfor a; do [ "$a" = scripts/queue/review.sh ] && exit 1; done\nexec %q "$@"\n' "$(command -v git)" > "$TMP/gitstub/git"
+chmod +x "$TMP/gitstub/git"
+out="$(PATH="$TMP/gitstub:$PATH" PR_QUEUE_DIR="$S9" ingest "$DB9")"; rc=$?
+assert "the rules log fails: exit 0" test "$rc" -eq 0
+assert_contains "the rules log fails: no repo read" "$out" "git: 0 main commits and 0 rule changes from 0 repos"
+assert "the rules log fails: the repo keeps its commits and rule changes" \
+  test "$(Q9 "SELECT (SELECT COUNT(*) FROM main_commits) || ':' || (SELECT COUNT(*) FROM rule_changes)")" = "9:5"
 gc 2026-11-21T10:00:00+01:00 "local only" a.txt
 git -C "$G" update-ref refs/remotes/origin/main HEAD~1
 echo "$TMP/g/nogit" > "$S9/repos/gone/checkout"; mkdir -p "$TMP/g/nogit"
@@ -854,8 +864,8 @@ assert "a repo whose git fails keeps its rows" test "$(Q9 "SELECT COUNT(*) FROM 
 echo "-- flaky CI checks"
 S10="$TMP/state10"; mkdir -p "$S10/reviews"
 # ck <ts> <event> <job> <branch> <sha> [<result>]
-ck() { printf '{"v":1,"ts":"%s","event":"%s","repo":"app","branch":"%s","job_id":"%s","sha":"%s"%s}\n' \
-  "$1" "$2" "$4" "$3" "$5" "${6:+,\"result\":\"$6\"}"; }
+ck() { printf '{"v":1,"ts":"%s","event":"%s","repo":"%s","branch":"%s","job_id":"%s","sha":"%s"%s}\n' \
+  "$1" "$2" "${CKREPO:-app}" "$4" "$3" "$5" "${6:+,\"result\":\"$6\"}"; }
 { ck 2026-11-10T10:00:00.000Z job_queued a1 feat/a qa
   ck 2026-11-10T10:10:00.000Z checks_finished a1 feat/a m1 fail
   ck 2026-11-10T11:00:00.000Z job_queued a2 feat/a qa
@@ -864,6 +874,9 @@ ck() { printf '{"v":1,"ts":"%s","event":"%s","repo":"app","branch":"%s","job_id"
   ck 2026-11-10T10:10:00.000Z checks_finished b1 feat/b b1 fail
   ck 2026-11-10T11:00:00.000Z job_queued b2 feat/b qb2
   ck 2026-11-10T11:10:00.000Z checks_finished b2 feat/b b2 pass
+  # Another repo's job of the same branch, queued at the same commit, passes on the same sha: not feat/b's pass.
+  CKREPO=other ck 2026-11-10T10:30:00.000Z job_queued o1 feat/b qb
+  CKREPO=other ck 2026-11-10T10:40:00.000Z checks_finished o1 feat/b b1 pass
   ck 2026-11-10T10:10:00.000Z checks_finished c1 feat/c c1 fail
   ck 2026-11-10T10:20:00.000Z checks_finished c2 feat/c c1 pass
   ck 2026-11-10T10:00:00.000Z checks_finished d1 feat/d d1 pass
@@ -871,10 +884,10 @@ ck() { printf '{"v":1,"ts":"%s","event":"%s","repo":"app","branch":"%s","job_id"
   ck 2026-11-10T10:40:00.000Z checks_finished d3 feat/d d1 timeout
 } > "$S10/events.jsonl"
 PR_QUEUE_DIR="$S10" ingest "$TMP/out/ten.db" >/dev/null
-assert_contains "flaky: passed later on the same sha, or queued again at the same commit; not after new commits, nor a pass before" \
+assert_contains "flaky: passed later on the same sha, or queued again at the same commit; not after new commits, nor a pass before, nor another repo's" \
   "$(DB2="$TMP/out/ten.db" q "SELECT group_concat(branch || ':' || ifnull(passed_at, '-'), ' ') FROM (SELECT * FROM v_flaky_checks ORDER BY branch)")" \
   "feat/a:2026-11-10T11:10:00.000Z feat/b:- feat/c:2026-11-10T10:20:00.000Z feat/d:-"
-assert "checks: only pass and fail" test "$(DB2="$TMP/out/ten.db" q "SELECT COUNT(*) FROM checks")" -eq 8
+assert "checks: only pass and fail" test "$(DB2="$TMP/out/ten.db" q "SELECT COUNT(*) FROM checks")" -eq 9
 
 echo "-- the last ingest's time"
 before="$(date -u +%Y-%m-%dT%H:%M:%S)"

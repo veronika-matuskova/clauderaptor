@@ -165,9 +165,9 @@ def nice_ticks(top, whole=False):
     return ticks
 
 
-def columns(rows, fmt=compact, aria="", whole=True, marks=None):
-    """Columns on one baseline with one y axis: rows of (x label, value, tooltip). marks: {x label: tooltip}, a
-    dashed line over each of those columns (e.g. a rule change that day)."""
+def columns(rows, fmt=compact, aria="", whole=True, marks=None, keys=None):
+    """Columns on one baseline with one y axis: rows of (x label, value, tooltip). marks: {key: tooltip}, a
+    dashed line over each column whose key (keys[i], default its label) is one (e.g. a rule change that day)."""
     if not rows:
         return '<p class="empty">no data yet</p>'
     W, H, left, bottom, top_pad = 640, 200, 48, 28, 10
@@ -190,11 +190,12 @@ def columns(rows, fmt=compact, aria="", whole=True, marks=None):
         if h > 0:
             out.append('<path class="s1" d="%s"/>' % bar_path(x, top_pad + plot_h - h, bw, h, horizontal=False))
         out.append('</g>')
-        if marks and label in marks:
+        key = keys[i] if keys else label
+        if marks and key in marks:
             cx = x + bw / 2
             out.append('<g class="mark rule"><title>%s</title><line class="rule-mark" x1="%.1f" x2="%.1f" y1="%d" '
                        'y2="%d"/><rect class="hit" x="%.1f" y="%d" width="8" height="%d"/></g>'
-                       % (e(marks[label]), cx, cx, top_pad, top_pad + plot_h, cx - 4, top_pad, plot_h))
+                       % (e(marks[key]), cx, cx, top_pad, top_pad + plot_h, cx - 4, top_pad, plot_h))
         if i % every == 0:
             out.append('<text class="tick" x="%.1f" y="%d" text-anchor="middle">%s</text>'
                        % (x + bw / 2, H - 10, e(label)))
@@ -510,12 +511,12 @@ def s_timeline(db):
     rules = db.q("SELECT substr(ts, 1, 10), repo, sha, subject FROM rule_changes WHERE ts IS NOT NULL ORDER BY ts, repo, sha")
     marks = {}
     for d, repo, sha, subject in rules:
-        marks[d[5:]] = (marks[d[5:]] + "; " if d[5:] in marks else "rule change %s: " % d) + "%s %s %s" % (repo, sha, subject)
+        marks[d] = (marks[d] + "; " if d in marks else "rule change %s: " % d) + "%s %s %s" % (repo, sha, subject)
     body = ['<h3>Rounds per day <span class="n">n=%d</span></h3>' % sum(r[1] for r in rounds),
             '<p class="sub">A dashed line marks a day the rules changed (claude/rules, CLAUDE.md, review.sh, '
             'claude/agents): compare first-pass yield and precision before and after.</p>' if rules else "",
             columns([(d[5:], c, "%s: %d rounds, %d merged" % (d, c, mg or 0)) for d, c, mg in rounds], aria="rounds per day",
-                    marks=marks),
+                    marks=marks, keys=[d for d, _, _ in rounds]),
             '<h3>Queue review cost per day <span class="n">n=%d reviews (code, tests, judge)</span></h3>' % sum(r[2] for r in cost),
             columns([(d[5:], c or 0, "%s: %s in %d reviews" % (d, money(c), n)) for d, c, n in cost], fmt=money,
                     aria="review cost per day", whole=False),

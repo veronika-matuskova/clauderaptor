@@ -416,7 +416,8 @@ INSERT INTO checks (job_id, repo, branch, sha, queued_sha, ts, result) VALUES
 INSERT INTO rule_changes (repo, sha, ts, subject) VALUES
  ('app', 'abc1234', '2026-10-26T08:00:00.000Z', 'docs: tighten the rules <script>x</script>'),
  ('app', 'def5678', '2026-10-26T09:00:00.000Z', 'chore: agents'),
- ('tool', '0123abc', '2026-10-28T09:00:00.000Z', 'docs: CLAUDE.md');
+ ('tool', '0123abc', '2026-10-28T09:00:00.000Z', 'docs: CLAUDE.md'),
+ ('app', 'old1234', '2025-10-05T09:00:00.000Z', 'docs: a year earlier');
 INSERT OR REPLACE INTO meta (key, value) VALUES ('last_ingest', '2026-11-01T08:30:00.000Z');"
 report --db "$DV" --out "$TMP/out/derived.html" >/dev/null
 TV="$(text "$TMP/out/derived.html")"; HV="$(cat "$TMP/out/derived.html")"
@@ -426,12 +427,12 @@ assert_contains "flaky rate with n" "$TV" "Flaky CI n=5 Flaky rate: 40% (n=5)"
 assert_contains "the flaky runs, newest first, the branch escaped" "$TV" "Flaky runs (2) Repo Branch Failed Passed app <b>flaky</b> 2026-10-26 10:00 2026-10-26 11:00 app feat/x 2026-10-26 09:30 2026-10-26 12:00"
 assert_contains "a branch name in the flaky table is escaped" "$HV" "&lt;b&gt;flaky&lt;/b&gt;"
 assert_contains "a dashed mark on a day with rounds and a rule change" "$HV" '<g class="mark rule"><title>rule change 2026-10-26: app abc1234 docs: tighten the rules &lt;script&gt;x&lt;/script&gt;; app def5678 chore: agents</title><line class="rule-mark"'
-assert "one mark: the other change's day has no rounds" test "$(grep -o 'class="rule-mark"' <<<"$HV" | wc -l)" -eq 1
+assert "one mark: the other change's day has no rounds, the same day a year earlier is another day" test "$(grep -o 'class="rule-mark"' <<<"$HV" | wc -l)" -eq 1
 assert_not_contains "a subject is escaped" "$HV" "<script>x"
-assert_contains "the rule changes listed" "$TV" "Rule changes n=3 Rule changes (3) Day Repo Commit Subject 2026-10-26 app abc1234 docs: tighten the rules <script>x</script> 2026-10-26 app def5678 chore: agents 2026-10-28 tool 0123abc docs: CLAUDE.md"
+assert_contains "the rule changes listed" "$TV" "Rule changes n=4 Rule changes (4) Day Repo Commit Subject 2025-10-05 app old1234 docs: a year earlier 2026-10-26 app abc1234 docs: tighten the rules <script>x</script> 2026-10-26 app def5678 chore: agents 2026-10-28 tool 0123abc docs: CLAUDE.md"
 assert_contains "the weekly trend counts them" "$TV" "2026-10-26 7 2 not enough data (n=2) \$11.10 3"
 assert_contains "last ingested: meta's time, not the file's" "$TV" "Last ingested: 2026-11-01 08:30. Generated"
-assert_contains "row counts of the git and checks tables" "$TV" "checks 7 main_commits 8 rule_changes 3"
+assert_contains "row counts of the git and checks tables" "$TV" "checks 7 main_commits 8 rule_changes 4"
 TE="$(text "$OUT")"
 assert_contains "no git rows: not enough data" "$TE" "Escaped defects n=0 Escaped rate: not enough data (n=0)"
 assert_contains "no failed checks: not enough data" "$TE" "Flaky CI n=0 Flaky rate: not enough data (n=0)"

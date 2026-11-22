@@ -24,7 +24,7 @@ Then:
 
 It's interactive (sudo password, GitHub login), so run it yourself in a terminal as your user, not with `sudo`. Every step is safe to re-run.
 
-Then `scripts/check.sh` checks that everything is in place: the system (Ubuntu, WSL, systemd and a systemd user instance for `capped.sh`), git (identity, signing, the pre-commit hook), the tools, the `~/.claude` links, and the machine's resources. It only looks, without sudo, and prints `ok`, `warn` or `FAIL` with what to run for each check. Resources only warn: under 7 GiB of memory, when `capped.sh`'s overall cap leaves under 2 GiB for the rest, under 4 CPUs, or under 20 GiB free in `$HOME` or on the Windows drive. Its exit code is the number of FAILs.
+Then `scripts/setup/check.sh` checks that everything is in place: the system (Ubuntu, WSL, systemd and a systemd user instance for `capped.sh`), git (identity, SSH commit signing, the pre-commit hook), the tools, the `~/.claude` links, and the machine's resources. It only looks, without sudo, and prints `ok`, `warn` or `FAIL` with what to run for each check. Resources only warn: under 7 GiB of memory, when `capped.sh`'s overall cap leaves under 2 GiB for the rest, under 4 CPUs, or under 20 GiB free in `$HOME` or on the Windows drive. Its exit code is the number of FAILs.
 
 ## Use
 - Config lives in `claude/`: `CLAUDE.md` (global instructions), `rules/*.md`, `skills/<name>/SKILL.md` (starter in `templates/skill/`), `agents/*.md`, `statusline.py`. It's symlinked, so edits apply immediately. Per-repo overrides go in each repo's own `CLAUDE.md` / `.claude/`.

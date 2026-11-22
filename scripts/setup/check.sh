@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Checks that this machine has what clauderaptor needs. It only looks: no sudo, nothing installed or changed.
-#   scripts/check.sh
+#   scripts/setup/check.sh
 # One line per check: ok; warn (works, but may cause trouble); FAIL (missing, with what to run).
 #   system     not root, Ubuntu, WSL, systemd, a systemd user instance (capped.sh needs it for its caps)
-#   git        your git identity, commit signing, the pre-commit hook
+#   git        your git identity, SSH commit signing, the pre-commit hook
 #   tools      git python3 curl gh shellcheck claude docker (FAIL) and node (warn); gh logged in; docker info
 #   install    ~/.claude links into claude/, settings.json is built
 #   resources  warns below 7 GiB of memory (WSL set to 8 GB shows 7.6), when capped.sh's overall cap
@@ -11,7 +11,7 @@
 #              in $HOME and, on WSL, on the Windows drive (/mnt/c), where WSL's virtual disk usually is
 # Exit code: the number of FAILs; warnings don't count.
 set -uo pipefail
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 # The tests point these at their own files
 MEMINFO="${CHECK_MEMINFO:-/proc/meminfo}"
 OS_RELEASE="${CHECK_OS_RELEASE:-/etc/os-release}"
@@ -56,14 +56,16 @@ for k in user.name user.email; do
     fail "no git $k: git config --global $k \"<your ${k#user.} on GitHub>\""
   fi
 done
+# As setup-tools.sh sets it up: an SSH key (without gpg.format=ssh, git hands the key to gpg and commits fail)
 key="$(git config --global user.signingkey)"
-if [ "$(git config --global commit.gpgsign)" = true ] && [ -n "$key" ] && [ -f "$key" ]; then
+if [ "$(git config --global commit.gpgsign)" = true ] && [ "$(git config --global gpg.format)" = ssh ] &&
+   [ -n "$key" ] && [ -f "$key" ]; then
   ok "commits are signed with $key"
 else
-  fail "commit signing isn't set up: run scripts/setup.sh tools"
+  fail "commit signing isn't set up: run scripts/setup/setup.sh tools"
 fi
 if [ "$(git -C "$REPO" config core.hooksPath)" = .githooks ]; then ok "pre-commit hook runs tests/run.sh"; else
-  fail "pre-commit hook isn't on: run scripts/install.sh"
+  fail "pre-commit hook isn't on: run scripts/setup/install.sh"
 fi
 
 echo "== tools"
@@ -71,16 +73,16 @@ for c in git python3 curl; do
   if has "$c"; then ok "$c"; else fail "$c not found: sudo apt-get install $c"; fi
 done
 for c in gh shellcheck; do
-  if has "$c"; then ok "$c"; else fail "$c not found: run scripts/setup.sh tools"; fi
+  if has "$c"; then ok "$c"; else fail "$c not found: run scripts/setup/setup.sh tools"; fi
 done
 if has claude; then ok "claude"; else fail "claude not found: install Claude Code (review.sh runs claude -p)"; fi
 if has node; then ok "node $(node --version 2>/dev/null)"; else
   warn "node not found: the queue needs it for repos with scripts/e2e-gate.mjs"
 fi
 if has gh; then
-  if gh auth status >/dev/null 2>&1; then ok "gh is logged in"; else fail "gh isn't logged in: run scripts/setup.sh tools"; fi
+  if gh auth status >/dev/null 2>&1; then ok "gh is logged in"; else fail "gh isn't logged in: run scripts/setup/setup.sh tools"; fi
 fi
-if ! has docker; then fail "docker not found: run scripts/setup.sh docker"
+if ! has docker; then fail "docker not found: run scripts/setup/setup.sh docker"
 elif out="$(timeout 60 docker info --format '{{.ServerVersion}}' 2>&1)"; then ok "docker: server $out"
 else
   hint=""; [[ "$out" == *"permission denied"* ]] && hint=" (new to the docker group? open a new terminal)"
@@ -98,9 +100,9 @@ for item in CLAUDE.md statusline.py rules skills agents; do
 done
 if [ ${#bad[@]} -eq 0 ]; then ok "$DEST links into $(dirname "$(readlink "$DEST/CLAUDE.md")")"; else
   list="$(printf '%s; ' "${bad[@]}")"
-  fail "in $DEST: ${list%; }: run scripts/install.sh"
+  fail "in $DEST: ${list%; }: run scripts/setup/install.sh"
 fi
-if [ -f "$DEST/settings.json" ]; then ok "settings.json is built"; else fail "no $DEST/settings.json: run scripts/install.sh"; fi
+if [ -f "$DEST/settings.json" ]; then ok "settings.json is built"; else fail "no $DEST/settings.json: run scripts/setup/install.sh"; fi
 
 echo "== resources"
 mem="$(awk '/^MemTotal:/ { print $2 }' "$MEMINFO" 2>/dev/null)"

@@ -8,8 +8,8 @@ source "$(dirname "$0")/lib.sh"
 # State next to the stubs: .cpus, .free (df's free KiB), .gh-out (gh logged out), .docker-err (docker info fails).
 setup() {
   D="$TMP/$1"; BIN="$D/bin"; H="$D/home"; R="$D/repo"
-  mkdir -p "$BIN" "$H/.ssh" "$R/scripts" "$D/run/systemd" "$D/systemd" "$D/c" "$R/claude/rules" "$R/claude/skills" "$R/claude/agents"
-  cp "$ROOT/scripts/check.sh" "$R/scripts/"
+  mkdir -p "$BIN" "$H/.ssh" "$R/scripts/setup" "$D/run/systemd" "$D/systemd" "$D/c" "$R/claude/rules" "$R/claude/skills" "$R/claude/agents"
+  cp "$ROOT/scripts/setup/check.sh" "$R/scripts/setup/"
   git init -q "$R"; git -C "$R" config core.hooksPath .githooks
   for c in python3 curl shellcheck claude systemd-run systemctl; do printf '#!/usr/bin/env bash\n' > "$BIN/$c"; done
   printf '#!/usr/bin/env bash\necho v24.0.0\n' > "$BIN/node"
@@ -35,7 +35,7 @@ EOF
   printf 'MemTotal:       %s kB\nSwapTotal:       3145728 kB\n' $((12 * 1048576)) > "$D/meminfo"
   G="$D/gitconfig"
   git config --file "$G" user.name t; git config --file "$G" user.email t@t
-  echo key > "$H/.ssh/k.pub"; git config --file "$G" user.signingkey "$H/.ssh/k.pub"; git config --file "$G" commit.gpgsign true
+  echo key > "$H/.ssh/k.pub"; git config --file "$G" user.signingkey "$H/.ssh/k.pub"; git config --file "$G" commit.gpgsign true; git config --file "$G" gpg.format ssh
   mkdir -p "$H/.claude"; touch "$R/claude/CLAUDE.md" "$R/claude/statusline.py" "$H/.claude/settings.json"
   for i in CLAUDE.md statusline.py rules skills agents; do ln -s "$R/claude/$i" "$H/.claude/$i"; done
 }
@@ -43,7 +43,7 @@ EOF
 check() {
   OUT="$(env -i PATH="$BIN" HOME="$H" GIT_CONFIG_GLOBAL="$G" GIT_CONFIG_NOSYSTEM=1 XDG_RUNTIME_DIR="$D/run" \
     WSL_DISTRO_NAME=Ubuntu CHECK_MEMINFO="$D/meminfo" CHECK_OS_RELEASE="$D/os-release" CHECK_SYSTEMD_DIR="$D/systemd" \
-    CHECK_WINDOWS_DRIVE="$D/c" "$@" bash "$R/scripts/check.sh" 2>&1)"; RC=$?
+    CHECK_WINDOWS_DRIVE="$D/c" "$@" bash "$R/scripts/setup/check.sh" 2>&1)"; RC=$?
 }
 
 # Everything there: exit 0, every section, no FAIL or warn
@@ -78,6 +78,9 @@ assert "nouser: exits 1" [ "$RC" -eq 1 ]
 assert_contains "nouser: no user instance" "$OUT" "FAIL  no systemd user instance"
 setup norun; rm "$BIN/systemd-run"; check
 assert_contains "norun: no systemd-run means no user instance" "$OUT" "FAIL  no systemd user instance"
+setup nosystemctl; rm "$BIN/systemctl"; check
+assert "nosystemctl: exits 1" [ "$RC" -eq 1 ]
+assert_contains "nosystemctl: no systemctl means no user instance" "$OUT" "FAIL  no systemd user instance"
 
 setup noemail; git config --file "$G" --unset user.email; check
 assert "noemail: exits 1" [ "$RC" -eq 1 ]
@@ -86,18 +89,23 @@ assert_contains "noemail: name still ok" "$OUT" "ok    user.name: t"
 
 setup nosign; git config --file "$G" commit.gpgsign false; check
 assert_contains "nosign: signing off" "$OUT" "FAIL  commit signing isn't set up"
+setup noformat; git config --file "$G" --unset gpg.format; check
+assert "noformat: exits 1" [ "$RC" -eq 1 ]
+assert_contains "noformat: a key without gpg.format=ssh isn't signing" "$OUT" "FAIL  commit signing isn't set up"
+setup gpgformat; git config --file "$G" gpg.format openpgp; check
+assert_contains "gpgformat: another format isn't SSH signing" "$OUT" "FAIL  commit signing isn't set up"
 setup nokey; rm "$H/.ssh/k.pub"; check
 assert "nokey: exits 1" [ "$RC" -eq 1 ]
 assert_contains "nokey: a missing key file isn't signing" "$OUT" "FAIL  commit signing isn't set up"
 
 setup nohook; git -C "$R" config --unset core.hooksPath; check
-assert_contains "nohook: says how" "$OUT" "FAIL  pre-commit hook isn't on: run scripts/install.sh"
+assert_contains "nohook: says how" "$OUT" "FAIL  pre-commit hook isn't on: run scripts/setup/install.sh"
 
 # Missing tools: each named, with its fix; the count is the exit code
 setup notools; rm "$BIN/python3" "$BIN/shellcheck" "$BIN/claude"; check
 assert "notools: exits 3" [ "$RC" -eq 3 ]
 assert_contains "notools: python3" "$OUT" "FAIL  python3 not found: sudo apt-get install python3"
-assert_contains "notools: shellcheck" "$OUT" "FAIL  shellcheck not found: run scripts/setup.sh tools"
+assert_contains "notools: shellcheck" "$OUT" "FAIL  shellcheck not found: run scripts/setup/setup.sh tools"
 assert_contains "notools: claude" "$OUT" "FAIL  claude not found"
 
 setup nogh; rm "$BIN/gh"; check
@@ -111,7 +119,7 @@ assert "nonode: only a warning" [ "$RC" -eq 0 ]
 assert_contains "nonode: warns" "$OUT" "warn  node not found"
 
 setup nodocker; rm "$BIN/docker"; check
-assert_contains "nodocker: says how" "$OUT" "FAIL  docker not found: run scripts/setup.sh docker"
+assert_contains "nodocker: says how" "$OUT" "FAIL  docker not found: run scripts/setup/setup.sh docker"
 setup dockerdown; printf 'Client: x\npermission denied while trying to connect\n' > "$BIN/.docker-err"; check
 assert "dockerdown: exits 1" [ "$RC" -eq 1 ]
 assert_contains "dockerdown: shows the error and a hint" "$OUT" \
@@ -123,7 +131,7 @@ rm "$H/.claude/rules"; mkdir "$H/.claude/rules"; rm "$R/claude/statusline.py"
 ln -sfn "$D/elsewhere" "$H/.claude/agents"; rm "$H/.claude/settings.json"; check
 assert "noinstall: exits 2" [ "$RC" -eq 2 ]
 assert_contains "noinstall: lists each link" "$OUT" \
-  "FAIL  in $H/.claude: statusline.py is a broken link; rules isn't a link; agents is a broken link: run scripts/install.sh"
+  "FAIL  in $H/.claude: statusline.py is a broken link; rules isn't a link; agents is a broken link: run scripts/setup/install.sh"
 assert_contains "noinstall: settings" "$OUT" "FAIL  no $H/.claude/settings.json"
 setup otherlink; mkdir -p "$D/x/stuff"; ln -sfn "$D/x/stuff" "$H/.claude/skills"; check
 assert_contains "otherlink: a link outside claude/" "$OUT" "skills links to $D/x/stuff"

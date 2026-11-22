@@ -565,8 +565,8 @@ def cwd_facts(cwd):
         return None, None, None
     h = hashlib.sha256(cwd.encode("utf-8", "replace")).hexdigest()[:16]
     parts = cwd.rstrip("/").split("/")
-    if "repos" in parts[:-1]:
-        i = len(parts) - 1 - parts[::-1].index("repos")
+    if "repos" in parts[:-1]:  # the last repos/ that has a folder after it
+        i = len(parts) - 2 - parts[-2::-1].index("repos")
         return h, parts[i + 1], "repos"
     if any((cwd.rstrip("/") + "/").startswith(t) for t in tmp_dirs()):
         return h, None, "tmp"
@@ -578,66 +578,85 @@ def num_tok(v):
 
 
 def ingest_transcripts(db, projects):
-    """New lines of every transcript: each message's usage once (by message.id), and its session's entrypoint,
-    first cwd and branch, and first and last time. Reads only the allowlisted fields. Returns (files, new msgs)."""
+    """New lines of every transcript (see ingest_transcript). A transcript that can't be read is skipped, its
+    changes undone, and the rest are read. Returns (files read, new msgs, {error name: files skipped})."""
     files = new = 0
+    skipped = {}
     for path, sid, parent in transcript_files(projects):
-        facts = {"entrypoint": None, "cwd": None, "branch": None, "start": None, "end": None, "lines": 0,
-                 "restart": False}
-        msgs = []
-        places = {}  # (cwd, branch) -> lines: where the session's lines were, also after it cd's elsewhere
+        db.execute("SAVEPOINT transcript")
+        try:
+            n = ingest_transcript(db, path, sid, parent)
+        except Exception as e:  # noqa: BLE001 -- one bad transcript never stops the ingest
+            db.execute("ROLLBACK TO transcript")
+            skipped[type(e).__name__] = skipped.get(type(e).__name__, 0) + 1
+            n = None
+        db.execute("RELEASE transcript")
+        if n is not None:
+            files += 1
+            new += n
+    return files, new, skipped
 
-        def take(text, d):
-            facts["lines"] += 1
-            ts = norm_ts(d["timestamp"]) if isinstance(d.get("timestamp"), str) else None
-            if ts:
-                facts["start"] = min(facts["start"] or ts, ts)
-                facts["end"] = max(facts["end"] or ts, ts)
-            for k, f in (("entrypoint", "entrypoint"), ("cwd", "cwd"), ("branch", "gitBranch")):
-                if facts[k] is None and isinstance(d.get(f), str) and d[f]:
-                    facts[k] = d[f]
-            if isinstance(d.get("cwd"), str) and d["cwd"]:
-                pk = (d["cwd"], d["gitBranch"] if isinstance(d.get("gitBranch"), str) else "")
-                places[pk] = places.get(pk, 0) + 1
-            m = d.get("message")
-            if not isinstance(m, dict) or not isinstance(m.get("usage"), dict) or not isinstance(m.get("id"), str):
-                return
-            u = m["usage"]
-            cc = u.get("cache_creation") if isinstance(u.get("cache_creation"), dict) else {}
-            model = m.get("model") if isinstance(m.get("model"), str) else None
-            msgs.append((m["id"], sid, model,
-                         ts[:10] if ts else None, num_tok(u.get("input_tokens")), num_tok(u.get("output_tokens")),
-                         num_tok(u.get("cache_creation_input_tokens")), num_tok(cc.get("ephemeral_1h_input_tokens")),
-                         num_tok(u.get("cache_read_input_tokens"))))
 
-        if not tail_jsonl(db, path, take, transcript_key(path), lambda: facts.update(restart=True)):
-            continue
-        files += 1
-        if facts["restart"]:  # read again from the start: its places are counted again
-            db.execute("DELETE FROM session_places WHERE session_id = ?", (sid,))
-        if not facts["lines"]:
-            continue
-        for (cwd, branch), n in places.items():
-            h, name, place = cwd_facts(cwd)
-            db.execute("INSERT INTO session_places VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (session_id, cwd_hash, branch) "
-                       "DO UPDATE SET lines = session_places.lines + excluded.lines", (sid, h, branch, name, place, n))
-        for row in msgs:
-            new += db.execute("INSERT OR IGNORE INTO usage_msgs (msg_id, session_id, model, day, tokens_in, tokens_out, "
-                              "cache_w, cache_w_1h, cache_r) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", row).rowcount
-        h, name, place = cwd_facts(facts["cwd"])
-        db.execute(
-            "INSERT INTO sessions (session_id, worktree, branch, cwd_hash, place, entrypoint, start, end, parent_session) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (session_id) DO UPDATE SET "
-            "worktree = CASE WHEN sessions.cwd_hash IS NULL THEN excluded.worktree ELSE sessions.worktree END, "
-            "place = CASE WHEN sessions.cwd_hash IS NULL THEN excluded.place ELSE sessions.place END, "
-            "cwd_hash = COALESCE(sessions.cwd_hash, excluded.cwd_hash), "
-            "branch = COALESCE(sessions.branch, excluded.branch), "
-            "entrypoint = COALESCE(sessions.entrypoint, excluded.entrypoint), "
-            "start = MIN(COALESCE(sessions.start, excluded.start), COALESCE(excluded.start, sessions.start)), "
-            "end = MAX(COALESCE(sessions.end, excluded.end), COALESCE(excluded.end, sessions.end)), "
-            "parent_session = COALESCE(sessions.parent_session, excluded.parent_session)",
-            (sid, name, facts["branch"], h, place, facts["entrypoint"], facts["start"], facts["end"], parent))
-    return files, new
+def ingest_transcript(db, path, sid, parent):
+    """New lines of one transcript: each message's usage once (by message.id), its session's entrypoint, first
+    cwd and branch, first and last time, and its lines per cwd and branch. Reads only the allowlisted fields.
+    Returns how many messages were new, or None if the file is missing."""
+    facts = {"entrypoint": None, "cwd": None, "branch": None, "start": None, "end": None, "lines": 0,
+             "restart": False}
+    msgs = []
+    places = {}  # (cwd, branch) -> lines: where the session's lines were, also after it cd's elsewhere
+
+    def take(text, d):
+        facts["lines"] += 1
+        ts = norm_ts(d["timestamp"]) if isinstance(d.get("timestamp"), str) else None
+        if ts:
+            facts["start"] = min(facts["start"] or ts, ts)
+            facts["end"] = max(facts["end"] or ts, ts)
+        for k, f in (("entrypoint", "entrypoint"), ("cwd", "cwd"), ("branch", "gitBranch")):
+            if facts[k] is None and isinstance(d.get(f), str) and d[f]:
+                facts[k] = d[f]
+        if isinstance(d.get("cwd"), str) and d["cwd"]:
+            pk = (d["cwd"], d["gitBranch"] if isinstance(d.get("gitBranch"), str) else "")
+            places[pk] = places.get(pk, 0) + 1
+        m = d.get("message")
+        if not isinstance(m, dict) or not isinstance(m.get("usage"), dict) or not isinstance(m.get("id"), str):
+            return
+        u = m["usage"]
+        cc = u.get("cache_creation") if isinstance(u.get("cache_creation"), dict) else {}
+        model = m.get("model") if isinstance(m.get("model"), str) else None
+        msgs.append((m["id"], sid, model,
+                     ts[:10] if ts else None, num_tok(u.get("input_tokens")), num_tok(u.get("output_tokens")),
+                     num_tok(u.get("cache_creation_input_tokens")), num_tok(cc.get("ephemeral_1h_input_tokens")),
+                     num_tok(u.get("cache_read_input_tokens"))))
+
+    if not tail_jsonl(db, path, take, transcript_key(path), lambda: facts.update(restart=True)):
+        return None
+    if facts["restart"]:  # read again from the start: its places are counted again
+        db.execute("DELETE FROM session_places WHERE session_id = ?", (sid,))
+    if not facts["lines"]:
+        return 0
+    new = 0
+    for (cwd, branch), n in places.items():
+        h, name, place = cwd_facts(cwd)
+        db.execute("INSERT INTO session_places VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (session_id, cwd_hash, branch) "
+                   "DO UPDATE SET lines = session_places.lines + excluded.lines", (sid, h, branch, name, place, n))
+    for row in msgs:
+        new += db.execute("INSERT OR IGNORE INTO usage_msgs (msg_id, session_id, model, day, tokens_in, tokens_out, "
+                          "cache_w, cache_w_1h, cache_r) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", row).rowcount
+    h, name, place = cwd_facts(facts["cwd"])
+    db.execute(
+        "INSERT INTO sessions (session_id, worktree, branch, cwd_hash, place, entrypoint, start, end, parent_session) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (session_id) DO UPDATE SET "
+        "worktree = CASE WHEN sessions.cwd_hash IS NULL THEN excluded.worktree ELSE sessions.worktree END, "
+        "place = CASE WHEN sessions.cwd_hash IS NULL THEN excluded.place ELSE sessions.place END, "
+        "cwd_hash = COALESCE(sessions.cwd_hash, excluded.cwd_hash), "
+        "branch = COALESCE(sessions.branch, excluded.branch), "
+        "entrypoint = COALESCE(sessions.entrypoint, excluded.entrypoint), "
+        "start = MIN(COALESCE(sessions.start, excluded.start), COALESCE(excluded.start, sessions.start)), "
+        "end = MAX(COALESCE(sessions.end, excluded.end), COALESCE(excluded.end, sessions.end)), "
+        "parent_session = COALESCE(sessions.parent_session, excluded.parent_session)",
+        (sid, name, facts["branch"], h, place, facts["entrypoint"], facts["start"], facts["end"], parent))
+    return new
 
 
 ROLE_BY_KIND = {"code": "review", "tests": "review", "judge": "judge", "suite": "suite"}
@@ -662,7 +681,8 @@ def classify_sessions(db, state):
     """Every session's repo, role, rolled-up role and message count, again. Roles: a session a review sidecar
     names gets that review's kind; a subagent's file, subagent; an sdk-cli session in a worktree that has no
     sidecar, and ended at most 5 minutes before a review of its branch without one was written, that review's
-    kind (a session that was still running when the review was written is no review); else an sdk-cli session in a worktree, agent; a cli session in a checkout, main; anything else
+    kind (each review goes to the session that ended last before it, each session takes one; a session still
+    running when the review was written is no review); else an sdk-cli session in a worktree, agent; a cli session in a checkout, main; anything else
     (cli in a worktree, a temp dir), other.
     A subagent's repo and branch are those of the worktree it spent the most lines in (link = worktree: an agent
     the main session started cd's into its worktree), else of its first cwd (link = cwd). Its rolled-up role
@@ -678,8 +698,8 @@ def classify_sessions(db, state):
         elif branch and finished and kind in ROLE_BY_KIND:
             unnamed.append((branch, epoch(finished), rid, kind))
     msgs = dict(db.execute("SELECT session_id, COUNT(*) FROM usage_msgs GROUP BY session_id"))
-    taken = set()
     updates = []
+    candidates = []  # (session, branch, end epoch) of the sdk-cli worktree sessions no sidecar names
     rows = db.execute("SELECT session_id, worktree, place, branch, entrypoint, start, end, parent_session "
                       "FROM sessions ORDER BY end, session_id").fetchall()
     best = {}  # subagent -> (worktree, branch, repo) of the worktree it has the most lines in, any subfolder
@@ -704,19 +724,22 @@ def classify_sessions(db, state):
             role = "subagent"
         elif entry == "sdk-cli" and in_worktree:
             role = "agent"
-            if end:
-                e0 = epoch(end)
-                near = [(f - e0, rid, kind) for b, f, rid, kind in unnamed
-                        if b == branch and rid not in taken and e0 <= f <= e0 + 300]
-                if near:
-                    _, review_id, kind = min(near)
-                    taken.add(review_id)
-                    role = ROLE_BY_KIND[kind]
+            if end and branch:
+                candidates.append((sid, branch, epoch(end)))
         elif entry == "cli" and place in ("repos", "dir") and not in_worktree:
             role = "main"
         else:
             role = "other"
         updates.append((role, repo, name, branch, link, msgs.get(sid, 0), review_id, sid))
+    # Each review without a sidecar, in the order they were written, goes to the free session of its branch that
+    # ended last at most 5 minutes before it was written; each session takes at most one review.
+    used = {}
+    for b, f, rid, kind in sorted(unnamed, key=lambda r: (r[1], r[2])):
+        near = [(e0, sid) for sid, cb, e0 in candidates if cb == b and sid not in used and e0 <= f <= e0 + 300]
+        if near:
+            used[max(near)[1]] = (rid, kind)
+    updates = [(ROLE_BY_KIND[used[u[-1]][1]],) + u[1:6] + (used[u[-1]][0], u[-1]) if u[-1] in used else u
+               for u in updates]
     db.executemany("UPDATE sessions SET role = ?, repo = ?, worktree = ?, branch = ?, link = ?, msgs = ?, review_id = ? "
                    "WHERE session_id = ?", updates)
     # Rolled up: a subagent counts toward its parent's role (subagent if its parent has no transcript).
@@ -1018,7 +1041,7 @@ def ingest(dbpath, projects=None):
         new = ingest_events(db, events)
         changed = ingest_reviews(db, rdir)
         link_reviews(db, *rebuild_jobs(db, state))
-        files, new_msgs = ingest_transcripts(db, projects or default_projects())
+        files, new_msgs, skipped = ingest_transcripts(db, projects or default_projects())
         classify_sessions(db, state)
         unpriced = rebuild_usage(db)
     counts = {t: db.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
@@ -1032,6 +1055,9 @@ def ingest(dbpath, projects=None):
           % (files, new_msgs, counts["sessions"], roles or "none", counts["usage_msgs"]))
     if unpriced:
         print("stats: no price for %s: their cost is null" % ", ".join(unpriced))
+    if skipped:
+        print("stats: skipped %d transcripts that could not be read (%s)"
+              % (sum(skipped.values()), ", ".join("%s %d" % kv for kv in sorted(skipped.items()))))
 
 
 def main(argv):

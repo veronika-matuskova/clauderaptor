@@ -597,6 +597,62 @@ got="$(DB2="$TMP/out/boss.db" q "SELECT (SELECT group_concat(role) FROM v_tokens
 assert "only a subagent's tokens: the views name its rolled-up role" test "$got" = "agent|agent|agent"
 assert_contains "and its subagent share is all of it" "$(DB2="$TMP/out/boss.db" q "SELECT subagent_token_share, subagent_cost_share, cache_hit_rate FROM v_subagent_share, v_cache_hit_rate")" "1.0|1.0|0.75"
 
+echo "-- transcripts: review matching, merges, repo names, bad transcripts"
+S6="$TMP/state6"; P6="$TMP/projects6"; DB6="$TMP/out/six.db"
+mkdir -p "$S6/reviews" "$S6/repos/app" "$S6/repos/app-x" "$P6/p" "$P6/p/s-dir.jsonl"
+W6=/home/u/code/app/repos/app-feat-r
+# Two sessions of one branch end before one review without a sidecar: the review goes to the one that ended
+# last before it was written (the review's session), not to the agent that ended first.
+SID=s6-agent EP=sdk-cli CWD="$W6" BR=feat/r
+{ line 2026-11-10T11:00:00.000Z a61 $O 1000000 0 0 0 0; line 2026-11-10T12:00:00.000Z; } > "$P6/p/s6-agent.jsonl"
+SID=s6-rev; { line 2026-11-10T12:01:00.000Z; line 2026-11-10T12:02:00.000Z; } > "$P6/p/s6-rev.jsonl"
+# shellcheck disable=SC2016  # literal dollar sign, not an expansion
+printf '# Review of feat/r at 999999999999 (/code-review medium, cost $1.00, 60 s)\nVerdict: ready\n' > "$S6/reviews/feat-r-999999999999-medium.md"
+touch -d '2026-11-10 12:02:05' "$S6/reviews/feat-r-999999999999-medium.md"
+# feat/r merged twice: each merge counts only the sessions and reviews since the one before.
+SID=s6-agent2; line 2026-11-11T10:00:00.000Z a62 $O 2000000 0 0 0 0 > "$P6/p/s6-agent2.jsonl"
+SID=s6-agent3; line 2026-11-12T10:00:00.000Z a63 $O 3000000 0 0 0 0 > "$P6/p/s6-agent3.jsonl"
+printf '{"v":1,"kind":"code","branch":"feat/r","level":"low","file":"feat-r-888888888888-low.md","cost_usd":0.7,"finished":"2026-11-11T11:00:00.000Z"}\n' > "$S6/reviews/feat-r-888888888888-low.json"
+printf '{"v":1,"kind":"judge","branch":"feat/r","file":"feat-r-888888888888-judge.md","cost_usd":0.2,"finished":"2026-11-11T11:10:00.000Z"}\n' > "$S6/reviews/feat-r-888888888888-judge.json"
+{ ev2 2026-11-10T13:00:00.000Z merged r-m1 feat/r '"pr":1'
+  ev2 2026-11-11T13:00:00.000Z merged r-m2 feat/r '"pr":2'; } | sed 's/"repo":"one"/"repo":"app"/' > "$S6/events.jsonl"
+# A worktree of repo app-x: the longer repo name wins over app.
+SID=s6-x CWD=/home/u/code/app/repos/app-x-feat BR=feat/q; line 2026-11-10T09:00:00.000Z > "$P6/p/s6-x.jsonl"
+# A cwd that ends in a folder named repos; and a transcript that can't be read (a folder): skipped, counted.
+SID=s6-repos CWD=/home/u/repos/app/repos/ BR=main; line 2026-11-10T09:00:00.000Z > "$P6/p/s6-repos.jsonl"
+out="$(PROJ="$P6" PR_QUEUE_DIR="$S6" ingest "$DB6")"; rc=$?
+assert "a bad transcript doesn't stop the ingest" test "$rc" -eq 0
+assert_contains "it is counted as skipped" "$out" "skipped 1 transcripts that could not be read (IsADirectoryError 1)"
+assert_contains "and the others are read" "$out" "6 transcripts read"
+Q6() { DB2="$DB6" q "$1"; }
+assert_contains "the review goes to the session that ended last before it" \
+  "$(Q6 "SELECT group_concat(session_id || ':' || role || ':' || ifnull(review_id,''), ' ') FROM (SELECT * FROM sessions WHERE session_id IN ('s6-agent', 's6-rev') ORDER BY session_id)")" \
+  "s6-agent:agent: s6-rev:review:feat-r-999999999999-medium.md"
+got="$(Q6 "SELECT job_id, agent_sessions, agent_cost_usd_est, review_cost_usd, ifnull(judge_cost_usd,'none') FROM v_cost_per_merged_branch ORDER BY merged_at")"
+assert_contains "first merge: only what came before it" "$got" "r-m1|1|4.0|1.0|none"
+assert_contains "second merge: only what came since the first" "$got" "r-m2|1|8.0|0.7|0.2"
+assert_contains "the longest repo name a worktree starts with" "$(Q6 "SELECT repo, worktree FROM sessions WHERE session_id = 's6-x'")" "app-x|app-x-feat"
+assert_contains "a cwd ending in repos: the folder before it" "$(Q6 "SELECT worktree, place FROM sessions WHERE session_id = 's6-repos'")" "app|repos"
+# Any error in one transcript, after some of its rows were written: they are undone, the rest is read.
+P7="$TMP/projects7"; mkdir -p "$P7/p"
+SID=s7-boom EP=sdk-cli CWD=/home/u/boom BR=main; line 2026-11-10T09:00:00.000Z b71 $O 1 1 0 0 0 > "$P7/p/s7-boom.jsonl"
+SID=s7-ok CWD=/home/u/ok; line 2026-11-10T09:00:00.000Z b72 $O 1 1 0 0 0 > "$P7/p/s7-ok.jsonl"
+out="$(PR_QUEUE_DIR="$S6" py "
+real = s.cwd_facts
+def boom(cwd):
+    if cwd and 'boom' in cwd:
+        raise ValueError('x')
+    return real(cwd)
+s.cwd_facts = boom
+s.ingest('$TMP/out/seven.db', '$P7')" 2>&1)"
+assert_contains "an error that is no OSError: skipped and counted" "$out" "skipped 1 transcripts that could not be read (ValueError 1)"
+assert "its rows are undone, the other transcript's kept" \
+  test "$(DB2="$TMP/out/seven.db" q "SELECT group_concat(session_id) FROM (SELECT session_id FROM usage_msgs UNION SELECT session_id FROM sessions)")" = "s7-ok"
+assert "and where it stopped is not saved: the next run reads it again" \
+  test "$(DB2="$TMP/out/seven.db" q "SELECT COUNT(*) FROM ingest_state WHERE path LIKE 'transcript:%'")" -eq 1
+out="$(py 'h = s.cwd_facts("/home/u/repos/app/repos"); print(h[1:], s.cwd_facts("/home/u/repos/app/repos/")[1:], s.cwd_facts("/a/repos/b/repos/c")[1:])')"
+assert_contains "cwd_facts: the last repos/ with a folder after it" "$out" "('app', 'repos') ('app', 'repos') ('c', 'repos')"
+
 echo "-- transcripts: incremental, partial line, reread"
 M="$PROJ/-home-u-code-app/s-main.jsonl"
 nm() { q "SELECT COUNT(*) FROM usage_msgs WHERE session_id = 's-main'"; }

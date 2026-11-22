@@ -5,7 +5,7 @@
 # lists combine (as Claude Code combines them across its settings files), other values: local wins.
 # Keys of the old settings.json that the repo doesn't set (e.g. another tool's hooks) are kept.
 set -euo pipefail
-SRC="$(cd "$(dirname "$0")/.." && pwd)/claude"
+SRC="$(cd "$(dirname "$0")/../.." && pwd)/claude"
 DEST="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 mkdir -p "$DEST"
 stamp="$(date +%Y%m%d%H%M%S)"

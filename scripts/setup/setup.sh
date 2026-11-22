@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Sets up a machine in one go: runs the setup steps in order and stops at the first one that fails.
 #
-#   scripts/setup.sh                all steps: install tools docker
-#   scripts/setup.sh tools docker   only the named steps
-#   scripts/setup.sh --list         print each step and its script
+#   scripts/setup/setup.sh                all steps: install tools docker
+#   scripts/setup/setup.sh tools docker   only the named steps
+#   scripts/setup/setup.sh --list         print each step and its script
 #
 #   install   install.sh        link claude/ into ~/.claude, build settings.json, enable the pre-commit hook
 #   tools     setup-tools.sh    gh + login, shellcheck, SSH commit signing (interactive, sudo)

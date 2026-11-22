@@ -9,7 +9,7 @@ export CLAUDE_CONFIG_DIR="$TMP/claude-config"; mkdir -p "$CLAUDE_CONFIG_DIR"
 echo "Stand-in user rule." > "$CLAUDE_CONFIG_DIR/CLAUDE.md"
 unset REVIEW_DIR REVIEW_TIMEOUT PR_QUEUE_REVIEW REVIEW_MODEL REVIEW_EFFORT REVIEW_CONFIG   # reviews go to $PR_QUEUE_DIR/reviews, not a real folder
 mkdir -p "$TQ/bin" "$TQ/passed"
-Q() { PATH="$TQ/bin:$PATH" bash "$ROOT/scripts/pr-queue.sh" "$@" </dev/null 2>&1; }
+Q() { PATH="$TQ/bin:$PATH" bash "$ROOT/scripts/queue/pr-queue.sh" "$@" </dev/null 2>&1; }
 
 # gh: one PR, number 7. Its state, branch and body live in files under $TQ; its head is the branch on origin.
 # $TQ/checks_seq: check results to report, one per call (the last repeats): pass, fail, pending, cancel, none.
@@ -162,7 +162,9 @@ out="$(Q add "$TMP/wt-happy" fix x "$TMP/nobody.md")"; assert_contains "add: mis
 echo "My summary" > "$TQ/body.md"
 out="$(Q add "$TMP/wt-happy" fix "Happy thing" "$TQ/body.md")"; assert_contains "add: queued" "$out" "queued fix/happy"
 out="$(Q status)";                           assert_contains "status lists the job"       "$out" "fix/happy"
-out="$(Q run)"
+# Run through the old path, scripts/pr-queue.sh (a link: agents' prompts still use it). It must find review.sh
+# in queue/, next to the script the link points to.
+out="$(PATH="$TQ/bin:$PATH" bash "$ROOT/scripts/pr-queue.sh" run </dev/null 2>&1)"
 assert_contains "happy: merged main in"      "$out" "merged origin/main"
 assert_contains "happy: reviewed at medium"  "$out" "(/code-review medium)"
 assert_contains "happy: fresh claude -p review" "$(cat "$TQ/claude.log")" 'args "medium fix/happy"'
@@ -339,7 +341,7 @@ assert_contains "no checks: gives up"        "$out" "no checks reported on #7"
 # A check that never leaves pending fails the job at PR_QUEUE_CHECKS_TIMEOUT (timeout 30 guards against a hang)
 reset_pr; echo pending > "$TQ/checks_seq"; mkwt hang
 Q add "$TMP/wt-hang" fix "Hang" >/dev/null
-out="$(PR_QUEUE_CHECKS_TIMEOUT=1 PATH="$TQ/bin:$PATH" timeout 30 bash "$ROOT/scripts/pr-queue.sh" run </dev/null 2>&1)"; rc=$?
+out="$(PR_QUEUE_CHECKS_TIMEOUT=1 PATH="$TQ/bin:$PATH" timeout 30 bash "$ROOT/scripts/queue/pr-queue.sh" run </dev/null 2>&1)"; rc=$?
 assert "stuck pending: runner exits"         test "$rc" -ne 124
 assert_contains "stuck pending: gives up, names the check" "$out" "checks still pending on #7 after 1s: Checks"
 assert "stuck pending: job in failed/"       in_failed hang
@@ -431,7 +433,7 @@ stop_runner() {
   reset_pr; rm -rf "$TQ/hung" "$TQ/tmp"; mkdir -p "$TQ/tmp"; touch "$TQ/hang"; mkwt "$2"
   Q add "$TMP/wt-$2" fix "Stop" >/dev/null
   PATH="$TQ/bin:$PATH" TMPDIR="$TQ/tmp" python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-    bash "$ROOT/scripts/pr-queue.sh" run </dev/null >/dev/null 2>&1 &
+    bash "$ROOT/scripts/queue/pr-queue.sh" run </dev/null >/dev/null 2>&1 &
   rpid=$!
   for _ in $(seq 100); do [ "$(wc -l 2>/dev/null < "$TQ/hung")" = 2 ] && break; sleep 0.1; done
   started="$(wc -l 2>/dev/null < "$TQ/hung")"
@@ -525,7 +527,7 @@ out="$(PR_QUEUE_JUDGE=maybe Q run)";         assert_contains "run: bad PR_QUEUE_
 reset_pr; rm -rf "$TQ/hung" "$TQ/tmp"; mkdir -p "$TQ/tmp"; echo "needs changes" > "$TQ/verdict"; touch "$TQ/judge_hang"; mkwt stopjudge
 Q add "$TMP/wt-stopjudge" fix "Stop judge" >/dev/null
 PATH="$TQ/bin:$PATH" TMPDIR="$TQ/tmp" python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-  bash "$ROOT/scripts/pr-queue.sh" run </dev/null >/dev/null 2>&1 &
+  bash "$ROOT/scripts/queue/pr-queue.sh" run </dev/null >/dev/null 2>&1 &
 rpid=$!
 for _ in $(seq 100); do [ -s "$TQ/hung" ] && break; sleep 0.1; done
 assert "judge stopped: the judge's session started" test -s "$TQ/hung"
@@ -612,7 +614,7 @@ rm -f "$RQ"/queue/*
 # A job queued to another repo while one repo's runner works starts at once, not after that repo's queue: the
 # first job's e2e run queues it, then waits (up to 10 s) until it is running before it ends.
 reset_pr; rm -f "$TQ/next_started"; touch "$TQ/e2e_fail"; mkwt first; mkwt second; mkwt2 next
-{ printf 'PATH=%q bash %q add %q fix Next >/dev/null\n' "$TQ/bin:$PATH" "$ROOT/scripts/pr-queue.sh" "$TMP/wt2-next"
+{ printf 'PATH=%q bash %q add %q fix Next >/dev/null\n' "$TQ/bin:$PATH" "$ROOT/scripts/queue/pr-queue.sh" "$TMP/wt2-next"
   # shellcheck disable=SC2016  # expands when on_e2e runs
   printf 'for _ in $(seq 100); do [ -n "$(find %q -name "*next.job")" ] && { touch %q; break; }; sleep 0.1; done\n' \
     "$RQ2/running" "$TQ/next_started"; } > "$TQ/on_e2e"
@@ -629,7 +631,7 @@ reset_pr; rm -rf "$TQ/hung"; touch "$TQ/e2e_fail" "$TQ/hang"; mkwt slow; mkwt2 b
 echo 'sleep 1' > "$TQ/on_e2e"
 Q add "$TMP/wt-slow" fix "Slow" >/dev/null
 Q add --review none --tests none "$TMP/wt2-b1" fix "B1" >/dev/null
-PATH="$TQ/bin:$PATH" bash "$ROOT/scripts/pr-queue.sh" run </dev/null >"$TQ/ended.out" 2>&1 & rpid=$!
+PATH="$TQ/bin:$PATH" bash "$ROOT/scripts/queue/pr-queue.sh" run </dev/null >"$TQ/ended.out" 2>&1 & rpid=$!
 for _ in $(seq 100); do grep -q "fix/b1" "$RQ2/results.log" 2>/dev/null && flock -n "$RQ2/run.lock" true && break; sleep 0.1; done
 Q add --review none --tests none "$TMP/wt2-b2" fix "B2" >/dev/null
 for _ in $(seq 100); do grep -q "fix/b2" "$RQ2/results.log" 2>/dev/null && break; sleep 0.1; done
@@ -640,7 +642,7 @@ kill -TERM "$rpid"; { wait "$rpid"; } 2>/dev/null
 rm -f "$TQ/hang" "$RQ"/running/*
 # A job queued in another repo while the runner works is run too.
 reset_pr; touch "$TQ/e2e_fail"; mkwt early; mkwt2 late
-printf 'PATH=%q bash %q add %q fix Late >/dev/null\n' "$TQ/bin:$PATH" "$ROOT/scripts/pr-queue.sh" "$TMP/wt2-late" > "$TQ/on_e2e"
+printf 'PATH=%q bash %q add %q fix Late >/dev/null\n' "$TQ/bin:$PATH" "$ROOT/scripts/queue/pr-queue.sh" "$TMP/wt2-late" > "$TQ/on_e2e"
 Q add "$TMP/wt-early" fix "Early" >/dev/null
 out="$(PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 Q run)"
 assert_contains "late job: the first job ran" "$out" "FAILED fix/early"
@@ -652,7 +654,7 @@ R3="$TMP/repo3"; git clone -q "$TMP/origin.git" "$R3" 2>/dev/null; RQ3="$PR_QUEU
 git -C "$R3" worktree add -q "$TMP/wt3-later" -b fix/later origin/main 2>/dev/null
 echo later > "$TMP/wt3-later/later.txt"; git -C "$TMP/wt3-later" add -A; git -C "$TMP/wt3-later" commit -q -m later
 reset_pr; touch "$TQ/e2e_fail"; mkwt both1; mkwt2 both2
-printf 'PATH=%q bash %q add %q fix Later >/dev/null\n' "$TQ/bin:$PATH" "$ROOT/scripts/pr-queue.sh" "$TMP/wt3-later" > "$TQ/on_e2e"
+printf 'PATH=%q bash %q add %q fix Later >/dev/null\n' "$TQ/bin:$PATH" "$ROOT/scripts/queue/pr-queue.sh" "$TMP/wt3-later" > "$TQ/on_e2e"
 Q add "$TMP/wt-both1" fix "Both 1" >/dev/null; Q add "$TMP/wt2-both2" fix "Both 2" >/dev/null
 out="$(PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 Q run)"
 assert_contains "late job after two repos: one ran" "$out" "FAILED fix/both1"
@@ -664,7 +666,7 @@ rm -rf "$RQ3"
 reset_pr; touch "$TQ/e2e_fail"; mkwt live; mkwt2 orphaned
 Q add "$TMP/wt-live" fix "Live" >/dev/null; Q add "$TMP/wt2-orphaned" fix "Orphaned" >/dev/null
 echo "$TMP/no-such-checkout" > "$RQ2/checkout"
-out="$(PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 PATH="$TQ/bin:$PATH" timeout 120 bash "$ROOT/scripts/pr-queue.sh" run </dev/null 2>&1)"; rc=$?
+out="$(PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 PATH="$TQ/bin:$PATH" timeout 120 bash "$ROOT/scripts/queue/pr-queue.sh" run </dev/null 2>&1)"; rc=$?
 assert "given up: the runner ends"           test "$rc" != 124
 assert_contains "given up: the other repo's job ran" "$out" "FAILED fix/live"
 assert_contains "given up: says why"         "$out" "$TMP/no-such-checkout is not a git checkout"
@@ -687,7 +689,7 @@ for sig in INT TERM HUP; do
   Q add "$TMP/wt-sig$sig" fix "A" >/dev/null; Q add "$TMP/wt2-sig2$sig" fix "B" >/dev/null
   # A long poll: the signal must end the runner's sleep, not wait for it.
   PR_QUEUE_POLL=30 PATH="$TQ/bin:$PATH" TMPDIR="$TQ/tmp" python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-    bash "$ROOT/scripts/pr-queue.sh" run </dev/null >/dev/null 2>&1 &
+    bash "$ROOT/scripts/queue/pr-queue.sh" run </dev/null >/dev/null 2>&1 &
   rpid=$!
   for _ in $(seq 100); do [ "$(wc -l 2>/dev/null < "$TQ/hung")" = 4 ] && break; sleep 0.1; done
   assert "several repos, $sig: all four sessions started" test "$(wc -l < "$TQ/hung")" = 4

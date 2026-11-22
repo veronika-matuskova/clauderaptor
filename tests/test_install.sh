@@ -4,8 +4,8 @@
 source "$(dirname "$0")/lib.sh"
 
 SRC="$TMP/repo"; DEST="$TMP/home/.claude"
-mkdir -p "$SRC/scripts" "$SRC/claude/rules" "$SRC/claude/skills" "$SRC/claude/agents"
-cp "$ROOT/scripts/install.sh" "$SRC/scripts/"
+mkdir -p "$SRC/scripts/setup" "$SRC/claude/rules" "$SRC/claude/skills" "$SRC/claude/agents"
+cp "$ROOT/scripts/setup/install.sh" "$SRC/scripts/setup/"
 echo "# g" > "$SRC/claude/CLAUDE.md"; echo "x" > "$SRC/claude/statusline.py"
 cat > "$SRC/claude/settings.json" <<'EOF'
 {"theme": "dark", "permissions": {"deny": ["a", "b"]}, "items": [{"x": 1, "y": 2}],
@@ -15,7 +15,7 @@ cat > "$SRC/claude/settings.local.json" <<'EOF'
 {"permissions": {"deny": ["b", "c"]}, "items": [{"y": 2, "x": 1}, {"z": 3}],
  "modelSettings": {"a": {"effortLevel": "xhigh"}}, "extra": true}
 EOF
-run() { CLAUDE_CONFIG_DIR="$DEST" bash "$SRC/scripts/install.sh" 2>&1; }
+run() { CLAUDE_CONFIG_DIR="$DEST" bash "$SRC/scripts/setup/install.sh" 2>&1; }
 get() { python3 -c "import json,sys; d=json.load(open('$DEST/settings.json')); print(eval(sys.argv[1]))" "$1"; }
 # edit <python statement on d>: changes the live settings.json, as another tool or /config would
 edit() { python3 -c "import json,sys; p='$DEST/settings.json'; d=json.load(open(p)); exec(sys.argv[1]); json.dump(d, open(p, 'w'), indent=2)" "$1"; }

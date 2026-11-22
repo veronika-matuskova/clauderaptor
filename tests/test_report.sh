@@ -95,7 +95,7 @@ assert_contains "cost per ready: few ready, high cost each" "$T" "code medium 5 
 assert_contains "a share below $((5)) is not enough data" "$T" "suite – 1 \$9.00 \$9.00 not enough data (n=1)"
 assert_contains "by repo: finished rounds only, not the queued job" "$T" "app 7 3 not enough data (n=3) 1 4 \$5.10"
 assert_contains "the timeline counts the same finished rounds" "$T" "Rounds per day n=11"
-assert_contains "weekly trends with 4 weeks" "$T" "Week of Rounds Merged First-pass yield Review cost 2026-10-05 1 1 not enough data (n=1) – 2026-10-12 1 1 not enough data (n=1) – 2026-10-19 2 1 not enough data (n=1) – 2026-10-26 7 2 not enough data (n=2) \$11.10"
+assert_contains "weekly trends with 4 weeks" "$T" "Week of Rounds Merged First-pass yield Review cost Rule changes 2026-10-05 1 1 not enough data (n=1) – 0 2026-10-12 1 1 not enough data (n=1) – 0 2026-10-19 2 1 not enough data (n=1) – 0 2026-10-26 7 2 not enough data (n=2) \$11.10 0"
 assert_contains "rounds per day" "$T" "2026-10-26 5 2"
 assert_contains "queue review cost per day, no suite audits" "$T" "2026-10-27 \$8.60 12"
 assert_contains "data note: row counts" "$T" "jobs 13 reviews 18 findings 24"
@@ -104,13 +104,30 @@ assert_contains "transcript tables, no transcripts ingested: empty" "$T" "sessio
 
 echo "-- no network, no script"
 H="$(cat "$OUT")"
-for bad in "//" "<script" "<link" "<img" "url(" "@import"; do
-  assert_not_contains "no $bad in the page" "$H" "$bad"
+# The icon and the logo are the only images, inlined as data: PNGs; with them blanked out, nothing may link out.
+png_re='data:image/png;base64,[A-Za-z0-9+/]*=*'
+assert "the icon and the logo are inlined" test "$(grep -oE "$png_re" "$OUT" | wc -l)" -eq 2
+while read -r uri; do
+  assert "an inlined image decodes to a PNG" test "$(printf '%s' "${uri#*,}" | base64 -d | head -c 4 | tail -c 3)" = PNG
+done < <(grep -oE "$png_re" "$OUT")
+assert_contains "the icon link inlines icon.png" "$H" \
+  "<link rel=\"icon\" type=\"image/png\" href=\"data:image/png;base64,$(base64 -w0 "$ROOT/scripts/stats/icon.png")\">"
+assert_contains "the logo img inlines logo.png" "$H" \
+  "<img class=\"logo\" src=\"data:image/png;base64,$(base64 -w0 "$ROOT/scripts/stats/logo.png")\" alt=\"\">"
+B="$(sed -E "s#$png_re#PNG#g" "$OUT")"
+assert_contains "the icon is a data: PNG" "$B" '<link rel="icon" type="image/png" href="PNG">'
+assert_contains "the logo is a data: PNG" "$B" '<img class="logo" src="PNG" alt="">'
+for bad in "//" "<script" "url(" "@import"; do
+  assert_not_contains "no $bad in the page" "$B" "$bad"
 done
-tags="$(grep -o '<[a-zA-Z][^>]*>' "$OUT")"
-assert_not_contains "no tag with a src" "$tags" "src="
-assert_not_contains "no tag with an href" "$tags" "href="
-assert_contains "a CSP that allows nothing but inline styles" "$H" "default-src 'none'; style-src 'unsafe-inline'"
+tags="$(printf '%s' "$B" | grep -o '<[a-zA-Z][^>]*>' | grep -vxF -e '<link rel="icon" type="image/png" href="PNG">' \
+  -e '<img class="logo" src="PNG" alt="">')"
+assert_not_contains "no other link" "$tags" "<link"
+assert_not_contains "no other img" "$tags" "<img"
+assert_not_contains "no other tag with a src" "$tags" "src="
+assert_not_contains "no other tag with an href" "$tags" "href="
+assert_contains "a CSP that allows nothing but inline styles and data: images" "$H" \
+  "default-src 'none'; style-src 'unsafe-inline'; img-src data:"
 
 echo "-- escaping"
 assert_contains "a hostile branch name is escaped" "$H" "&lt;script&gt;alert(1)&lt;/script&gt;"
@@ -199,7 +216,7 @@ ny_rows() { local d i=0; for d in 2025-12-15 2025-12-22 2025-12-29 2025-12-31 20
 hint_case newyear "$(ny_rows)" >/dev/null
 T6="$(text "$TMP/out/newyear.html")"
 assert_contains "Monday 29 Dec to Sunday 4 Jan is one week" "$T6" \
-  "Week of Rounds Merged First-pass yield Review cost 2025-12-15 1 1 not enough data (n=1) – 2025-12-22 1 1 not enough data (n=1) – 2025-12-29 4 4 not enough data (n=4) – 2026-01-05 1 1 not enough data (n=1) –"
+  "Week of Rounds Merged First-pass yield Review cost Rule changes 2025-12-15 1 1 not enough data (n=1) – 0 2025-12-22 1 1 not enough data (n=1) – 0 2025-12-29 4 4 not enough data (n=4) – 0 2026-01-05 1 1 not enough data (n=1) – 0"
 
 echo "-- a review group without any cost"
 out="$(hint_case nocost "INSERT INTO reviews (id, kind, verdict, cost_usd) VALUES ('j', 'judge', 'ready', NULL);")"
@@ -256,7 +273,7 @@ assert_contains "cache hit rate by role" "$T4" "Cache hit rate by role Cache rea
 assert_contains "cache hit rate table: no rate is a dash" "$T4" "agent 750K 755.5K 99% judge 0 0 – review 40K 40.4K 99%"
 # agent: a3's 50,500 of 758,500 tokens, \$2.50 of \$20.00; main: m2 and m3's 2,436 of 4,060, \$0.25 of \$0.50
 assert_contains "subagent share" "$T4" "Subagent share Role Sessions Subagent sessions Share of tokens Share of est. \$ (estimate) <b>main</b> 3 2 60% of 4,060 50% of \$0.50 agent 5 1 7% of 758.5K 12% of \$20.00 judge 2 0 – – review 2 0 0% of 40.6K 0% of \$1.25"
-assert_contains "cost per merged branch: how many have agent cost" "$T4" "Agent cost found for 2 of 5 merged branches: many agent sessions can't be linked to a branch yet. Per branch (5)"
+assert_contains "cost per merged branch: how many have agent cost" "$T4" "Agent cost found for 2 of 5 merged branches. A session is linked to a branch by its transcript's worktree and branch, by a job file's worktree, or by the job queued within 10 minutes after it ended; the rest can't be linked. Per branch (5)"
 assert_contains "cost per merged branch: newest first, agent est. + review + judge" "$T4" \
   "tool feat/five 2026-10-26 0 – – – – app feat/four 2026-10-26 1 \$2.50 – – \$2.50 tool feat/three 2026-10-19 0 – – – – app <i>feat/two</i> 2026-10-12 0 – \$0.50 – \$0.50 app feat/one 2026-10-05 2 \$10.00 \$1.00 \$0.30 \$11.30"
 assert_contains "row counts of the new tables" "$T4" "sessions 12 usage_daily 12"
@@ -387,6 +404,60 @@ assert "no wslpath: exit 0" test "$rc" -eq 0
 assert_contains "says wslpath is missing" "$out" "wslpath not found"
 sleep 0.3
 assert "and starts no Edge" test ! -e "$EDGE_ARGV"
+
+echo "-- derived metrics: rule changes, escaped defects, flaky CI, last ingest"
+DV="$TMP/out/derived.db"; cp "$FX" "$DV"
+# The fixture's 5 merged branches on main; a fix/ commit 10 days after feat/one touches its file, one 20 days
+# after feat/two touches its file; another file of feat/three. 5 failed check runs, 2 passed later. Two rule
+# changes on 2026-10-26 (a day with rounds), one with a hostile subject, and one on a day without rounds.
+sql "$DV" "
+INSERT INTO main_commits (repo, sha, ts, subject, branch, kind) VALUES
+ ('app', 'c1', '2026-10-05T10:00:00.000Z', 's', 'feat/one', 'other'),
+ ('app', 'c2', '2026-10-12T10:00:00.000Z', 's', 'feat/two', 'other'),
+ ('tool', 'c3', '2026-10-19T10:00:00.000Z', 's', 'feat/three', 'other'),
+ ('app', 'c4', '2026-10-26T10:00:00.000Z', 's', 'feat/four', 'other'),
+ ('tool', 'c5', '2026-10-26T11:00:00.000Z', 's', 'feat/five', 'other'),
+ ('app', 'f1', '2026-10-15T10:00:00.000Z', 'fix: one', 'fix/one', 'fix'),
+ ('app', 'f2', '2026-11-01T10:00:00.000Z', 'fix: two', NULL, 'fix'),
+ ('tool', 'f3', '2026-10-20T10:00:00.000Z', 'fix: three', NULL, 'fix');
+INSERT INTO main_commit_files (repo, sha, path) VALUES ('app', 'c1', 'a.js'), ('app', 'c2', 'b.js'), ('tool', 'c3', 'c.js'),
+ ('app', 'f1', 'a.js'), ('app', 'f2', 'b.js'), ('tool', 'f3', 'other.js');
+INSERT INTO checks (job_id, repo, branch, sha, queued_sha, ts, result) VALUES
+ ('k1', 'app', '<b>flaky</b>', 's1', 'q1', '2026-10-26T10:00:00.000Z', 'fail'),
+ ('k2', 'app', '<b>flaky</b>', 's1', 'q1', '2026-10-26T11:00:00.000Z', 'pass'),
+ ('k3', 'app', 'feat/x', 's3', 'q3', '2026-10-26T09:30:00.000Z', 'fail'),
+ ('k4', 'app', 'feat/x', 's4', 'q3', '2026-10-26T12:00:00.000Z', 'pass'),
+ ('k5', 'app', 'feat/y', 's5', 'q5', '2026-10-26T10:00:00.000Z', 'fail'),
+ ('k6', 'app', 'feat/z', 's6', 'q6', '2026-10-26T10:00:00.000Z', 'fail'),
+ ('k7', 'app', 'feat/w', 's7', 'q7', '2026-10-26T10:00:00.000Z', 'fail');
+INSERT INTO rule_changes (repo, sha, ts, subject) VALUES
+ ('app', 'abc1234', '2026-10-26T08:00:00.000Z', 'docs: tighten the rules <script>x</script>'),
+ ('app', 'def5678', '2026-10-26T09:00:00.000Z', 'chore: agents'),
+ ('tool', '0123abc', '2026-10-28T09:00:00.000Z', 'docs: CLAUDE.md'),
+ ('app', 'old1234', '2025-10-05T09:00:00.000Z', 'docs: a year earlier');
+INSERT OR REPLACE INTO meta (key, value) VALUES ('last_ingest', '2026-11-01T08:30:00.000Z');"
+report --db "$DV" --out "$TMP/out/derived.html" >/dev/null
+TV="$(text "$TMP/out/derived.html")"; HV="$(cat "$TMP/out/derived.html")"
+assert_contains "escaped rate with n: a fix within 14 days on the same files" "$TV" "Escaped defects n=5 Escaped rate: 20% (n=5)"
+assert_contains "the escaped branch and its fix" "$TV" "Escaped branches (1) Repo Branch Merged Fixed by app feat/one 2026-10-05 f1"
+assert_contains "flaky rate with n" "$TV" "Flaky CI n=5 Flaky rate: 40% (n=5)"
+assert_contains "the flaky runs, newest first, the branch escaped" "$TV" "Flaky runs (2) Repo Branch Failed Passed app <b>flaky</b> 2026-10-26 10:00 2026-10-26 11:00 app feat/x 2026-10-26 09:30 2026-10-26 12:00"
+assert_contains "a branch name in the flaky table is escaped" "$HV" "&lt;b&gt;flaky&lt;/b&gt;"
+assert_contains "a dashed mark on a day with rounds and a rule change" "$HV" '<g class="mark rule"><title>rule change 2026-10-26: app abc1234 docs: tighten the rules &lt;script&gt;x&lt;/script&gt;; app def5678 chore: agents</title><line class="rule-mark"'
+assert "one mark: the other change's day has no rounds, the same day a year earlier is another day" test "$(grep -o 'class="rule-mark"' <<<"$HV" | wc -l)" -eq 1
+assert_not_contains "a subject is escaped" "$HV" "<script>x"
+assert_contains "the rule changes listed" "$TV" "Rule changes n=4 Rule changes (4) Day Repo Commit Subject 2025-10-05 app old1234 docs: a year earlier 2026-10-26 app abc1234 docs: tighten the rules <script>x</script> 2026-10-26 app def5678 chore: agents 2026-10-28 tool 0123abc docs: CLAUDE.md"
+assert_contains "the weekly trend counts them" "$TV" "2026-10-26 7 2 not enough data (n=2) \$11.10 3"
+assert_contains "last ingested: meta's time, not the file's" "$TV" "Last ingested: 2026-11-01 08:30. Generated"
+assert_contains "row counts of the git and checks tables" "$TV" "checks 7 main_commits 8 rule_changes 4"
+TE="$(text "$OUT")"
+assert_contains "no git rows: not enough data" "$TE" "Escaped defects n=0 Escaped rate: not enough data (n=0)"
+assert_contains "no failed checks: not enough data" "$TE" "Flaky CI n=0 Flaky rate: not enough data (n=0)"
+assert_not_contains "no rule changes: no marks" "$(cat "$OUT")" 'class="rule-mark"'
+OLD="$TMP/out/old-meta.db"; cp "$FX" "$OLD"; sql "$OLD" "DROP TABLE meta;"
+touch -d '2026-10-30 07:15' "$OLD"
+report --db "$OLD" --out "$TMP/out/old-meta.html" >/dev/null
+assert_contains "no meta table: the db file's time, said so" "$(text "$TMP/out/old-meta.html")" "Last ingested: 2026-10-30 07:15 (the db file's time)."
 
 echo "-- file URLs"
 py() { python3 -I -B -c 'import importlib.util, sys

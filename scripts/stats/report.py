@@ -488,14 +488,15 @@ def s_timeline(db):
                     aria="review cost per day", whole=False),
             details(table(["Day", "Rounds", "Merged"], [(d, c, mg or 0) for d, c, mg in rounds], (1, 2)), "Rounds table"),
             details(table(["Day", "Review cost", "Reviews"], [(d, money(c), n) for d, c, n in cost], (1, 2)), "Cost table")]
-    weeks = db.q("SELECT strftime('%Y-W%W', ended), COUNT(*), SUM(outcome = 'merged'), "
+    # A week is the date of its Monday: one row even when it runs into the new year.
+    weeks = db.q("SELECT date(ended, 'weekday 0', '-6 days'), COUNT(*), SUM(outcome = 'merged'), "
                  "SUM(outcome = 'merged' AND round = 1) FROM jobs WHERE round IS NOT NULL AND ended IS NOT NULL "
                  "GROUP BY 1 ORDER BY 1")
-    wcost = dict(db.q("SELECT strftime('%%Y-W%%W', finished), SUM(cost_usd) FROM reviews WHERE finished IS NOT NULL "
+    wcost = dict(db.q("SELECT date(finished, 'weekday 0', '-6 days'), SUM(cost_usd) FROM reviews WHERE finished IS NOT NULL "
                       "AND kind IN %s GROUP BY 1" % QUEUE_KINDS))
     body.append("<h3>Weekly trend</h3>")
     if len(weeks) >= WEEKS_FOR_TRENDS:
-        body.append(table(["Week", "Rounds", "Merged", "First-pass yield", "Review cost"],
+        body.append(table(["Week of", "Rounds", "Merged", "First-pass yield", "Review cost"],
                           [(w, c, mg or 0, share(fp or 0, mg or 0), money(wcost.get(w))) for w, c, mg, fp in weeks],
                           (1, 2, 4)))
     else:

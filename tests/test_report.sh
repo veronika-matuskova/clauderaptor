@@ -44,7 +44,8 @@ INSERT INTO jobs (job_id, repo, branch, round, ended, outcome, fail_reason) VALU
  ('m5', 'tool', 'feat/five', 3, '2026-10-26T11:00:00.000Z', 'merged', NULL),
  ('f6', 'app', 'feat/six', 1, '2026-10-27T09:00:00.000Z', 'failed', 'conflict'),
  ('e7', 'app', '<script>alert(1)</script>\"><img src=x onerror=alert(1)>', 1, '2026-10-27T10:00:00.000Z', 'escalated', 'judge'),
- ('r8', 'app', 'feat/six', NULL, '2026-10-27T11:00:00.000Z', 'replaced', 'replaced');
+ ('r8', 'app', 'feat/six', NULL, '2026-10-27T11:00:00.000Z', 'replaced', 'replaced'),
+ ('e9', 'app', 'feat/esc-old', 1, '2026-10-20T10:00:00.000Z', 'escalated', 'judge');
 WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i WHERE n < 5)
 INSERT INTO reviews (id, repo, kind, level, verdict, cost_usd, mut_tried, mut_caught, finished)
  SELECT 'cm' || n, 'app', 'code', 'medium', CASE n WHEN 1 THEN 'ready' ELSE 'needs changes' END, 0.5, NULL, NULL,
@@ -78,9 +79,9 @@ assert_contains "median rounds" "$T" "Median rounds to merge 2 n=5"
 assert_contains "review cost (queue reviews, no suite) and per merged branch" "$T" "Review cost \$11.10 \$2.22 per merged branch"
 assert_contains "reviewer precision" "$T" "Reviewer precision 30% judge-confirmed blocking findings, n=10"
 assert_contains "rounds distribution, a share with its n" "$T" "Rounds Branches Share 1 2 40% (n=5) 2 2 40% (n=5) 3 1 20% (n=5)"
-assert_contains "failure reasons ranked, the replaced job left out" "$T" "review_code 3 conflict 1 judge 1"
-assert_contains "failure share with n" "$T" "review_code 3 60% (n=5)"
-assert_contains "escalations listed" "$T" "Escalations to you n=1"
+assert_contains "failure reasons ranked, the replaced job left out" "$T" "review_code 3 judge 2 conflict 1"
+assert_contains "failure share with n" "$T" "review_code 3 50% (n=6)"
+assert_contains "escalations listed, newest first" "$T" "Escalations to you n=2 Repo Branch When Reason app <script>alert(1)</script>\"><img src=x onerror=alert(1)> 2026-10-27 10:00 judge app feat/esc-old 2026-10-20 10:00 judge"
 assert_contains "findings by severity: tests" "$T" "Test review findings n=8 blocker 2 major 6 minor 0 other 0"
 assert_contains "findings by severity: code" "$T" "Code review findings n=3 blocker 1 major 0 minor 2"
 assert_contains "judge rulings" "$T" "confirmed 3 downgraded 5 rejected 2"
@@ -89,11 +90,11 @@ assert_contains "mutation kill rate" "$T" "40 of 50 mutants caught: 80% (n=50)"
 assert_contains "cost per kind/level and per ready verdict" "$T" "code high 5 \$6.00 \$1.20 100% (n=5) \$1.20"
 assert_contains "cost per ready: few ready, high cost each" "$T" "code medium 5 \$2.50 \$0.50 20% (n=5) \$2.50"
 assert_contains "a share below $((5)) is not enough data" "$T" "suite – 1 \$9.00 \$9.00 not enough data (n=1)"
-assert_contains "by repo" "$T" "app 6 3 not enough data (n=3) 1 3 \$5.10"
-assert_contains "weekly trends with 4 weeks" "$T" "2026-W43 7 2 not enough data (n=2) \$11.10"
+assert_contains "by repo" "$T" "app 7 3 not enough data (n=3) 1 4 \$5.10"
+assert_contains "weekly trends with 4 weeks" "$T" "Week of Rounds Merged First-pass yield Review cost 2026-10-05 1 1 not enough data (n=1) – 2026-10-12 1 1 not enough data (n=1) – 2026-10-19 2 1 not enough data (n=1) – 2026-10-26 7 2 not enough data (n=2) \$11.10"
 assert_contains "rounds per day" "$T" "2026-10-26 5 2"
 assert_contains "queue review cost per day, no suite audits" "$T" "2026-10-27 \$8.60 12"
-assert_contains "data note: row counts" "$T" "jobs 11 reviews 18 findings 24"
+assert_contains "data note: row counts" "$T" "jobs 12 reviews 18 findings 24"
 assert_contains "data note: stays on this machine" "$T" "The data stays on this machine"
 assert_contains "transcript tables missing: no table yet" "$T" "sessions no table yet"
 
@@ -118,7 +119,7 @@ assert_contains "all hints fire on the fixture" "$(hints "$OUT")" \
 assert_contains "precision hint, plain language" "$T" "Most blocking findings are downgraded or rejected by the judge (reviewer precision 30% (n=10))"
 assert_contains "category hint names the category" "$T" "[mutation] findings keep coming back (6 of 8 findings with a category): add a rule or agent instruction"
 assert_contains "costly-ready hint names the level" "$T" "code reviews at high cost \$1.20 on average and mostly say ready (100% (n=5))"
-assert_contains "top reason hint advises" "$T" "review_code ends 60% (n=5) of the failed rounds: the code review keeps finding changes"
+assert_contains "top reason hint advises" "$T" "review_code ends 50% (n=6) of the failed rounds: the code review keeps finding changes"
 assert_not_contains "a cheap level that mostly says ready: no hint" "$T" "tests reviews cost"
 
 echo "-- hints at their thresholds don't fire"
@@ -126,6 +127,7 @@ OK="$TMP/out/ok.db"; cp "$FX" "$OK"
 # precision 6/10 = 60% (not below); mutation 4 of 8 (fewer than 5); high: avg exactly $1.00, ready 3 of 5 (60%);
 # first-pass 3/5 = 60%; failures: 2 review_code of 5 (40% is the line: fires).
 sql "$OK" "
+DELETE FROM jobs WHERE job_id = 'e9';
 UPDATE findings SET ruling = 'confirmed' WHERE review_id = 'j1' AND n <= 6;
 UPDATE findings SET category = 'missing' WHERE review_id = 't1' AND n IN (5, 6);
 UPDATE reviews SET cost_usd = 1.0, verdict = CASE WHEN id IN ('ch1', 'ch2') THEN 'needs changes' ELSE 'ready' END WHERE level = 'high';
@@ -165,6 +167,9 @@ hint_case() { cp "$EMPTY" "$TMP/out/$1.db"; sql "$TMP/out/$1.db" "$2"
 cat_rows() { echo "INSERT INTO reviews (id, kind) VALUES ('t', 'tests');
 WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i WHERE n < $(($1 + $2)))
 INSERT INTO findings (review_id, n, sev_norm, category) SELECT 't', n, 'major', CASE WHEN n <= $1 THEN 'mutation' ELSE 'other-' || n END FROM i;"; }
+assert "precision: exactly 5 ruled findings, 1 confirmed, fires" test "$(hint_case prec5 "INSERT INTO reviews (id, kind) VALUES ('j', 'judge');
+INSERT INTO findings (review_id, n, sev_norm, ruling) VALUES ('j', 1, 'blocker', 'confirmed'), ('j', 2, 'blocker', 'rejected'),
+  ('j', 3, 'blocker', 'rejected'), ('j', 4, 'blocker', 'downgraded'), ('j', 5, 'blocker', 'downgraded');")" = 'data-hint="precision" '
 assert "category: exactly 5 findings fires" test "$(hint_case cat5 "$(cat_rows 5 0)")" = 'data-hint="category" '
 assert "category: 4 findings doesn't" test -z "$(hint_case cat4 "$(cat_rows 4 0)")"
 assert "category: exactly 30% (6 of 20) fires" test "$(hint_case cat30 "$(cat_rows 6 14)")" = 'data-hint="category" '
@@ -182,6 +187,15 @@ INSERT INTO jobs (job_id, repo, branch, round, ended, outcome) SELECT 'm' || n, 
   CASE WHEN n <= $1 THEN 1 ELSE 2 END, '2026-10-01T10:00:00.000Z', 'merged' FROM i;"; }
 assert "first-pass: exactly 50% doesn't fire" test -z "$(hint_case fp50 "$(fp_rows 5)")"
 assert "first-pass: 40% fires" test "$(hint_case fp40 "$(fp_rows 4)")" = 'data-hint="first-pass" '
+
+echo "-- weeks across the new year"
+ny_rows() { local d i=0; for d in 2025-12-15 2025-12-22 2025-12-29 2025-12-31 2026-01-01 2026-01-04 2026-01-05; do
+  i=$((i + 1)); echo "INSERT INTO jobs (job_id, repo, branch, round, ended, outcome) VALUES ('n$i', 'app', 'b$i', 1, '${d}T12:00:00.000Z', 'merged');"
+  done; }
+hint_case newyear "$(ny_rows)" >/dev/null
+T6="$(text "$TMP/out/newyear.html")"
+assert_contains "Monday 29 Dec to Sunday 4 Jan is one week" "$T6" \
+  "Week of Rounds Merged First-pass yield Review cost 2025-12-15 1 1 not enough data (n=1) – 2025-12-22 1 1 not enough data (n=1) – 2025-12-29 4 4 not enough data (n=4) – 2026-01-05 1 1 not enough data (n=1) –"
 
 echo "-- a review group without any cost"
 out="$(hint_case nocost "INSERT INTO reviews (id, kind, verdict, cost_usd) VALUES ('j', 'judge', 'ready', NULL);")"
@@ -352,6 +366,18 @@ exec(sys.argv[2])' "$RP" "$1" 2>&1; }
 assert_contains "a UNC path: host, escaped parts" "$(py 'print(r.file_url("\\\\wsl.localhost\\Ubuntu-24.04\\home\\a b\\x#1%.html"))')" \
   "file://wsl.localhost/Ubuntu-24.04/home/a%20b/x%231%25.html"
 assert_contains "a drive path" "$(py 'print(r.file_url("C:\\Users\\a b\\r.html"))')" "file:///C:/Users/a%20b/r.html"
+
+echo "-- a failed write"
+cp "$OUT" "$TMP/before.html"
+out="$(FX="$FX" OUTF="$OUT" py 'import os
+def boom(*a):
+    raise OSError("disk full")
+r.os.replace = boom
+r.main(["--db", os.environ["FX"], "--out", os.environ["OUTF"]])')"; rc=$?
+assert "exits non-zero" test "$rc" -ne 0
+assert_contains "with the error" "$out" "disk full"
+assert "leaves no temp file" test -z "$(find "$TMP/out" -name '.report-*')"
+assert "leaves the old report as it was" cmp -s "$OUT" "$TMP/before.html"
 
 echo "-- compact numbers"
 assert_contains "in full under 10,000, compact from it" "$(py 'print(" ".join(r.compact(v) for v in (9999, 10000, 12345, 999949, 999950, 1000000, 2500000000, 1.5)))')" \

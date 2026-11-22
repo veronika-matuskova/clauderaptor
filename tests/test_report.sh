@@ -304,6 +304,7 @@ sleep 5
 EOF
 chmod +x "$TMP/bin/wslpath" "$TMP/bin/msedge.exe"
 export EDGE_ARGV="$TMP/edge.argv"
+# shellcheck disable=SC2329 # called through assert
 wait_argv() { for _ in $(seq 50); do [ -f "$EDGE_ARGV" ] && return 0; sleep 0.1; done; return 1; }
 edge() { PATH="$TMP/bin:$PATH" STATS_EDGE="$TMP/bin/msedge.exe" python3 -I -B "$RP" --db "$FX" "$@" 2>&1; }
 SP="$TMP/my stats"

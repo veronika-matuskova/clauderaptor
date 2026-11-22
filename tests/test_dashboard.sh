@@ -21,6 +21,7 @@ cat > "$TMP/bin/msedge.exe" <<'EOF'
 printf '%s\n' "$@" > "$EDGE_ARGV"
 EOF
 chmod +x "$TMP/bin/wslpath" "$TMP/bin/msedge.exe"
+# shellcheck disable=SC2329 # called through assert
 wait_argv() { for _ in $(seq 50); do [ -f "$EDGE_ARGV" ] && return 0; sleep 0.1; done; return 1; }
 
 SD="$XDG_STATE_HOME/clauderaptor-stats"

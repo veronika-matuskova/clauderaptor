@@ -11,7 +11,7 @@ tasks/*
 # Skills synced from claude.ai (written by Claude Code via the skills symlink)
 claude/skills/synced/
 
-# Python bytecode (a review session that imports scripts/stats/stats.py would write it)
+# Python bytecode (a review session that imports apps/stats/stats.py would write it)
 __pycache__/
 
 # Stats data lives in the state dir (~/.local/state), never in the repo (the pre-commit hook also refuses it)

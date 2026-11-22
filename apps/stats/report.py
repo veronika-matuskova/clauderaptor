@@ -756,7 +756,7 @@ def main(argv):
     dbpath = a.db or stats.default_db()
     out = a.out or os.path.join(os.path.dirname(stats.default_db()), "report.html")
     if not os.path.isfile(dbpath):
-        die("no stats db at %s: run scripts/stats/stats.py ingest first" % dbpath)
+        die("no stats db at %s: run apps/stats/stats.py ingest first" % dbpath)
     refuse_work_tree(out)
     write_atomic(out, render(dbpath))
     if a.open:

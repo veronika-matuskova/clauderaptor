@@ -165,8 +165,9 @@ def nice_ticks(top, whole=False):
     return ticks
 
 
-def columns(rows, fmt=compact, aria="", whole=True):
-    """Columns on one baseline with one y axis: rows of (x label, value, tooltip)."""
+def columns(rows, fmt=compact, aria="", whole=True, marks=None):
+    """Columns on one baseline with one y axis: rows of (x label, value, tooltip). marks: {x label: tooltip}, a
+    dashed line over each of those columns (e.g. a rule change that day)."""
     if not rows:
         return '<p class="empty">no data yet</p>'
     W, H, left, bottom, top_pad = 640, 200, 48, 28, 10
@@ -189,6 +190,11 @@ def columns(rows, fmt=compact, aria="", whole=True):
         if h > 0:
             out.append('<path class="s1" d="%s"/>' % bar_path(x, top_pad + plot_h - h, bw, h, horizontal=False))
         out.append('</g>')
+        if marks and label in marks:
+            cx = x + bw / 2
+            out.append('<g class="mark rule"><title>%s</title><line class="rule-mark" x1="%.1f" x2="%.1f" y1="%d" '
+                       'y2="%d"/><rect class="hit" x="%.1f" y="%d" width="8" height="%d"/></g>'
+                       % (e(marks[label]), cx, cx, top_pad, top_pad + plot_h, cx - 4, top_pad, plot_h))
         if i % every == 0:
             out.append('<text class="tick" x="%.1f" y="%d" text-anchor="middle">%s</text>'
                        % (x + bw / 2, H - 10, e(label)))
@@ -345,7 +351,7 @@ def s_headline(m):
     return section("Headline", '<div class="tiles">%s</div>' % "".join(tiles), "headline")
 
 
-def s_rework(m):
+def s_rework(db, m):
     dist = {}
     for r in m["merged"]:
         if r[2] is not None:
@@ -362,6 +368,25 @@ def s_rework(m):
     frows = [(r or "unknown", c, "%s: %d (%s)" % (r or "unknown", c, share(c, nf))) for r, c in m["failures"]]
     body += ['<h3>Why rounds failed <span class="n">n=%d</span></h3>' % nf, hbars(frows, aria="failure reasons"),
              details(table(["Reason", "Failed rounds", "Share"], [(r, c, share(c, nf)) for r, c, _ in frows], (1,)))]
+    esc = db.q("SELECT repo, branch, merged_at, fixed_by FROM v_escaped_defects ORDER BY merged_at DESC")
+    n_esc = sum(1 for r in esc if r[3])
+    body += ['<h3>Escaped defects <span class="n">n=%d</span></h3>' % len(esc),
+             '<p data-metric="escaped">Escaped rate: %s</p><p class="sub">A merged branch escaped when a fix/ '
+             'branch or a revert merged into main within 14 days touches one of its files (from git; a branch merged '
+             'less than 14 days ago can still escape).</p>' % e(share(n_esc, len(esc))),
+             details(table(["Repo", "Branch", "Merged", "Fixed by"], [(a, b, (c or "")[:10], (d or "")[:12])
+                                                                     for a, b, c, d in esc if d]),
+                     "Escaped branches (%d)" % n_esc)]
+    flaky = db.q("SELECT repo, branch, failed_at, passed_at FROM v_flaky_checks ORDER BY failed_at DESC")
+    n_flaky = sum(1 for r in flaky if r[3])
+    body += ['<h3>Flaky CI <span class="n">n=%d</span></h3>' % len(flaky),
+             '<p data-metric="flaky">Flaky rate: %s</p><p class="sub">A failed CI check run is flaky when the '
+             'checks passed later with no new commits: on the same commit, or with the branch queued again at the '
+             'same commit.</p>' % e(share(n_flaky, len(flaky))),
+             details(table(["Repo", "Branch", "Failed", "Passed"], [(a or "–", b, (c or "")[:16].replace("T", " "),
+                                                                    (d or "")[:16].replace("T", " "))
+                                                                   for a, b, c, d in flaky if d]),
+                     "Flaky runs (%d)" % n_flaky)]
     body += ['<h3>Escalations to you <span class="n">n=%d</span></h3>' % len(m["escalations"]),
              table(["Repo", "Branch", "When", "Reason"], [(a or "–", b, (c or "")[:16].replace("T", " "), d or "–")
                                                           for a, b, c, d in m["escalations"]])]
@@ -463,8 +488,9 @@ def s_tokens(db):
     body.append("<h3>Cost per merged branch</h3>")
     if per:
         with_agent = sum(1 for r in per if r[3])
-        body.append('<p class="sub">Agent cost found for %d of %d merged branches: many agent sessions can\'t be '
-                    'linked to a branch yet.</p>' % (with_agent, len(per)))
+        body.append('<p class="sub">Agent cost found for %d of %d merged branches. A session is linked to a branch by '
+                    'its transcript\'s worktree and branch, by a job file\'s worktree, or by the job queued within 10 '
+                    'minutes after it ended; the rest can\'t be linked.</p>' % (with_agent, len(per)))
         body.append(details(table(["Repo", "Branch", "Merged", "Agent sessions", "Agent est. $ (estimate)",
                                    "Review $", "Judge $", "Total"],
                           [(r[0], r[1], (r[2] or "")[:10], r[3] or 0,
@@ -481,24 +507,35 @@ def s_timeline(db):
                   "AND ended IS NOT NULL GROUP BY 1 ORDER BY 1")
     cost = db.q("SELECT substr(finished, 1, 10), SUM(cost_usd), COUNT(*) FROM reviews WHERE finished IS NOT NULL "
                 "AND kind IN %s GROUP BY 1 ORDER BY 1" % QUEUE_KINDS)
+    rules = db.q("SELECT substr(ts, 1, 10), repo, sha, subject FROM rule_changes WHERE ts IS NOT NULL ORDER BY ts, repo, sha")
+    marks = {}
+    for d, repo, sha, subject in rules:
+        marks[d[5:]] = (marks[d[5:]] + "; " if d[5:] in marks else "rule change %s: " % d) + "%s %s %s" % (repo, sha, subject)
     body = ['<h3>Rounds per day <span class="n">n=%d</span></h3>' % sum(r[1] for r in rounds),
-            columns([(d[5:], c, "%s: %d rounds, %d merged" % (d, c, mg or 0)) for d, c, mg in rounds], aria="rounds per day"),
+            '<p class="sub">A dashed line marks a day the rules changed (claude/rules, CLAUDE.md, review.sh, '
+            'claude/agents): compare first-pass yield and precision before and after.</p>' if rules else "",
+            columns([(d[5:], c, "%s: %d rounds, %d merged" % (d, c, mg or 0)) for d, c, mg in rounds], aria="rounds per day",
+                    marks=marks),
             '<h3>Queue review cost per day <span class="n">n=%d reviews (code, tests, judge)</span></h3>' % sum(r[2] for r in cost),
             columns([(d[5:], c or 0, "%s: %s in %d reviews" % (d, money(c), n)) for d, c, n in cost], fmt=money,
                     aria="review cost per day", whole=False),
             details(table(["Day", "Rounds", "Merged"], [(d, c, mg or 0) for d, c, mg in rounds], (1, 2)), "Rounds table"),
-            details(table(["Day", "Review cost", "Reviews"], [(d, money(c), n) for d, c, n in cost], (1, 2)), "Cost table")]
+            details(table(["Day", "Review cost", "Reviews"], [(d, money(c), n) for d, c, n in cost], (1, 2)), "Cost table"),
+            '<h3>Rule changes <span class="n">n=%d</span></h3>' % len(rules),
+            details(table(["Day", "Repo", "Commit", "Subject"], rules), "Rule changes (%d)" % len(rules))]
     # A week is the date of its Monday: one row even when it runs into the new year.
     weeks = db.q("SELECT date(ended, 'weekday 0', '-6 days'), COUNT(*), SUM(outcome = 'merged'), "
                  "SUM(outcome = 'merged' AND round = 1) FROM jobs WHERE round IS NOT NULL AND ended IS NOT NULL "
                  "GROUP BY 1 ORDER BY 1")
     wcost = dict(db.q("SELECT date(finished, 'weekday 0', '-6 days'), SUM(cost_usd) FROM reviews WHERE finished IS NOT NULL "
                       "AND kind IN %s GROUP BY 1" % QUEUE_KINDS))
+    wrules = dict(db.q("SELECT date(ts, 'weekday 0', '-6 days'), COUNT(*) FROM rule_changes WHERE ts IS NOT NULL "
+                       "GROUP BY 1"))
     body.append("<h3>Weekly trend</h3>")
     if len(weeks) >= WEEKS_FOR_TRENDS:
-        body.append(table(["Week of", "Rounds", "Merged", "First-pass yield", "Review cost"],
-                          [(w, c, mg or 0, share(fp or 0, mg or 0), money(wcost.get(w))) for w, c, mg, fp in weeks],
-                          (1, 2, 4)))
+        body.append(table(["Week of", "Rounds", "Merged", "First-pass yield", "Review cost", "Rule changes"],
+                          [(w, c, mg or 0, share(fp or 0, mg or 0), money(wcost.get(w)), wrules.get(w, 0))
+                           for w, c, mg, fp in weeks], (1, 2, 4, 5)))
     else:
         body.append('<p class="empty">not enough data: weekly trends need %d weeks, there %s %d</p>'
                     % (WEEKS_FOR_TRENDS, "is" if len(weeks) == 1 else "are", len(weeks)))
@@ -530,15 +567,22 @@ def s_hints(m):
 
 
 def s_data(db, path):
-    try:
-        when = datetime.datetime.fromtimestamp(os.stat(path).st_mtime).strftime("%Y-%m-%d %H:%M")
-    except OSError:
-        when = "unknown"
+    last = db.one("SELECT value FROM meta WHERE key = 'last_ingest'")
+    ts = stats.norm_ts(last[0]) if last and isinstance(last[0], str) else None
+    if ts:
+        when = datetime.datetime.fromtimestamp(stats.epoch(ts)).strftime("%Y-%m-%d %H:%M")
+    else:
+        try:
+            when = datetime.datetime.fromtimestamp(os.stat(path).st_mtime).strftime("%Y-%m-%d %H:%M") + \
+                " (the db file's time)"
+        except OSError:
+            when = "unknown"
     counts = []
-    for t in ("jobs", "reviews", "findings", "events_raw", "sessions", "usage_daily"):
+    for t in ("jobs", "reviews", "findings", "events_raw", "sessions", "usage_daily", "checks", "main_commits",
+              "rule_changes"):
         r = db.one("SELECT COUNT(*) FROM %s" % t) if db.has(t) else None
         counts.append((t, r[0] if r else "no table yet"))
-    body = ('<p>Last ingested: %s (the db file\'s time). Generated %s.</p>%s<p class="sub">The data stays on this '
+    body = ('<p>Last ingested: %s. Generated %s.</p>%s<p class="sub">The data stays on this '
             'machine: the db and this page live outside any git checkout, and this page loads nothing from the '
             'network.</p>' % (e(when), e(datetime.datetime.now().strftime("%Y-%m-%d %H:%M")),
                               table(["Table", "Rows"], counts, (1,))))
@@ -571,6 +615,7 @@ section{background:var(--surface-1);border:1px solid var(--border);border-radius
 .s1{fill:var(--series-1)}.s2{fill:var(--series-2)}.s3{fill:var(--series-3)}.track{fill:var(--track)}
 .inside{fill:#fff;font-weight:600}.hit{fill:transparent}.mark:hover path,.mark:hover rect:not(.hit){opacity:.8}
 .legend span{margin-right:14px;white-space:nowrap}
+.rule-mark{stroke:var(--series-2);stroke-width:2;stroke-dasharray:4 3}
 .sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
 i.s1{background:var(--series-1)}i.s2{background:var(--series-2)}i.s3{background:var(--series-3)}
 .pair{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media (max-width:640px){.pair{grid-template-columns:1fr}}
@@ -586,7 +631,7 @@ details{margin:6px 0}summary{cursor:pointer;color:var(--text-secondary);font-siz
 def render(dbpath):
     db = Db(dbpath)
     m = metrics(db)
-    parts = [s_headline(m), s_rework(m), s_review_value(db, m), s_tokens(db), s_timeline(db), s_repos(db),
+    parts = [s_headline(m), s_rework(db, m), s_review_value(db, m), s_tokens(db), s_timeline(db), s_repos(db),
              s_hints(m), s_data(db, dbpath)]
     return ('<!DOCTYPE html>\n<html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'

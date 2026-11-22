@@ -163,6 +163,7 @@ args="$(cat "$STUB/args")"; mb="$(git -C "$W" merge-base main HEAD)"
 assert_contains "tests: names the change"     "$args" "git diff ${mb:0:12} $sha (against main)"
 assert_contains "tests: gives the instructions" "$args" "Mutation: break the code on purpose"
 assert_contains "tests: gives the lock command" "$args" "$ROOT/scripts/pr-queue.sh lock <command>"
+assert_contains "tests: gives the cap command" "$args" "Cap command: $ROOT/scripts/capped.sh <command>"
 assert_contains "tests: no edit tools"        "$args" "Edit,Write,NotebookEdit"
 assert "tests: got a scratch folder"          test -s "$STUB/scratch"
 assert "tests: scratch folder removed after"  test ! -e "$(cat "$STUB/scratch")"
@@ -251,8 +252,8 @@ out="$(rv --suite "$TMP/empty")"
 assert_contains "suite: a repo with no commits" "$out" "has no commits"
 assert_contains "suite: no commits -> exit 2" "$out" "exit=2"
 
-# Outside any cap (no CAPPED), the session runs in a capped systemd scope (systemd-run stubbed: it logs, then
-# runs the command after "--").
+# Without CAP_OFF (which lib.sh sets for the tests), the session runs in a capped systemd scope (systemd-run
+# stubbed: it logs, then runs the command after "--").
 cat > "$TMP/bin/systemd-run" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >> "$STUB/systemd-run"
@@ -261,7 +262,7 @@ shift; exec "$@"
 EOF
 printf '#!/usr/bin/env bash\n' > "$TMP/bin/systemctl"; chmod +x "$TMP/bin/systemd-run" "$TMP/bin/systemctl"
 printf 'No findings.\nVerdict: ready\n' > "$STUB/result"; commit capped
-out="$(CAPPED='' rv "$W")"
+out="$(CAP_OFF='' rv "$W")"
 assert_contains "capped: the review runs"     "$out" "exit=0"
 assert "capped: claude -p in a capped scope"  grep -q -- "--scope .*TasksMax=.*-- claude -p" "$STUB/systemd-run"
 

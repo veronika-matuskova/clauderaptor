@@ -12,8 +12,9 @@
 # A test review or audit gets a scratch folder, removed afterwards: it runs the tests in a copy of the
 # commit there, with the code broken on purpose, and e2e tests only under `pr-queue.sh lock`.
 # It is stopped after $REVIEW_TIMEOUT seconds (1800 for the code, 3600 for the tests: e2e runs wait for the
-# lock), and killed 30 s later if it is still running. It runs under capped.sh, so that a runaway in it (e.g. a
-# mutation that starts processes without end) can't fill the machine. A Ctrl-C, kill (TERM) or hangup of
+# lock), and killed 30 s later if it is still running. It runs under capped.sh, so that a runaway in it can't
+# fill the machine, and runs each test command under a cap of its own (the cap command), so that a mutation
+# that runs away is stopped there and the session goes on to report it. A Ctrl-C, kill (TERM) or hangup of
 # review.sh stops the session too, and waits for it to end. (Started by pr-queue.sh, review.sh ignores SIGINT as
 # a background job: the queue sends it TERM.)
 # REVIEW_SKIP_TESTS=1 tells /code-review to leave the quality of tests to the test review.
@@ -114,6 +115,7 @@ if [ "$mode" != code ]; then
   prompt="$task
 - Scratch folder (yours, removed afterwards): $scratch
 - e2e lock command: $HERE/pr-queue.sh lock <command>
+- Cap command: $HERE/capped.sh <command>
 
 $(cat "$HERE/review-tests.md")"
 fi

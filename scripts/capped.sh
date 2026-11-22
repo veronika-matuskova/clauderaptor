@@ -2,23 +2,29 @@
 # Runs a command with a cap on its processes and memory, so that a runaway (a fork bomb, a leak) is stopped
 # inside the cap instead of filling the machine (WSL has 8 GB):
 #   capped.sh <command...>
-# The command runs in a systemd user scope, which every process it starts stays in, setsid or not.
+# The command runs in a systemd user scope of its own, which every process it starts stays in, setsid or not.
 # TasksMax=$CAP_TASKS (default 2000) caps its processes and threads, MemoryMax=$CAP_MEMORY (default 4G) its
 # memory, with no swap, so that it can't push the rest of the machine out to swap. At the cap, forks fail and
-# the kernel kills processes of the scope only. When the command ends, or capped.sh is stopped, whatever is
-# still running in the scope is stopped too (TERM, then KILL after 10 s).
-# The command gets CAPPED=1: capped.sh inside it runs its command as it is, since a scope of its own would be
-# outside this one's cap. Without a systemd user instance (e.g. in CI) the command runs uncapped, with a warning.
+# the kernel kills processes of the scope only.
+# Each call gets a scope of its own, also inside another capped command (e.g. a mutation loop in a capped
+# review session): a runaway in it fills only its own cap, so the caller keeps running and can report it.
+# When capped.sh ends, also by a SIGKILL, whatever is still running in the scope is stopped (TERM, then KILL
+# after 10 s): a watcher outside its process group stops the scope if capped.sh dies without cleaning up.
+# CAP_OFF=1 runs the command as it is (the tests set it: each test file already runs under a cap of its own).
+# Without a systemd user instance that can apply the caps (e.g. in CI), the command runs uncapped, with a warning.
 # Exit code: the command's; 2 if no command was given.
 set -uo pipefail
 [ $# -ge 1 ] || { echo "usage: capped.sh <command...>" >&2; exit 2; }
-if [ -n "${CAPPED:-}" ]; then exec "$@"; fi
-export CAPPED=1
-if ! systemd-run --user --scope --quiet -- true >/dev/null 2>&1; then
-  echo "capped: no systemd user instance, so $1 runs without a cap" >&2
+if [ -n "${CAP_OFF:-}" ]; then exec "$@"; fi
+caps=(-p TasksMax="${CAP_TASKS:-2000}" -p MemoryMax="${CAP_MEMORY:-4G}" -p MemorySwapMax=0 -p TimeoutStopSec=10)
+# The check applies the same caps, so a cap systemd can't set means no cap rather than no command.
+if ! systemd-run --user --scope --quiet "${caps[@]}" -- true >/dev/null 2>&1; then
+  echo "capped: no systemd user instance that can apply the caps, so '${*:1:2}' runs without a cap" >&2
   exec "$@"
 fi
 unit="capped-$$-$RANDOM"
 trap 'systemctl --user stop "$unit.scope" >/dev/null 2>&1' EXIT
-systemd-run --user --scope --quiet --collect --unit="$unit" -p TasksMax="${CAP_TASKS:-2000}" \
-  -p MemoryMax="${CAP_MEMORY:-4G}" -p MemorySwapMax=0 -p TimeoutStopSec=10 -- "$@"
+# shellcheck disable=SC2016  # $1 and $2 expand in the watcher
+setsid bash -c 'tail --pid="$1" -f /dev/null; systemctl --user stop "$2.scope"' _ "$$" "$unit" \
+  </dev/null >/dev/null 2>&1 &
+systemd-run --user --scope --quiet --collect --unit="$unit" "${caps[@]}" -- "$@"

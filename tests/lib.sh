@@ -3,10 +3,15 @@
 set -uo pipefail
 # Each test file runs under scripts/capped.sh, also when run by itself (e.g. a mutation loop), so that a script
 # under test that starts processes without end is stopped by the cap instead of filling the machine. Started
-# again once, marked so that it never loops.
-if [ -z "${TESTS_CAPPED:-}" ]; then
-  TESTS_CAPPED=1 exec "$(dirname "${BASH_SOURCE[0]}")/../scripts/capped.sh" bash "$0" "$@"
+# again once, with bash's -x and -v: TESTS_CAPPED marks the re-run, so it never loops. A test file that a test
+# runs inherits it, and runs inside this cap.
+if [ -z "${TESTS_CAPPED:-}" ] && [ "${BASH_SOURCE[1]:-}" = "$0" ]; then
+  opts="${-//[^xv]/}"
+  TESTS_CAPPED=1 exec "$(dirname "${BASH_SOURCE[0]}")/../scripts/capped.sh" bash ${opts:+"-$opts"} "$0" "$@"
 fi
+# The scripts under test run capped.sh's command as it is: this file's cap covers them, and tests start no
+# real scopes.
+export CAP_OFF=1
 # Run from a git hook (pre-commit), git exports GIT_INDEX_FILE, GIT_DIR, ...; drop them so git in a test
 # repo never reads or writes this repo's index.
 # shellcheck disable=SC2046
@@ -32,4 +37,5 @@ assert_not_contains() {
   if [[ "$2" != *"$3"* ]]; then pass "$1"; else fail "$1"; echo "       expected NOT to contain: $3"; fi
 }
 
-finish() { exit "$FAILS"; }
+# finish: the last line, which tests/run.sh checks: a file that stops early, or never runs, has none.
+finish() { echo "  finished: $FAILS failed"; exit "$FAILS"; }

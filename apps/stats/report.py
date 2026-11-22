@@ -8,6 +8,9 @@ ${XDG_STATE_HOME:-~/.local/state}/clauderaptor-stats/stats.db), --out to report.
 self-contained (inline CSS and SVG, the logo and icon inlined as data: PNGs, no script, no fonts, no links to
 anything), so opening it makes no network requests. Like the db it stays on this machine: report.py refuses (exit 2) to write it into a git work tree,
 and writes it 0600, atomically.
+The file has a Refresh button that stays hidden: serve.py serves the page with a script (served_page: a CSP
+nonce) that shows it and asks serve.py, on 127.0.0.1 only, to ingest and rebuild. raptor-stats goes through
+serve.py; report.py --open opens the plain file, without Refresh.
 --open then opens it in an Edge app window with its own profile (under WSL: msedge.exe through interop, the
 Windows user's %LOCALAPPDATA%\\clauderaptor-stats\\edge-profile). The Windows user is the only one under
 /mnt/c/Users with an Edge folder; with several, name yours (--windows-user or $CLAUDERAPTOR_WINDOWS_USER).
@@ -575,17 +578,21 @@ def s_hints(m):
     return section("What to change", body, "hints")
 
 
-def s_data(db, path):
+def last_ingested(db, path):
+    """meta's last_ingest as local time, else the db file's time (said so)."""
     last = db.one("SELECT value FROM meta WHERE key = 'last_ingest'")
     ts = stats.norm_ts(last[0]) if last and isinstance(last[0], str) else None
     if ts:
-        when = datetime.datetime.fromtimestamp(stats.epoch(ts)).strftime("%Y-%m-%d %H:%M")
-    else:
-        try:
-            when = datetime.datetime.fromtimestamp(os.stat(path).st_mtime).strftime("%Y-%m-%d %H:%M") + \
-                " (the db file's time)"
-        except OSError:
-            when = "unknown"
+        return datetime.datetime.fromtimestamp(stats.epoch(ts)).strftime("%Y-%m-%d %H:%M")
+    try:
+        return datetime.datetime.fromtimestamp(os.stat(path).st_mtime).strftime("%Y-%m-%d %H:%M") + \
+            " (the db file's time)"
+    except OSError:
+        return "unknown"
+
+
+def s_data(db, path):
+    when = last_ingested(db, path)
     counts = []
     for t in ("jobs", "reviews", "findings", "events_raw", "sessions", "usage_daily", "checks", "main_commits",
               "rule_changes"):
@@ -593,7 +600,8 @@ def s_data(db, path):
         counts.append((t, r[0] if r else "no table yet"))
     body = ('<p>Last ingested: %s. Generated %s.</p>%s<p class="sub">The data stays on this '
             'machine: the db and this page live outside any git checkout, and this page loads nothing from the '
-            'network.</p>' % (e(when), e(datetime.datetime.now().strftime("%Y-%m-%d %H:%M")),
+            'network. Opened by raptor-stats, it talks only to its own local server (serve.py, on 127.0.0.1), '
+            'for Refresh.</p>' % (e(when), e(datetime.datetime.now().strftime("%Y-%m-%d %H:%M")),
                               table(["Table", "Rows"], counts, (1,))))
     return section("Data", body, "data")
 
@@ -634,8 +642,20 @@ th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--grid);overfl
 th{color:var(--text-secondary);font-weight:600}td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;overflow-wrap:normal}
 details{margin:6px 0}summary{cursor:pointer;color:var(--text-secondary);font-size:12px}
 .hints li{margin:6px 0}
+.refresh{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:6px 0 0}
+.refresh button{font:inherit;padding:3px 12px;border:1px solid var(--axis);border-radius:6px;cursor:pointer;
+background:var(--surface-1);color:var(--text-primary)}.refresh button:disabled{opacity:.6;cursor:default}
+.refresh button[hidden]{display:none}
 @media (forced-colors:active){.s1,.s2,.s3{fill:CanvasText}}
 """
+
+
+# The file's CSP: nothing but inline styles and data: images. served_page adds a nonce'd script and the page's
+# own server (connect-src 'self').
+CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'"
+CSP_META = '<meta http-equiv="Content-Security-Policy" content="%s">' % CSP
+FILE_NOTE = "Opened as a file: run raptor-stats to refresh."
+SAFE = re.compile(r"[A-Za-z0-9_-]{16,}")  # what secrets.token_urlsafe makes
 
 
 def render(dbpath):
@@ -643,17 +663,64 @@ def render(dbpath):
     m = metrics(db)
     parts = [s_headline(m), s_rework(db, m), s_review_value(db, m), s_tokens(db), s_timeline(db), s_repos(db),
              s_hints(m), s_data(db, dbpath)]
+    # The button stays hidden in the file (no script there); the served page's script shows it.
+    refresh = ('<p class="refresh"><button id="refresh" type="button" hidden>Refresh</button>'
+               '<span class="sub">Last ingested: %s.</span><span class="sub" id="refresh-note">%s</span></p>'
+               % (e(last_ingested(db, dbpath)), e(FILE_NOTE)))
     return ('<!DOCTYPE html>\n<html lang="en"><head><meta charset="utf-8">'
-            '<meta name="viewport" content="width=device-width,initial-scale=1">'
-            '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; '
-            'img-src data:">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">%s'
             '<link rel="icon" type="image/png" href="%s">'
             '<title>clauderaptor stats</title><style>%s</style></head><body class="viz-root"><main><header>'
             '<img class="logo" src="%s" alt=""><div>'
             '<h1>clauderaptor: how the PR queue is doing</h1><p class="sub">A round is one run of a branch through '
-            'the queue. Shares show their n; below %d they say "not enough data".</p></div></header>%s</main>'
+            'the queue. Shares show their n; below %d they say "not enough data".</p>%s</div></header>%s</main>'
             '</body></html>\n'
-            % (png_data("icon.png"), CSS, png_data("logo.png"), MIN_N, "".join(parts)))
+            % (CSP_META, png_data("icon.png"), CSS, png_data("logo.png"), MIN_N, refresh, "".join(parts)))
+
+
+def csp_served(nonce):
+    return CSP + "; script-src 'nonce-%s'; connect-src 'self'" % nonce
+
+
+# The served page's script: shows the button, POSTs /refresh (then reloads, or says why not) and a heartbeat
+# every 60 s, so serve.py stays up while the window is open. Messages go in as text, never as HTML.
+SCRIPT = """(function () {
+  var T = %s, b = document.getElementById("refresh"), n = document.getElementById("refresh-note");
+  if (!b || !n) return;
+  if (/[?&]k=/.test(location.search)) history.replaceState(null, "", "/?t=" + T);
+  function post(p) { return fetch(p, {method: "POST", headers: {"X-Raptor-Token": T}, cache: "no-store"}); }
+  function say(s) { n.textContent = s; }
+  b.hidden = false;
+  say("");
+  b.addEventListener("click", function () {
+    b.disabled = true;
+    say("Refreshing\u2026");
+    post("/refresh").then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) {
+        if (r.ok && j.ok) { location.reload(); return; }
+        say("Refresh failed: " + (j.error || "HTTP " + r.status));
+        b.disabled = false;
+      });
+    }, function () {
+      say("The local server has stopped: run raptor-stats again.");
+      b.disabled = false;
+    });
+  });
+  setInterval(function () { post("/heartbeat").catch(function () {}); }, 60000);
+})();"""
+
+
+def served_page(page, nonce, token):
+    """The report file's page as serve.py serves it: the CSP with the nonce and connect-src 'self', and the
+    script, with that nonce and the token. ValueError if the page isn't a report page."""
+    if not SAFE.fullmatch(nonce) or not SAFE.fullmatch(token):
+        raise ValueError("a nonce and a token are token_urlsafe strings")
+    if page.count(CSP_META) != 1 or "</body>" not in page:
+        raise ValueError("not a report page")
+    head, _, tail = page.rpartition("</body>")
+    meta = '<meta http-equiv="Content-Security-Policy" content="%s">' % csp_served(nonce)  # no " in it: a nonce is SAFE
+    return (head.replace(CSP_META, meta) + '<script nonce="%s">%s</script></body>' % (nonce, SCRIPT % ('"%s"' % token))
+            + tail)
 
 
 def refuse_work_tree(path):
@@ -727,20 +794,38 @@ def windows_home(users_root, user):
     return os.path.join(users_root, found[0])
 
 
-def open_in_edge(report, user):
+def find_edge():
+    """(msedge.exe, wslpath, None) under WSL, else (None, None, what is missing)."""
     edge = os.environ.get("STATS_EDGE") or EDGE
     wslpath = shutil.which("wslpath")
     if not os.path.isfile(edge) or not wslpath:
-        print("report: %s\nreport: open it in a browser (--open starts an Edge app window only under WSL: %s not "
-              "found)" % (report, "wslpath" if not wslpath else edge))
-        return
+        return None, None, "wslpath" if not wslpath else edge
+    return edge, wslpath, None
+
+
+def edge_profile(wslpath, user):
+    """The app's Edge profile folder (made if missing), as a Windows path."""
     home = windows_home(os.environ.get("STATS_WINDOWS_USERS_DIR") or "/mnt/c/Users", user)
     prof = os.path.join(home, *PROFILE_FOLDER)
     os.makedirs(prof, exist_ok=True)
-    args = [edge, "--app=" + file_url(wslpath_w(wslpath, os.path.abspath(report))),
-            "--user-data-dir=" + wslpath_w(wslpath, prof), "--no-first-run", "--no-default-browser-check"]
+    return wslpath_w(wslpath, prof)
+
+
+def launch_edge(edge, app_url, profile):
+    """Edge with the URL as an app, in the background: this returns at once."""
+    args = [edge, "--app=" + app_url, "--user-data-dir=" + profile, "--no-first-run", "--no-default-browser-check"]
     subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True, close_fds=True)
+
+
+def open_in_edge(report, user):
+    edge, wslpath, missing = find_edge()
+    if missing:
+        print("report: %s\nreport: open it in a browser (--open starts an Edge app window only under WSL: %s not "
+              "found)" % (report, missing))
+        return
+    prof = edge_profile(wslpath, user)
+    launch_edge(edge, file_url(wslpath_w(wslpath, os.path.abspath(report))), prof)
     print("report: %s, opening it in an Edge app window" % report)
 
 

@@ -45,7 +45,8 @@
 # PR_QUEUE_CHECKS_TIMEOUT (seconds, default 3600) fails the job when checks are still pending after that long.
 # Each repo has its own queue, so one repo's jobs never wait for another's: `run` starts a runner for every
 # repo with jobs, side by side, and while any works, one for each repo that gets jobs (it looks every
-# PR_QUEUE_POLL seconds, default 5) until no repo has any. `run <checkout>` works only on that checkout's
+# PR_QUEUE_POLL seconds, default 5) until no repo has any. A repo whose queue another runner has is looked at
+# again each time, so it gets a runner once that one ends. `run <checkout>` works only on that checkout's
 # repo. Neither starts while a runner of the old version holds its lock. A repo is its main checkout; it is
 # named after that folder. Only the e2e lock (`lock`, step 3) is shared by all repos: it
 # guards the machine's one local test stack.
@@ -504,8 +505,10 @@ run() {
   # TERM to it reaches its job and the job's reviews too). While any works, every $PR_QUEUE_POLL seconds, it
   # notes the ones that ended and starts one for each repo that has jobs by then (a job left in running/ too:
   # run_repo moves it to failed/), so a job queued to a repo never waits for another repo's queue. A repo whose
-  # queue another runner has, or whose runner failed (it said why), is left out, so this ends.
-  local d p sig given_up=" " active=" "
+  # runner failed (it said why) is left out, so this ends. A repo whose queue another runner has is tried again
+  # at each poll (said once), so a job queued to it after that runner ends still gets a runner while this one
+  # works; when this one has nothing left to do, it ends and names the repos still busy with jobs.
+  local d p sig given_up=" " active=" " busy=" "
   local -A repo_of=()  # pid of each repo's runner -> its repo folder
   # A Ctrl-C or kill of this runner stops them with a TERM to each one's process group, waits until each group
   # is gone (its job stopping its reviews too; at most 70 s: a review session gets 30 s to stop, then 30 s
@@ -523,8 +526,12 @@ run() {
         continue
       fi
       if ! flock -n "$d/run.lock" true; then
-        echo "pr-queue: $(basename "$d"): a runner is already working on the queue"; given_up+="$d "; continue
+        if [[ "$busy" != *" $d "* ]]; then
+          echo "pr-queue: $(basename "$d"): a runner is already working on the queue"; busy+="$d "
+        fi
+        continue
       fi
+      busy="${busy/" $d "/ }"
       PR_QUEUE_CHILD=1 setsid bash "$0" run "$(cat "$d/checkout")" &
       repo_of[$!]="$d"; active+="$d "
     done
@@ -539,6 +546,10 @@ run() {
     done
   done
   trap - INT TERM HUP
+  for d in $busy; do
+    [[ "$given_up" == *" $d "* ]] || [ -z "$(find "$d/queue" "$d/running" -name '*.job' 2>/dev/null | head -1)" ] ||
+      given_up+="$d "
+  done
   if [ "$given_up" = " " ]; then echo "pr-queue: the queues are empty"; return; fi
   echo "pr-queue: jobs left in the queue of:$(for d in $given_up; do printf " %s" "$(basename "$d")"; done) (see above)"
 }

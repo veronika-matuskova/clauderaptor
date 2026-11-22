@@ -42,9 +42,10 @@
 # PR_QUEUE_MERGE=0 stops after the checks pass and leaves the PR open.
 # PR_QUEUE_CHECKS_TIMEOUT (seconds, default 3600) fails the job when checks are still pending after that long.
 # Each repo has its own queue, so one repo's jobs never wait for another's: `run` starts a runner for every
-# repo with jobs, side by side, again until no repo has jobs (one queued meanwhile too), and `run <checkout>`
-# works only on that checkout's repo. Neither starts while a runner of the old version holds its lock. A repo is its main
-# checkout; it is named after that folder. Only the e2e lock (`lock`, step 3) is shared by all repos: it
+# repo with jobs, side by side, and while any works, one for each repo that gets jobs (it looks every
+# PR_QUEUE_POLL seconds, default 5) until no repo has any. `run <checkout>` works only on that checkout's
+# repo. Neither starts while a runner of the old version holds its lock. A repo is its main checkout; it is
+# named after that folder. Only the e2e lock (`lock`, step 3) is shared by all repos: it
 # guards the machine's one local test stack.
 # State lives in $PR_QUEUE_DIR (default ${XDG_STATE_HOME:-~/.local/state}/pr-queue): repos/<repo>/ holds a
 # repo's jobs (queue, running, done, failed), logs, results.log and run.lock; e2e.lock and reviews/ are shared.
@@ -400,6 +401,8 @@ run() {
     0|1) ;;
     *) die "PR_QUEUE_JUDGE must be 0 (no judge: a review that needs changes fails the job) or 1, not '$PR_QUEUE_JUDGE'" ;;
   esac
+  POLL="${PR_QUEUE_POLL:-5}"
+  [[ "$POLL" =~ ^[0-9]*\.?[0-9]+$ && "$POLL" =~ [1-9] ]] || die "PR_QUEUE_POLL must be a number of seconds above 0, not '$POLL'"
   migrate
   # A runner of the old version works on all repos' jobs under the old lock; a new one beside it could run a
   # second job of the same repo. A shared lock to check: it fails only beside the old runner's exclusive one,
@@ -411,42 +414,45 @@ run() {
     use_repo "$1" || die "$1 is not a git checkout"; run_repo; return
   fi
   [ -z "$CHILD" ] || die "a repo's runner must not start runners for every repo"
-  # Rounds, until no repo has jobs: each round takes every repo with jobs (a job left in running/ too: run_repo
-  # moves it to failed/), so a job queued meanwhile, in any repo, is run too. A repo whose queue another runner
-  # has, or whose runner failed this time (it said why), is left out, so the rounds always end.
-  local d i todo pids=() given_up=" " sig
+  # A runner of its own for every repo with jobs, side by side, each in a process group of its own (so that a
+  # TERM to it reaches its job and the job's reviews too). While any works, every $PR_QUEUE_POLL seconds, it
+  # notes the ones that ended and starts one for each repo that has jobs by then (a job left in running/ too:
+  # run_repo moves it to failed/), so a job queued to a repo never waits for another repo's queue. A repo whose
+  # queue another runner has, or whose runner failed (it said why), is left out, so this ends.
+  local d p sig given_up=" " active=" "
+  local -A repo_of=()  # pid of each repo's runner -> its repo folder
+  # A Ctrl-C or kill of this runner stops them with a TERM to each one's process group, waits until each group
+  # is gone (its job stopping its reviews too; at most 70 s: a review session gets 30 s to stop, then 30 s
+  # more), then ends this one by the same signal.
+  for sig in INT TERM HUP; do
+    # shellcheck disable=SC2064,SC2154  # $sig now; the pids (and p) are expanded when the trap runs
+    trap "for p in \"\${!repo_of[@]}\"; do kill -TERM -- -\$p 2>/dev/null; done
+      for p in \"\${!repo_of[@]}\"; do for _ in \$(seq 700); do kill -0 -- -\$p 2>/dev/null || break; sleep 0.1; done; done
+      trap - $sig; kill -$sig \$\$" "$sig"
+  done
   while :; do
-    todo=()
     for d in "$STATE"/repos/*/; do
       d="${d%/}"
-      if [[ "$given_up" == *" $d "* ]] || [ -z "$(find "$d/queue" "$d/running" -name '*.job' 2>/dev/null | head -1)" ]; then
+      if [[ "$given_up$active" == *" $d "* ]] || [ -z "$(find "$d/queue" "$d/running" -name '*.job' 2>/dev/null | head -1)" ]; then
         continue
       fi
       if ! flock -n "$d/run.lock" true; then
         echo "pr-queue: $(basename "$d"): a runner is already working on the queue"; given_up+="$d "; continue
       fi
-      todo+=("$d")
-    done
-    [ ${#todo[@]} -gt 0 ] || break
-    if [ ${#todo[@]} -eq 1 ]; then set_repo "${todo[0]}"; run_repo; continue; fi
-    # While they run, a Ctrl-C or kill of this runner stops them with a TERM to each one's process group,
-    # waits until each group is gone (its job stopping its reviews too; at most 70 s: a review session gets
-    # 30 s to stop, then 30 s more), then ends this one by the same signal.
-    pids=()
-    for sig in INT TERM HUP; do
-      # shellcheck disable=SC2064,SC2154  # $sig now; the pids (and p) are expanded when the trap runs
-      trap "for p in \"\${pids[@]}\"; do kill -TERM -- -\$p 2>/dev/null; done
-        for p in \"\${pids[@]}\"; do for _ in \$(seq 700); do kill -0 -- -\$p 2>/dev/null || break; sleep 0.1; done; done
-        trap - $sig; kill -$sig \$\$" "$sig"
-    done
-    for d in "${todo[@]}"; do
-      # A process group of its own, so that a TERM to it reaches its job and the job's reviews too.
       PR_QUEUE_CHILD=1 setsid bash "$0" run "$(cat "$d/checkout")" &
-      pids+=($!)
+      repo_of[$!]="$d"; active+="$d "
     done
-    for i in "${!pids[@]}"; do wait "${pids[$i]}" || given_up+="${todo[$i]} "; done
-    trap - INT TERM HUP; pids=()
+    [ ${#repo_of[@]} -gt 0 ] || break
+    # In the background, so that a signal is handled at once, not when the sleep ends.
+    sleep "$POLL" & wait $!
+    # An ended runner: bash has reaped it (kill -0 fails), and wait gives its exit status.
+    for p in "${!repo_of[@]}"; do
+      kill -0 "$p" 2>/dev/null && continue
+      wait "$p" || given_up+="${repo_of[$p]} "
+      active="${active/" ${repo_of[$p]} "/ }"; unset "repo_of[$p]"
+    done
   done
+  trap - INT TERM HUP
   if [ "$given_up" = " " ]; then echo "pr-queue: the queues are empty"; return; fi
   echo "pr-queue: jobs left in the queue of:$(for d in $given_up; do printf " %s" "$(basename "$d")"; done) (see above)"
 }

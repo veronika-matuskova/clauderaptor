@@ -17,9 +17,11 @@
 # A test review, audit or judge gets a scratch folder, removed afterwards: it runs the tests in a copy of the
 # commit there (a test review with the code broken on purpose), and e2e tests only under `pr-queue.sh lock`.
 # It is stopped after $REVIEW_TIMEOUT seconds (1800 for the code, 3600 for the rest: e2e runs wait for the
-# lock), and killed 30 s later if it is still running. A Ctrl-C, kill (TERM) or hangup of review.sh stops the
-# session too, and waits for it to end. (Started by pr-queue.sh, review.sh ignores SIGINT as a background job: the queue
-# sends it TERM.)
+# lock), and killed 30 s later if it is still running. It runs under capped.sh, so that a runaway in it can't
+# fill the machine, and runs each test command under a cap of its own (the cap command), so that a mutation
+# that runs away is stopped there and the session goes on to report it. A Ctrl-C, kill (TERM) or hangup of
+# review.sh stops the session too, and waits for it to end. (Started by pr-queue.sh, review.sh ignores SIGINT as
+# a background job: the queue sends it TERM.)
 # REVIEW_SKIP_TESTS=1 tells /code-review to leave the quality of tests to the test review.
 # Reviews are saved to $REVIEW_DIR (default $PR_QUEUE_DIR/reviews, the folder pr-queue.sh uses) as
 # <branch>-<sha>-<level>.md (<level>-notests.md with REVIEW_SKIP_TESTS=1) or <branch>-<sha>-tests.md.
@@ -212,6 +214,7 @@ if [ "$mode" != code ]; then
   the repo's contributing guide at that commit too (git show ${rules_at:0:12}:<path>).
 - Scratch folder (yours, removed afterwards): $scratch
 - e2e lock command: $HERE/pr-queue.sh lock <command>
+- Cap command: $HERE/capped.sh <command>
 
 $(cat "$instructions")"
 fi
@@ -225,7 +228,7 @@ cd "$wt" || die "can't enter $wt"
 # kills it) before the EXIT trap removes the folders it may still be using.
 session=""
 trap '[ -z "$session" ] || { kill "$session" 2>/dev/null; wait "$session"; }; die "stopped, and so was the claude -p session"' INT TERM HUP
-timeout -k 30 "$limit" claude -p "$prompt" --output-format json --permission-mode auto \
+timeout -k 30 "$limit" "$HERE/capped.sh" claude -p "$prompt" --output-format json --permission-mode auto \
   --safe-mode --append-system-prompt-file "$sysprompt" \
   --disallowed-tools "Edit,Write,NotebookEdit" </dev/null >"$json" &
 session=$!

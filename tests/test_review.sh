@@ -69,6 +69,7 @@ assert_contains "headless JSON"           "$args" "--output-format"
 assert_contains "no edit tools"           "$args" "Edit,Write,NotebookEdit"
 assert_contains "loads none of the branch's config" "$args" "--safe-mode"
 assert_contains "names the rules in the prompt" "$args" 'rules under "Rules for this review" in your system prompt'
+assert_contains "the verdict goes by those rules" "$args" 'important or breaks one of the rules under "Rules for this review" in your system prompt'
 sp="$(cat "$STUB/sysprompt")"; mb="$(git -C "$W" merge-base main HEAD)"
 assert_contains "rules: from the base commit"   "$sp" "the repo's at commit ${mb:0:12} (the base of the change, against main)"
 assert_contains "rules: the base's CLAUDE.md"   "$sp" "Base rule: tests live in tests/."
@@ -221,6 +222,7 @@ args="$(cat "$STUB/args")"; mb="$(git -C "$W" merge-base main HEAD)"
 assert_contains "tests: names the change"     "$args" "git diff ${mb:0:12} $sha (against main)"
 assert_contains "tests: gives the instructions" "$args" "Mutation: break the code on purpose"
 assert_contains "tests: gives the lock command" "$args" "$ROOT/scripts/pr-queue.sh lock <command>"
+assert_contains "tests: gives the cap command" "$args" "Cap command: $ROOT/scripts/capped.sh <command>"
 assert_contains "tests: no edit tools"        "$args" "Edit,Write,NotebookEdit"
 assert_contains "tests: loads none of the branch's config" "$args" "--safe-mode"
 assert_contains "tests: names the rules commit" "$args" "from commit ${mb:0:12}"
@@ -375,6 +377,8 @@ assert_contains "judge: no earlier rulings"   "$args" "oldest first (read each w
 assert_contains "judge: gives the instructions" "$args" "## For every blocking finding"
 assert_not_contains "judge: not the test review's" "$args" "Mutation: break the code on purpose"
 assert_contains "judge: gives the lock command" "$args" "$ROOT/scripts/pr-queue.sh lock <command>"
+assert_contains "judge: gives the cap command" "$args" "Cap command: $ROOT/scripts/capped.sh <command>"
+assert_contains "judge: runs test commands under it" "$args" "Run every test command under the cap command"
 assert_contains "judge: loads none of the branch's config" "$args" "--safe-mode"
 assert_contains "judge: no edit tools"        "$args" "Edit,Write,NotebookEdit"
 assert_contains "judge: base rules"           "$(cat "$STUB/sysprompt")" "Base rule: tests live in tests/."
@@ -426,6 +430,19 @@ assert_contains "judge: needs a review file"  "$(rv --judge "$W")" "usage: revie
 cp "$ROOT/scripts/review.sh" "$TMP/bare/"
 out="$(PATH="$TMP/bin:$PATH" bash "$TMP/bare/review.sh" --judge "$W" "$TMP/code-review.md" 2>&1)"
 assert_contains "judge: instructions file missing" "$out" "missing $TMP/bare/review-judge.md"
+# Without CAP_OFF (which lib.sh sets for the tests), the session runs in a capped systemd scope (systemd-run
+# stubbed: it logs, then runs the command after "--").
+cat > "$TMP/bin/systemd-run" <<'EOF'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB/systemd-run"
+while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done
+shift; exec "$@"
+EOF
+printf '#!/usr/bin/env bash\n' > "$TMP/bin/systemctl"; chmod +x "$TMP/bin/systemd-run" "$TMP/bin/systemctl"
+printf 'No findings.\nVerdict: ready\n' > "$STUB/result"; commit capped
+out="$(CAP_OFF='' rv "$W")"
+assert_contains "capped: the review runs"     "$out" "exit=0"
+assert "capped: claude -p in a capped scope"  grep -q -- "--scope .*TasksMax=.*-- claude -p" "$STUB/systemd-run"
 
 printf 'Counts: mutation 0, missing 0, empty 0, duplicate 0, not atomic 0, rule 0\nVerdict: ready\n' > "$STUB/result"
 assert_contains "bad level"       "$(rv "$W" max)" "level must be low, medium, high or xhigh"

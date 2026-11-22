@@ -170,7 +170,11 @@ add() {
     tests="$old_tests"; echo "pr-queue: keeping --tests $tests from the earlier job"
   fi
   # Re-queueing a branch (after a fix) replaces its old job.
-  while read -r job; do rm -f "$job" "${job%.job}.body"; done < <(jobs_for "$QUEUE" "$branch")
+  # Its event: job_failed, replaced (no sha: the job file doesn't keep its commit; its job_queued has it).
+  while read -r job; do
+    EV_REPO="$REPO" EV_BRANCH="$branch" EV_JOB_ID="$(basename "${job%.job}")" EV_SHA="" emit job_failed step=queue reason=replaced
+    rm -f "$job" "${job%.job}.body"
+  done < <(jobs_for "$QUEUE" "$branch")
   if [ -n "$(jobs_for "$RUNNING" "$branch")" ]; then
     echo "pr-queue: $branch is being processed now; this commit is queued to follow (its worktree and branch are kept)"
   fi
@@ -194,7 +198,8 @@ with_line() {
 # gone, off the branch or dirty), fetch, conflict, review_code, review_tests, review_error, judge, e2e,
 # no_e2e_pass, moved (commits after the review), push, pr, head, checks_failed, checks_timeout, merge; and
 # abandoned, for a job a dead runner left in running/ (step start) or whose process ended without failjob (step
-# unknown), both in run_repo.
+# unknown), both in run_repo; and replaced (step queue), for a queued job that a re-queue of its branch replaces
+# (add).
 JOB=""; LOG=""; BRANCH=""
 failjob() {
   emit job_failed step="$1" reason="$2" "${@:4}"

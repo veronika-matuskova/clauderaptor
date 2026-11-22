@@ -278,6 +278,7 @@ Q add "$TMP/wt-late2" fix "Late commit" >/dev/null; out="$(Q run)"
 assert_contains "review: a commit after the review fails the job" "$out" "fix/late2 got commits after the review"
 assert "review: so no PR"                    test ! -s "$TQ/created.log"
 assert_contains "events: commits after the review" "$(ev fix/late2 'failed()')" "e2e/moved"
+assert_contains "events: moved, with the new HEAD's sha" "$(ev fix/late2 'one("job_failed")["sha"]')" "$(git -C "$TMP/wt-late2" rev-parse HEAD)"
 reset_pr; mkwt skip
 Q add "$TMP/wt-skip" fix "Skip" >/dev/null; out="$(PR_QUEUE_REVIEW=0 Q run)"
 assert "review: PR_QUEUE_REVIEW=0 skips it"  test -z "$(code_reviews)"
@@ -484,7 +485,15 @@ assert "subdir: worktree removed"            test ! -d "$TMP/wt-sub"
 reset_pr; mkwt login; mkwt login2 login.txt x login
 Q add "$TMP/wt-login" fix "Fix login" >/dev/null
 Q add "$TMP/wt-login2" fix "Login" >/dev/null
+replaced_id="$(basename "$(find "$RQ/queue" -name '*-login.job' ! -name '*-fix-login.job')" .job)"
 Q add "$TMP/wt-login2" fix "Login again" >/dev/null
+assert "requeue: the old job is gone"         test ! -e "$RQ/queue/$replaced_id.job"
+# shellcheck disable=SC2016  # python, not shell
+assert_contains "events: the replaced job ends with job_failed, replaced" \
+  "$(python3 -I -c 'import json, sys; print([(r["event"], r.get("step"), r.get("reason"), r["branch"], r["sha"]) for r in map(json.loads, open(sys.argv[1])) if r["job_id"] == sys.argv[2]])' "$EVENTS" "$replaced_id")" \
+  "[('job_queued', None, None, 'login', '$(git -C "$TMP/wt-login2" rev-parse HEAD)'), ('job_failed', 'queue', 'replaced', 'login', None)]"
+assert_contains "events: the new job is just queued" "$(ev login 'names()')" "job_queued"
+assert_not_contains "events: the other branch's job isn't replaced" "$(ev fix/login 'names()')" "job_failed"
 out="$(Q status)"
 assert_contains "similar names: fix/login still queued" "$out" "fix/login"
 assert "similar names: one job each"         test "$(find "$RQ/queue" -name '*.job' | wc -l)" = 2
@@ -591,6 +600,15 @@ assert_not_contains "judge: not given the ready test review" "$(judge_line)" "-t
 assert_contains "judge: nothing to fix, says so" "$out" "the judge found nothing to fix (judge: $PR_QUEUE_DIR/reviews/fix-falsealarm-"
 assert "judge: nothing to fix, e2e runs"     test -s "$TQ/npm.log"
 assert_contains "judge: nothing to fix, merged" "$out" "MERGED fix/falsealarm"
+# A judge's ready on the same reviews of the same commit is reused: its review_finished is cached.
+reset_pr; echo "needs changes" > "$TQ/verdict"; echo ready > "$TQ/judge_verdict"; echo fail > "$TQ/checks_seq"; mkwt judgedtwice
+Q add "$TMP/wt-judgedtwice" fix "Judged twice" >/dev/null; Q run >/dev/null
+assert_contains "events: a judge run is not cached" "$(ev fix/judgedtwice '[r["cached"] for r in evs if r["event"] == "review_finished" and r["kind"] == "judge"]')" "[False]"
+rm -f "$TQ/checks_seq"; : > "$TQ/claude.log"
+Q add "$TMP/wt-judgedtwice" fix "Judged twice" >/dev/null; out="$(Q run)"
+assert_contains "judge: already judged as ready" "$out" "MERGED fix/judgedtwice"
+assert "judge: not judged again"             test -z "$(judge_line)"
+assert_contains "events: a cached judge" "$(ev fix/judgedtwice '[(r["verdict"], r["cached"], r["review_file"].endswith("-judge.md")) for r in evs if r["event"] == "review_finished" and r["kind"] == "judge"]')" "[('ready', True, True)]"
 
 reset_pr; echo "needs changes" > "$TQ/verdict"; echo "needs changes" > "$TQ/tests_verdict"; mkwt real
 Q add "$TMP/wt-real" fix "Real" >/dev/null; out="$(Q run)"
@@ -679,10 +697,11 @@ assert "judge stopped: the job stayed in running/" test -n "$(find "$RQ/running"
 rm -f "$TQ/judge_hang" "$RQ"/running/*
 
 # --- a job left in running/ by a dead runner goes to failed/ ---
-printf 'worktree=/x\nbranch=fix/dead\n' > "$RQ/running/1-fix-dead.job"
+mkwt dead; printf 'worktree=%s\nbranch=fix/dead\n' "$TMP/wt-dead" > "$RQ/running/1-fix-dead.job"
 out="$(Q run)";                              assert_contains "dead runner: reported" "$out" "fix/dead was left unfinished"
 assert "dead runner: job in failed/"         in_failed dead
 assert_contains "events: a dead runner's job is abandoned" "$(ev fix/dead 'failed(), one("job_failed")["job_id"], one("job_failed")["repo"]')" "('start/abandoned', '1-fix-dead', 'repo')"
+assert_contains "events: with its worktree's sha" "$(ev fix/dead 'one("job_failed")["sha"]')" "$(git -C "$TMP/wt-dead" rev-parse HEAD)"
 
 # --- a job whose process ends without failjob (here: a SIGKILL during its e2e run) goes to failed/, abandoned ---
 # on_e2e kills the job's process: of the pr-queue.sh processes above the npm stub, the one just below the runner of

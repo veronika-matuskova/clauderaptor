@@ -9,7 +9,7 @@
   `pr-queue.sh add --review high`. When a review finds changes to make, a judge (`review.sh --judge`, a third fresh
   session) checks each blocking finding against the code and keeps only the real ones worth fixing; the main
   session doesn't rule on findings itself.
-  - "the judge found changes to make": goes back to the branch's agent, like a failed test. Send it the judge's
+  - "the judge confirmed changes to make": goes back to the branch's agent, like a failed test. Send it the judge's
     file (its To fix list), not the reviews.
   - "needs your decision" (the judge rejected a finding that would be critical if real, or the branch needed
     changes in two judged rounds): goes to the user. Show them the judge's file and the reviews, with options, and

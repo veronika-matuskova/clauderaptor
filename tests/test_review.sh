@@ -654,6 +654,103 @@ assert_contains "sidecar, wrong types: nulls" "$(sc "$j" '[d["session_id"], d["n
   '[null, null, null, null]'
 rm "$STUB/json"
 
+# --- the plan (--plan): a brief for a requested task, in any checkout, saved to $BRIEF_DIR ---
+rm -f "$STUB/hook" "$STUB/json"; export BRIEF_DIR="$TMP/briefs"
+brief_text() {  # brief_text <verdict> [section to leave out]
+  local h
+  echo "# Brief: notes"
+  for h in Request Requirements "Acceptance criteria" "Out of scope" Risk "Open questions"; do
+    [ "$h" = "${2:-}" ] && continue
+    printf '\n## %s\n' "$h"
+    if [ "$h" = "Acceptance criteria" ]; then printf -- '- A1: notes are saved. Check: tests/test_notes.sh\n'
+    else echo "- text"; fi
+  done
+  printf '\nVerdict: %s\n' "$1"
+}
+echo "Add a notes page." > "$TMP/request.md"
+M="$TMP/repo"; msha="$(git -C "$M" rev-parse --short=12 HEAD)"
+brief_text ready > "$STUB/result"
+echo "echo x >> '$M/tracked.txt'" > "$STUB/hook"
+out="$(rv --plan "$M" "$TMP/request.md")"; rm "$STUB/hook"; git -C "$M" checkout -q tracked.txt
+bfile="$(find "$BRIEF_DIR" -name "repo-$msha-*.md" | head -1)"
+assert_contains "plan: ready -> exit 0"       "$out" "exit=0"
+assert_contains "plan: prints the brief"      "$out" "A1: notes are saved."
+assert_contains "plan: names the saved file"  "$out" "(saved to $bfile)"
+assert_contains "plan: title, cost and time"  "$(head -1 "$bfile")" "# Brief for repo at $msha (cost \$0.42, 61 s, opus at high effort)"
+assert_contains "plan: edits in the checkout are fine" "$out" "exit=0"
+args="$(cat "$STUB/args")"
+assert_contains "plan: the task"              "$args" "Write a brief for one requested task"
+assert_contains "plan: at the checkout's commit" "$args" "Repo: $M, commit $msha. Plan at exactly that commit."
+assert_contains "plan: gives the request file" "$args" "The request (read it with cat): $TMP/request.md"
+assert_contains "plan: the instructions"      "$args" "## How to plan"
+assert_contains "plan: asks for numbered criteria" "$args" "Number the criteria A1, A2"
+assert_contains "plan: loads none of the repo's config" "$args" "--safe-mode"
+assert_contains "plan: no edit tools"         "$args" "Edit,Write,NotebookEdit"
+assert_contains "plan: on Opus"               "$(flag --model)" "opus"
+assert_contains "plan: high effort"           "$(flag --effort)" "high"
+assert_not_contains "plan: not xhigh"         "$(flag --effort)" "xhigh"
+assert_contains "plan: stopped after 1800 s"  "$(cat "$STUB/timeout")" "-k 30 1800"
+assert_contains "plan: runs in the checkout"  "$(cat "$STUB/cwd")" "$M"
+assert_contains "plan: no stdin"              "$(cat "$STUB/stdin")" "/dev/null"
+assert_contains "plan: rules the change must follow" "$(cat "$STUB/sysprompt")" "The rules the planned"
+assert_contains "plan: at that commit"        "$(cat "$STUB/sysprompt")" "the repo's at commit $msha, the commit you plan at."
+assert_contains "plan: the repo's rules"      "$(cat "$STUB/sysprompt")" "Base rule: tests live in tests/."
+assert_contains "plan: the user's rules"      "$(cat "$STUB/sysprompt")" "User rule: keep changes minimal."
+assert_contains "plan: a sidecar"             "$(sc "${bfile%.md}.json" '[d["kind"], d["verdict"], d["exit"], d["level"]]')" '["plan", "ready", 0, null]'
+assert "plan: not a review file"              test -z "$(find "$REVIEW_DIR" -name "repo-$msha-*")"
+brief_text questions > "$STUB/result"; out="$(rv --plan "$M" "$TMP/request.md")"
+assert_contains "plan: open questions -> exit 1" "$out" "exit=1"
+assert_contains "plan: says so"               "$out" "the brief has open questions for the user"
+qfile="$(sed -n 's/^(saved to \(.*\))$/\1/p' <<<"$out")"
+assert "plan: each brief a file of its own"   test "$qfile" != "$bfile"
+assert_contains "plan: a sidecar's verdict questions" "$(sc "${qfile%.md}.json" 'd["verdict"]')" '"questions"'
+brief_text ready Risk > "$STUB/result"; out="$(rv --plan "$M" "$TMP/request.md")"
+assert_contains "plan: a missing section -> exit 2" "$out" "exit=2"
+assert_contains "plan: names it"              "$out" "the brief has no Risk (saved to"
+brief_text ready | sed 's/A1:/AA:/' > "$STUB/result"; out="$(rv --plan "$M" "$TMP/request.md")"
+assert_contains "plan: no A1 -> exit 2"       "$out" "exit=2"
+assert_contains "plan: says the criteria are missing" "$out" "the brief has no the criteria A1…"
+brief_text ready | sed 's/- A1:/- **A1:**/' > "$STUB/result"
+assert_contains "plan: a bold A1 counts"      "$(rv --plan "$M" "$TMP/request.md")" "exit=0"
+brief_text ready | grep -v Verdict > "$STUB/result"; out="$(rv --plan "$M" "$TMP/request.md")"
+assert_contains "plan: no verdict -> exit 2"  "$out" "no verdict in the brief"
+brief_text ready > "$STUB/result"
+echo "git -C '$M' commit -q --allow-empty -m moved" > "$STUB/hook"
+out="$(rv --plan "$M" "$TMP/request.md")"; rm "$STUB/hook"
+assert_contains "plan: a moved HEAD is fine"  "$out" "exit=0"
+assert_contains "plan: a moved HEAD is noted" "$out" "moved while planning; the brief is of $msha"
+git -C "$M" reset -q --hard HEAD~1
+out="$(rv --plan "$M" "$TMP/nope.md")"
+assert_contains "plan: a missing request"     "$out" "no such request file, or it's empty: $TMP/nope.md"
+assert "plan: no session for it"              test ! -f "$STUB/args"
+: > "$TMP/blank.md"; assert_contains "plan: an empty request" "$(rv --plan "$M" "$TMP/blank.md")" "or it's empty"
+assert_contains "plan: needs both args"       "$(rv --plan "$M")" "usage: review.sh"
+brief_text ready > "$STUB/result"
+assert_contains "plan: in a worktree, named after its repo" "$(rv --plan "$W" "$TMP/request.md")" "(saved to $BRIEF_DIR/repo-$sha-"
+git -C "$M" checkout -q --detach
+assert_contains "plan: a detached HEAD is fine" "$(rv --plan "$M" "$TMP/request.md")" "exit=0"
+git -C "$M" checkout -q main
+unset BRIEF_DIR
+
+# --- REVIEW_BRIEF: the code and test reviews check the change against the brief; the judge doesn't get it ---
+printf '# Brief\n- A1: x\n' > "$TMP/the-brief.md"
+commit brief1; printf 'x.\nVerdict: ready\n' > "$STUB/result"
+REVIEW_BRIEF="$TMP/the-brief.md" rv "$W" >/dev/null
+assert_contains "brief: the code review reads it" "$(cat "$STUB/args")" "read the change's brief with cat: $TMP/the-brief.md"
+assert_contains "brief: each criterion not met is a finding" "$(cat "$STUB/args")" "For each acceptance criterion the change doesn't meet, add an important finding"
+REVIEW_BRIEF="$TMP/the-brief.md" rv --tests "$W" >/dev/null
+assert_contains "brief: the test review reads it" "$(cat "$STUB/args")" "The change's brief (requirements and acceptance criteria, approved by the user; read it with cat): $TMP/the-brief.md"
+assert_contains "brief: an untested criterion is missing" "$(cat "$STUB/args")" "add a must-fix finding of category missing"
+commit brief2; rv "$W" >/dev/null
+assert_not_contains "brief: none without REVIEW_BRIEF" "$(cat "$STUB/args")" "brief"
+printf 'Ruling.\nVerdict: ready\n' > "$STUB/result"
+REVIEW_BRIEF="$TMP/the-brief.md" rv --judge "$W" "$TMP/code-review.md" >/dev/null
+assert_contains "brief: the judge runs"       "$(cat "$STUB/args")" "Judge the reviews of one change"
+assert_not_contains "brief: the judge doesn't get it" "$(cat "$STUB/args")" "the-brief.md"
+commit brief3; out="$(REVIEW_BRIEF="$TMP/nope.md" rv "$W")"
+assert_contains "brief: a missing brief -> exit 2" "$out" "exit=2"
+assert_contains "brief: says so"              "$out" "no such brief: $TMP/nope.md"
+
 printf 'Counts: mutation 0, missing 0, empty 0, duplicate 0, not atomic 0, rule 0\nVerdict: ready\n' > "$STUB/result"
 assert_contains "bad level"       "$(rv "$W" max)" "level must be low, medium, high or xhigh"
 assert_contains "not a checkout"  "$(rv "$TMP")" "is not a git checkout"

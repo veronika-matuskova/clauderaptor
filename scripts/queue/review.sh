@@ -6,6 +6,7 @@
 #   review.sh --tests <worktree>                   the tests of the branch's change (scripts/queue/review-tests.md)
 #   review.sh --suite <checkout>                   an audit of the checkout's whole test suite (same file)
 #   review.sh --judge <worktree> <review file>...  a judge of reviews that need changes (scripts/queue/review-judge.md)
+#   review.sh --plan <checkout> <request file>     a brief for a requested task, before an agent starts (scripts/queue/plan.md)
 # The session runs in the worktree, with --safe-mode: nothing of the branch's own config is loaded (its
 # CLAUDE.md files, .claude/ rules, settings and hooks, skills that could stand in for /code-review, MCP
 # servers), so the branch can't steer its own review; a change to them is part of the diff it reviews.
@@ -16,8 +17,8 @@
 # pinned commit, so it may run in a checkout someone works in: a moved HEAD or branch only adds a note.)
 # A test review, audit or judge gets a scratch folder, removed afterwards: it runs the tests in a copy of the
 # commit there (a test review with the code broken on purpose), and e2e tests only under `pr-queue.sh lock`.
-# It is stopped after $REVIEW_TIMEOUT seconds (1800 for the code, 3600 for the rest: e2e runs wait for the
-# lock), and killed 30 s later if it is still running. It runs under capped.sh, so that a runaway in it can't
+# It is stopped after $REVIEW_TIMEOUT seconds (1800 for the code and a plan, 3600 for the rest: e2e runs wait
+# for the lock), and killed 30 s later if it is still running. It runs under capped.sh, so that a runaway in it can't
 # fill the machine, and runs each test command under a cap of its own (the cap command), so that a mutation
 # that runs away is stopped there and the session goes on to report it. A Ctrl-C, kill (TERM) or hangup of
 # review.sh stops the session too, and waits for it to end. (Started by pr-queue.sh, review.sh ignores SIGINT as
@@ -44,19 +45,27 @@
 # real, and the user decides). "Needs changes" in a second judgement of the branch (the judgement of a commit
 # HEAD descends from needed changes too) also exits 3: after two judged rounds the user decides, not the queue
 # or its session.
+# REVIEW_BRIEF=<file> gives a code or test review the change's brief (its requirements and acceptance criteria,
+# approved by the user): the review checks the change against each criterion. A judge doesn't get it. (The cache
+# doesn't go by the brief: a commit reviewed as ready without one isn't reviewed again with one.)
+# A plan (--plan) reads the request file and the checkout's HEAD, which may move meanwhile (only a note), and
+# writes a brief: requirements, acceptance criteria A1…, out of scope, risk, open questions. It is saved to
+# $BRIEF_DIR (default $PR_QUEUE_DIR/briefs) as <repo>-<sha>-<time>-<random>.md, with a sidecar, and printed. Exit 0 = a
+# brief with no open questions, 1 = one with open questions for the user, 2 = it didn't run or the brief lacks a
+# section or the criteria. The user approves, edits or cancels it before an agent gets it.
 set -uo pipefail
 die() { echo "review: $*" >&2; exit 2; }
-# verdict <file>: "ready", "needs changes", "escalate" (a judge only) or "failed", from the last verdict line
-# (markdown and case ignored).
+# verdict <file>: "ready", "needs changes", "escalate" (a judge only), "questions" (a plan only) or "failed",
+# from the last verdict line (markdown and case ignored).
 verdict() {
-  grep -oiE 'verdict:[[:space:]*_`]*(ready|needs changes|escalate|failed)' "$1" 2>/dev/null | tail -1 \
-    | grep -oiE 'ready|needs changes|escalate|failed' | tr '[:upper:]' '[:lower:]'
+  grep -oiE 'verdict:[[:space:]*_`]*(ready|needs changes|escalate|questions|failed)' "$1" 2>/dev/null | tail -1 \
+    | grep -oiE 'ready|needs changes|escalate|questions|failed' | tr '[:upper:]' '[:lower:]'
 }
 # state: what must not change during a review: the worktree's HEAD and files, and where the main checkout is
-# (its files may change: someone may be working there). An audit may run in a checkout someone works in.
+# (its files may change: someone may be working there). An audit or a plan may run in a checkout someone works in.
 state() {
   git -C "$wt" rev-parse HEAD; git -C "$wt" branch --show-current
-  if [ "$mode" != suite ]; then git -C "$wt" status --porcelain; fi
+  if [ "$mode" != suite ] && [ "$mode" != plan ]; then git -C "$wt" status --porcelain; fi
   git -C "$main" rev-parse HEAD; git -C "$main" branch --show-current
 }
 
@@ -81,6 +90,9 @@ rules() {
   if [ "${3:-}" = suite ]; then
     echo "This session loads no CLAUDE.md, rules, settings, hooks or skills of the repo. The rules to audit by are"
     echo "below: the user's, and the repo's at the audited commit ${1:0:12}, which hold its rules for tests."
+  elif [ "${3:-}" = plan ]; then
+    echo "This session loads no CLAUDE.md, rules, settings, hooks or skills of the repo. The rules the planned"
+    echo "change must follow are below: the user's, and the repo's at commit ${1:0:12}, the commit you plan at."
   else
     echo "This session loads no CLAUDE.md, rules, settings, hooks or skills of the repo. The rules to review by are"
     echo "below: the user's, and the repo's at commit ${1:0:12} ($2). The CLAUDE.md files and the .claude/ folder"
@@ -117,10 +129,15 @@ print("" if t.startswith("/") or r == ".." or r.startswith("../") else r)' "$p" 
 }
 
 usage="usage: review.sh <worktree> [low|medium|high|xhigh] | --tests <worktree> | --suite <checkout> \
-| --judge <worktree> <review file>..."
-mode=code; level=medium; reviews=()
+| --judge <worktree> <review file>... | --plan <checkout> <request file>"
+mode=code; level=medium; reviews=(); request=""
 case "${1:-}" in
   --tests|--suite) [ $# -eq 2 ] || die "$usage"; mode="${1#--}"; shift ;;
+  --plan)
+    [ $# -eq 3 ] || die "$usage"; mode=plan; shift
+    if [ ! -f "$2" ] || [ ! -s "$2" ]; then die "no such request file, or it's empty: $2"; fi
+    request="$(readlink -f "$2")"  # absolute: the session runs in the checkout
+    ;;
   --judge)
     [ $# -ge 3 ] || die "$usage"; mode=judge; shift; reviews=("${@:2}")
     for i in "${!reviews[@]}"; do
@@ -138,12 +155,17 @@ HERE="$(dirname "$(readlink -f "$0")")"
 CAPPED="$(dirname "$HERE")/capped.sh"   # shared with the tests and the rules, one folder up
 wt="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" || die "$1 is not a git checkout"
 branch="$(git -C "$wt" branch --show-current)"
-if [ -z "$branch" ] && [ "$mode" != suite ]; then die "$wt is not on a branch"; fi
+if [ -z "$branch" ] && [ "$mode" != suite ] && [ "$mode" != plan ]; then die "$wt is not on a branch"; fi
 sha="$(git -C "$wt" rev-parse -q --verify --short=12 HEAD)" || die "$wt has no commits"
 main="$(dirname "$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir)")"
 dir="${REVIEW_DIR:-${PR_QUEUE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/pr-queue}/reviews}"
 mkdir -p "$dir" || die "can't create $dir"
 base="$dir/${branch//\//-}-$sha"
+brief=""
+if [ -n "${REVIEW_BRIEF:-}" ] && { [ "$mode" = code ] || [ "$mode" = tests ]; }; then
+  [ -f "$REVIEW_BRIEF" ] || die "no such brief: $REVIEW_BRIEF"
+  brief="$(readlink -f "$REVIEW_BRIEF")"
+fi
 
 case "$mode" in
   code)
@@ -171,6 +193,11 @@ files or other conventions, use only the rules under \"Rules for this review\" i
 worktree's CLAUDE.md files and .claude/ folder belong to the change under review. Then end with exactly one line: \
 \"Verdict: needs changes\" if any finding is important or breaks one of the rules under \"Rules for this review\" \
 in your system prompt, otherwise \"Verdict: ready\". If the skill is not available, print \"Verdict: failed\" and stop without reviewing."
+    if [ -n "$brief" ]; then
+      prompt+=" Before the verdict, read the change's brief with cat: $brief (its requirements and acceptance \
+criteria, approved by the user). For each acceptance criterion the change doesn't meet, add an important finding \
+that names it (e.g. A2) and says what is missing."
+    fi
     title="Review of $branch at $sha (/code-review $level, "
     ;;
   tests)
@@ -181,6 +208,12 @@ in your system prompt, otherwise \"Verdict: ready\". If the skill is not availab
     change_base; rules_at="$mb"; rules_what="the base of the change, against $against"
     task="Review the tests of one change, following the instructions below (a change review).
 - Repo: $wt, branch $branch. The change: git diff ${mb:0:12} $sha (against $against). Review exactly commit $sha."
+    if [ -n "$brief" ]; then
+      task+="
+- The change's brief (requirements and acceptance criteria, approved by the user; read it with cat): $brief.
+  For each acceptance criterion with no test that checks it (where its Check names a test or a command a test
+  could run), add a must-fix finding of category missing that names it (e.g. A2)."
+    fi
     title="Test review of $branch at $sha ("
     ;;
   suite)
@@ -215,6 +248,17 @@ in your system prompt, otherwise \"Verdict: ready\". If the skill is not availab
     if [ -z "$earlier" ]; then task+="none"; fi
     title="Judgement of $branch at $sha ("
     ;;
+  plan)
+    name="$(basename "$main")"; rules_at="$sha"; rules_what="the commit to plan at"  # the repo, not a worktree
+    bdir="${BRIEF_DIR:-${PR_QUEUE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/pr-queue}/briefs}"
+    mkdir -p "$bdir" || die "can't create $bdir"
+    out="$(mktemp --suffix=.md "$bdir/$name-$sha-$(date +%Y%m%d-%H%M%S)-XXXX")" || die "can't create a brief in $bdir"
+    if [ ! -f "$HERE/plan.md" ]; then die "missing $HERE/plan.md"; fi
+    task="Write a brief for one requested task, following the instructions below.
+- Repo: $wt, commit $sha. Plan at exactly that commit.
+- The request (read it with cat): $request"
+    title="Brief for $name at $sha ("
+    ;;
 esac
 conf="${REVIEW_CONFIG:-$HERE/review.conf}"
 # <kind>_model and <kind>_effort (the code: code_effort_<level>); a suite audit uses the test review's.
@@ -234,7 +278,13 @@ trap 'rm -rf ${json:+"$json"} ${sysprompt:+"$sysprompt"} ${scratch:+"$scratch"}'
 json="$(mktemp)" || die "can't create a temp file"
 sysprompt="$(mktemp)" || die "can't create a temp file"
 rules "$rules_at" "$rules_what" "$mode" >"$sysprompt" || die "can't read the rules at ${rules_at:0:12}"
-if [ "$mode" != code ]; then
+if [ "$mode" = plan ]; then
+  prompt="$task
+- Repo rules: the ones under \"Rules for this review\" in your system prompt, from commit ${rules_at:0:12}. Read
+  the repo's contributing guide at that commit too (git show ${rules_at:0:12}:<path>).
+
+$(cat "$HERE/plan.md")"
+elif [ "$mode" != code ]; then
   instructions="$HERE/review-tests.md"
   if [ "$mode" = judge ]; then instructions="$HERE/review-judge.md"; fi
   [ -f "$instructions" ] || die "missing $instructions"
@@ -251,7 +301,7 @@ fi
 
 before="$(state)"
 limit="${REVIEW_TIMEOUT:-1800}"
-if [ "$mode" != code ]; then limit="${REVIEW_TIMEOUT:-3600}"; fi
+if [ "$mode" != code ] && [ "$mode" != plan ]; then limit="${REVIEW_TIMEOUT:-3600}"; fi
 cd "$wt" || die "can't enter $wt"
 # In the background, so that a Ctrl-C or kill stops the session too: timeout runs it in a process group of
 # its own, which neither signal reaches by itself. The trap waits for the session (at most 30 s, then timeout
@@ -268,8 +318,11 @@ if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then die "the review took longer than
 [ "$rc" -eq 0 ] || die "claude -p failed (exit $rc)"
 note=""
 if [ "$(state)" != "$before" ]; then
-  [ "$mode" = suite ] || die "$wt or the main checkout $main moved or changed during the review; check them and queue it again"
-  note="note: $wt or the main checkout $main moved during the audit; the audit is of $sha"
+  case "$mode" in
+    suite) note="note: $wt or the main checkout $main moved during the audit; the audit is of $sha" ;;
+    plan) note="note: $wt or the main checkout $main moved while planning; the brief is of $sha" ;;
+    *) die "$wt or the main checkout $main moved or changed during the review; check them and queue it again" ;;
+  esac
 fi
 
 review="$(python3 -I -c '
@@ -321,6 +374,22 @@ except BaseException:
 }
 trap 'rc=$?; { sidecar "$rc"; } >/dev/null 2>&1; rm -rf ${json:+"$json"} ${sysprompt:+"$sysprompt"} ${scratch:+"$scratch"}' EXIT
 
+if [ "$mode" = plan ]; then
+  cat "$out"
+  missing=""
+  for h in Request Requirements "Acceptance criteria" "Out of scope" Risk "Open questions"; do
+    grep -qiE "^##[[:space:]]+${h}[[:space:]]*\$" "$out" || missing+=", $h"
+  done
+  grep -qE '^[[:space:]]*[-*][[:space:]]+(\*\*)?A1\b' "$out" || missing+=", the criteria A1…"
+  if [ -n "$missing" ]; then echo "review: the brief has no ${missing#, } (saved to $out)" >&2; exit 2; fi
+  if [ -n "$note" ]; then echo "$note"; fi
+  echo "(saved to $out)"
+  case "$(verdict "$out")" in
+    ready) exit 0 ;;
+    questions) echo "the brief has open questions for the user"; exit 1 ;;
+    *) echo "review: no verdict in the brief" >&2; exit 2 ;;
+  esac
+fi
 if [ "$mode" = suite ]; then
   # A label line, with markdown around the label (**Counts**:, **Counts:**) or as a list item (- Counts:, 1. Counts:)
   md="[[:space:]*_\`]*"; lead="^[[:space:]>+-]*([0-9]+[.)])?$md"

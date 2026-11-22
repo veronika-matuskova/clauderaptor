@@ -50,7 +50,7 @@ esac
 EOF
   chmod +x "$BIN/sudo" "$BIN/curl" "$BIN/dpkg" "$BIN/id" "$BIN/sg" "$BIN/systemctl" "$BIN/docker-stub"
 }
-run() { PATH="$BIN" HOME="$H" SETUP_OS_RELEASE="$BIN/.os-release" SETUP_SYSTEMD_DIR="$BIN/.systemd" bash "$ROOT/scripts/setup-docker.sh"; }
+run() { PATH="$BIN" HOME="$H" SETUP_OS_RELEASE="$BIN/.os-release" SETUP_SYSTEMD_DIR="$BIN/.systemd" bash "$ROOT/scripts/setup/setup-docker.sh"; }
 
 # Fresh machine with Docker Desktop's leftover config: installs, joins group, enables socket, cleans config
 setup_bin fresh

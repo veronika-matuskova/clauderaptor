@@ -33,7 +33,7 @@ echo "$1 $2 $3" > "$STUB/timeout"
 exec "$REAL_TIMEOUT" "$@"
 EOF
 chmod +x "$TMP/bin/claude" "$TMP/bin/timeout"
-rv() { rm -f "$STUB/args" "$STUB/sysprompt"; PATH="$TMP/bin:$PATH" bash "$ROOT/scripts/review.sh" "$@" 2>&1; echo "exit=$?"; }
+rv() { rm -f "$STUB/args" "$STUB/sysprompt"; PATH="$TMP/bin:$PATH" bash "$ROOT/scripts/queue/review.sh" "$@" 2>&1; echo "exit=$?"; }
 # commit: a new commit on the worktree's branch, so the next review isn't a cached one
 commit() { git -C "$W" commit -q --allow-empty -m "change $1"; sha="$(git -C "$W" rev-parse --short=12 HEAD)"; }
 
@@ -226,7 +226,7 @@ stop_review() {
   rm -rf "$TMP/tmpdir" "$STUB/session"; mkdir "$TMP/tmpdir"; commit "$2"; touch "$STUB/slow_stop"
   # shellcheck disable=SC2016  # expands in the hook
   echo 'echo "$PPID" > "$STUB/session"; sleep 30' > "$STUB/hook"
-  PATH="$TMP/bin:$PATH" TMPDIR="$TMP/tmpdir" with_sigint bash "$ROOT/scripts/review.sh" --tests "$W" >"$TMP/stopped.out" 2>&1 &
+  PATH="$TMP/bin:$PATH" TMPDIR="$TMP/tmpdir" with_sigint bash "$ROOT/scripts/queue/review.sh" --tests "$W" >"$TMP/stopped.out" 2>&1 &
   local rpid=$! _
   for _ in $(seq 100); do [ -s "$STUB/session" ] && break; sleep 0.1; done
   session="$(cat "$STUB/session" 2>/dev/null)"
@@ -269,7 +269,7 @@ assert_contains "tests: runs in the worktree" "$(cat "$STUB/cwd")" "$W"
 args="$(cat "$STUB/args")"; mb="$(git -C "$W" merge-base main HEAD)"
 assert_contains "tests: names the change"     "$args" "git diff ${mb:0:12} $sha (against main)"
 assert_contains "tests: gives the instructions" "$args" "Mutation: break the code on purpose"
-assert_contains "tests: gives the lock command" "$args" "$ROOT/scripts/pr-queue.sh lock <command>"
+assert_contains "tests: gives the lock command" "$args" "$ROOT/scripts/queue/pr-queue.sh lock <command>"
 assert_contains "tests: gives the cap command" "$args" "Cap command: $ROOT/scripts/capped.sh <command>"
 assert_contains "tests: no edit tools"        "$args" "Edit,Write,NotebookEdit"
 assert_contains "tests: loads none of the branch's config" "$args" "--safe-mode"
@@ -296,7 +296,7 @@ git -C "$TMP/repo" update-ref -d refs/remotes/origin/main
 commit 15; echo "echo x >> '$W/new.txt'" > "$STUB/hook"
 assert_contains "tests: changed worktree -> exit 2" "$(rv --tests "$W")" "moved or changed during the review"
 rm "$W/new.txt" "$STUB/hook"
-commit 16; mkdir "$TMP/bare"; cp "$ROOT/scripts/review.sh" "$ROOT/scripts/review.conf" "$TMP/bare/"
+commit 16; mkdir "$TMP/bare"; cp "$ROOT/scripts/queue/review.sh" "$ROOT/scripts/queue/review.conf" "$TMP/bare/"
 out="$(PATH="$TMP/bin:$PATH" bash "$TMP/bare/review.sh" --tests "$W" 2>&1)"
 assert_contains "tests: instructions file missing" "$out" "missing $TMP/bare/review-tests.md"
 assert_contains "tests: needs a worktree"     "$(rv --tests)" "usage: review.sh"
@@ -431,7 +431,7 @@ assert_contains "judge: gives every review"   "$args" "Reviews to judge (read ea
 assert_contains "judge: no earlier rulings"   "$args" "oldest first (read each with cat): none"
 assert_contains "judge: gives the instructions" "$args" "## For every blocking finding"
 assert_not_contains "judge: not the test review's" "$args" "Mutation: break the code on purpose"
-assert_contains "judge: gives the lock command" "$args" "$ROOT/scripts/pr-queue.sh lock <command>"
+assert_contains "judge: gives the lock command" "$args" "$ROOT/scripts/queue/pr-queue.sh lock <command>"
 assert_contains "judge: gives the cap command" "$args" "Cap command: $ROOT/scripts/capped.sh <command>"
 assert_contains "judge: runs test commands under it" "$args" "Run every test command under the cap command"
 assert_contains "judge: loads none of the branch's config" "$args" "--safe-mode"
@@ -510,7 +510,7 @@ assert_contains "judge: and the failed one"   "$(cat "$STUB/args")" "$failed"
 mv "$TMP/aside"/* "$REVIEW_DIR/"
 assert_contains "judge: a missing review file" "$(rv --judge "$W" "$TMP/nope.md")" "no such review file: $TMP/nope.md"
 assert_contains "judge: needs a review file"  "$(rv --judge "$W")" "usage: review.sh"
-cp "$ROOT/scripts/review.sh" "$TMP/bare/"
+cp "$ROOT/scripts/queue/review.sh" "$TMP/bare/"
 out="$(PATH="$TMP/bin:$PATH" bash "$TMP/bare/review.sh" --judge "$W" "$TMP/code-review.md" 2>&1)"
 assert_contains "judge: instructions file missing" "$out" "missing $TMP/bare/review-judge.md"
 # Without CAP_OFF (which lib.sh sets for the tests), the session runs in a capped systemd scope (systemd-run

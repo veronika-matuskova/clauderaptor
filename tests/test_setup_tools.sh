@@ -47,7 +47,7 @@ exit 0
 EOF
   chmod +x "$BIN/gh-stub"
 }
-run() { PATH="$BIN" HOME="$H" GIT_CONFIG_GLOBAL="$H/.gitconfig" bash "$ROOT/scripts/setup-tools.sh"; }
+run() { PATH="$BIN" HOME="$H" GIT_CONFIG_GLOBAL="$H/.gitconfig" bash "$ROOT/scripts/setup/setup-tools.sh"; }
 gitcfg() { git config --file "$H/.gitconfig" "$1"; }
 # line_of <text>: number of the first log line containing text (0 if none)
 line_of() { grep -nF -- "$1" "$LOG" | head -1 | cut -d: -f1 | grep . || echo 0; }

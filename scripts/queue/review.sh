@@ -3,9 +3,9 @@
 # the calling session's context:
 #   review.sh <worktree> [low|medium|high|xhigh]   the code, with Claude Code's built-in /code-review
 #                                                  (default medium; use high for migrations, auth or RLS)
-#   review.sh --tests <worktree>                   the tests of the branch's change (scripts/review-tests.md)
+#   review.sh --tests <worktree>                   the tests of the branch's change (scripts/queue/review-tests.md)
 #   review.sh --suite <checkout>                   an audit of the checkout's whole test suite (same file)
-#   review.sh --judge <worktree> <review file>...  a judge of reviews that need changes (scripts/review-judge.md)
+#   review.sh --judge <worktree> <review file>...  a judge of reviews that need changes (scripts/queue/review-judge.md)
 # The session runs in the worktree, with --safe-mode: nothing of the branch's own config is loaded (its
 # CLAUDE.md files, .claude/ rules, settings and hooks, skills that could stand in for /code-review, MCP
 # servers), so the branch can't steer its own review; a change to them is part of the diff it reviews.
@@ -131,6 +131,7 @@ case "${1:-}" in
     ;;
 esac
 HERE="$(dirname "$(readlink -f "$0")")"
+CAPPED="$(dirname "$HERE")/capped.sh"   # shared with the tests and the rules, one folder up
 wt="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" || die "$1 is not a git checkout"
 branch="$(git -C "$wt" branch --show-current)"
 if [ -z "$branch" ] && [ "$mode" != suite ]; then die "$wt is not on a branch"; fi
@@ -239,7 +240,7 @@ if [ "$mode" != code ]; then
   the repo's contributing guide at that commit too (git show ${rules_at:0:12}:<path>).
 - Scratch folder (yours, removed afterwards): $scratch
 - e2e lock command: $HERE/pr-queue.sh lock <command>
-- Cap command: $HERE/capped.sh <command>
+- Cap command: $CAPPED <command>
 
 $(cat "$instructions")"
 fi
@@ -253,7 +254,7 @@ cd "$wt" || die "can't enter $wt"
 # kills it) before the EXIT trap removes the folders it may still be using.
 session=""
 trap '[ -z "$session" ] || { kill "$session" 2>/dev/null; wait "$session"; }; die "stopped, and so was the claude -p session"' INT TERM HUP
-timeout -k 30 "$limit" "$HERE/capped.sh" claude -p "$prompt" --output-format json --permission-mode auto \
+timeout -k 30 "$limit" "$CAPPED" claude -p "$prompt" --output-format json --permission-mode auto \
   --model "$model" --effort "$effort" --safe-mode --append-system-prompt-file "$sysprompt" \
   --disallowed-tools "Edit,Write,NotebookEdit" </dev/null >"$json" &
 session=$!

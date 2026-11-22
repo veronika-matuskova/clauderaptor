@@ -3,11 +3,11 @@
 # - None cloned yet: asks which GitHub repos to clone (owner/name or URL).
 # - Otherwise: fetches each one, shows its status and suggests push/pull.
 set -uo pipefail
-REPOS="$(cd "$(dirname "$0")/.." && pwd)/repos"
+REPOS="$(cd "$(dirname "$0")/../.." && pwd)/repos"
 mkdir -p "$REPOS"
 
 clone_prompt() {
-  command -v gh >/dev/null 2>&1 || { echo "gh not found; run scripts/setup-tools.sh first"; exit 1; }
+  command -v gh >/dev/null 2>&1 || { echo "gh not found; run scripts/setup/setup-tools.sh first"; exit 1; }
   echo "Your GitHub repos:"
   gh repo list --limit 50 --json nameWithOwner -q '.[].nameWithOwner' | sed 's/^/  /'
   while true; do

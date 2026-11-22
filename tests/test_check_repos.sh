@@ -3,9 +3,9 @@
 # shellcheck source=tests/lib.sh
 source "$(dirname "$0")/lib.sh"
 
-W="$TMP/ws"; mkdir -p "$W/repos" "$W/scripts"
-cp "$ROOT/scripts/check-repos.sh" "$W/scripts/"
-run() { bash "$W/scripts/check-repos.sh" </dev/null; }
+W="$TMP/ws"; mkdir -p "$W/repos" "$W/scripts/setup"
+cp "$ROOT/scripts/setup/check-repos.sh" "$W/scripts/setup/"
+run() { bash "$W/scripts/setup/check-repos.sh" </dev/null; }
 
 # Remote with one commit; make a clone per scenario
 git init -q --bare -b main "$TMP/remote.git"
@@ -43,7 +43,7 @@ assert_contains "non-git skipped"   "$out" "not a git repo, skipping"
 assert "never pushes by itself" test "$(git -C "$TMP/remote.git" rev-list --count main)" = 2
 
 # Empty repos/: lists GitHub repos via gh and clones what the user types
-E="$TMP/empty"; mkdir -p "$E/bin" "$E/scripts"; cp "$ROOT/scripts/check-repos.sh" "$E/scripts/"
+E="$TMP/empty"; mkdir -p "$E/bin" "$E/scripts/setup"; cp "$ROOT/scripts/setup/check-repos.sh" "$E/scripts/setup/"
 cat > "$E/bin/gh" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$E/gh.log"
@@ -53,7 +53,7 @@ case "\$1 \$2" in
 esac
 EOF
 chmod +x "$E/bin/gh"
-out="$(printf 'me/one\nhttps://github.com/me/two.git\nme/one\n\n' | PATH="$E/bin:$PATH" bash "$E/scripts/check-repos.sh")"
+out="$(printf 'me/one\nhttps://github.com/me/two.git\nme/one\n\n' | PATH="$E/bin:$PATH" bash "$E/scripts/setup/check-repos.sh")"
 assert_contains "prompts when empty" "$out" "No repos cloned in repos/ yet."
 assert_contains "lists GitHub repos" "$out" "  me/two"
 assert "cloned owner/name"           test -d "$E/repos/one/.git"
@@ -63,9 +63,9 @@ assert_contains "checks new clones"  "$out" "== one"
 assert "clone called twice" test "$(grep -c '^repo clone' "$E/gh.log")" = 2
 
 # Empty repos/ without gh: clear error
-M="$TMP/nogh"; mkdir -p "$M/bin" "$M/scripts"; cp "$ROOT/scripts/check-repos.sh" "$M/scripts/"
+M="$TMP/nogh"; mkdir -p "$M/bin" "$M/scripts/setup"; cp "$ROOT/scripts/setup/check-repos.sh" "$M/scripts/setup/"
 for c in bash dirname mkdir; do ln -s "$(command -v "$c")" "$M/bin/$c"; done
-out="$(PATH="$M/bin" bash "$M/scripts/check-repos.sh" </dev/null)"
-assert_contains "asks to run setup-tools without gh" "$out" "run scripts/setup-tools.sh first"
+out="$(PATH="$M/bin" bash "$M/scripts/setup/check-repos.sh" </dev/null)"
+assert_contains "asks to run setup-tools without gh" "$out" "run scripts/setup/setup-tools.sh first"
 
 finish

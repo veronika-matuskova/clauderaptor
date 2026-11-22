@@ -6,10 +6,14 @@
 - The queue reviews each branch before its e2e run, in two fresh `claude -p` sessions at the same time
   (`scripts/review.sh`): the code, with the built-in `/code-review`, and the tests (`review.sh --tests`: a mutation
   check, and missing, empty, duplicate or non-atomic tests). Queue migrations, auth or RLS changes with
-  `pr-queue.sh add --review high`. A failed review goes back to the branch's agent, like a failed test; its
-  findings are in the files the failure names. When a branch fails its second review, the main session reads the
-  findings and decides instead: it sends the agent only what is worth fixing, or queues the branch with
-  `--review none` or `--tests none` to merge it without another review of that kind.
+  `pr-queue.sh add --review high`. When a review finds changes to make, a judge (`review.sh --judge`, a third fresh
+  session) checks each blocking finding against the code and keeps only the real ones worth fixing; the main
+  session doesn't rule on findings itself.
+  - "the judge found changes to make": goes back to the branch's agent, like a failed test. Send it the judge's
+    file (its To fix list), not the reviews.
+  - "needs your decision" (the judge rejected a finding that would be critical if real, or the branch needed
+    changes in two judged rounds): goes to the user. Show them the judge's file and the reviews, with options, and
+    wait. Only then send the agent what the user chose, or queue the branch with `--review none` / `--tests none`.
 - To audit a repo's whole test suite, run `~/code/clauderaptor/scripts/review.sh --suite <checkout>`. It saves
   every finding to a file and prints a summary with the file's path.
 - Shared test infrastructure (a local database stack, a mail catcher, fixed ports) stays one shared instance.

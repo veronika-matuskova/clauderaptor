@@ -75,19 +75,25 @@ if [ -n "${PR_QUEUE_CHILD+set}" ]; then echo "inherited PR_QUEUE_CHILD" >> "$TQ/
 touch "$TQ/passed/$(git rev-parse HEAD)"
 EOF
 # claude -p (run by review.sh): logs "code <prompt>" for a code review, "tests <first line>" for a test review,
-# and reports the verdict in $TQ/verdict or $TQ/tests_verdict (default ready). $TQ/claude_fail makes both fail.
+# "judge <its reviews line>" for a judge, and reports the verdict in $TQ/verdict, $TQ/tests_verdict (default
+# ready) or $TQ/judge_verdict (default needs changes). $TQ/claude_fail makes them all fail.
 # With $TQ/sync, each session waits up to 5 s for the other one to start, and logs in sync.log if it did.
 # With $TQ/hang, each session logs its pid in $TQ/hung and hangs for 30 s; on TERM it takes 0.5 s to end.
+# $TQ/judge_hang does the same for a judge only.
 cat > "$TQ/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 if [[ "$2" == *"code-review skill"* ]]; then
   kind=code other=tests; echo "code $2" >> "$TQ/claude.log"; v="$(cat "$TQ/verdict" 2>/dev/null || echo ready)"
+elif [[ "$2" == "Judge the reviews of one change"* ]]; then
+  kind=judge other=""; echo "judge $(grep -m1 '^- Reviews to judge' <<<"$2")" >> "$TQ/claude.log"
+  v="$(cat "$TQ/judge_verdict" 2>/dev/null || echo "needs changes")"
 else
   kind=tests other=code; echo "tests ${2%%$'\n'*}" >> "$TQ/claude.log"; v="$(cat "$TQ/tests_verdict" 2>/dev/null || echo ready)"
 fi
 [ -f "$TQ/claude_fail" ] && exit 1
+if [ "$kind" = judge ] && [ -f "$TQ/judge_hang" ]; then trap 'sleep 0.5; exit 1' TERM; echo "$$" >> "$TQ/hung"; sleep 30; fi
 if [ -f "$TQ/hang" ]; then trap 'sleep 0.5; exit 1' TERM; echo "$$" >> "$TQ/hung"; sleep 30; fi
-if [ -f "$TQ/sync" ]; then
+if [ -f "$TQ/sync" ] && [ -n "$other" ]; then
   touch "$TQ/started-$kind"
   for _ in $(seq 50); do
     if [ -f "$TQ/started-$other" ]; then echo "$kind saw $other" >> "$TQ/sync.log"; break; fi
@@ -123,7 +129,7 @@ mkwt() {
 }
 reset_pr() {
   rm -f "$TQ/pr_state" "$TQ/pr_body" "$TQ/pr_branch" "$TQ/checks_seq" "$TQ/e2e_fail" "$TQ/merge_fail" "$TQ/head_lag" "$TQ/on_checks" \
-    "$TQ/verdict" "$TQ/tests_verdict" "$TQ/claude_fail" "$TQ/sync" "$TQ"/started-* "$TQ/sync.log"
+    "$TQ/verdict" "$TQ/tests_verdict" "$TQ/judge_verdict" "$TQ/judge_hang" "$TQ/claude_fail" "$TQ/sync" "$TQ"/started-* "$TQ/sync.log"
   : > "$TQ/gh.log"; : > "$TQ/created.log"; : > "$TQ/npm.log"; : > "$TQ/claude.log"
 }
 # code_reviews / test_reviews: the review sessions claude.log shows since the last reset
@@ -449,6 +455,72 @@ done
 stop_runner INT stopINT2
 assert "INT: the sessions ended before the runner" test -z "$alive_at_exit"
 rm -f "$RQ"/running/*
+
+# --- the judge: rules on the reviews that need changes; only its confirmed findings go to the agent ---
+# judge_line: what the judge session was given, since the last reset
+judge_line() { grep '^judge ' "$TQ/claude.log"; }
+reset_pr; echo "needs changes" > "$TQ/verdict"; echo ready > "$TQ/judge_verdict"; mkwt falsealarm
+Q add "$TMP/wt-falsealarm" fix "False alarm" >/dev/null; out="$(Q run)"
+assert_contains "judge: runs on a review that needs changes" "$(judge_line)" "Reviews to judge (read each with cat): $PR_QUEUE_DIR/reviews/fix-falsealarm-"
+assert_not_contains "judge: not given the ready test review" "$(judge_line)" "-tests.md"
+assert_contains "judge: nothing to fix, says so" "$out" "the judge found nothing to fix (judge: $PR_QUEUE_DIR/reviews/fix-falsealarm-"
+assert "judge: nothing to fix, e2e runs"     test -s "$TQ/npm.log"
+assert_contains "judge: nothing to fix, merged" "$out" "MERGED fix/falsealarm"
+
+reset_pr; echo "needs changes" > "$TQ/verdict"; echo "needs changes" > "$TQ/tests_verdict"; mkwt real
+Q add "$TMP/wt-real" fix "Real" >/dev/null; out="$(Q run)"
+assert_contains "judge: given both reviews"  "$(judge_line)" "-medium-notests.md $PR_QUEUE_DIR/reviews/fix-real-"
+assert_contains "judge: confirmed changes fail the job" "$out" "; the judge confirmed changes to make (judge: $PR_QUEUE_DIR/reviews/fix-real-"
+assert_contains "judge: names its file"      "$out" "-judge.md)"
+assert "judge: confirmed changes, no e2e"    test ! -s "$TQ/npm.log"
+assert "judge: confirmed changes, no PR"     test ! -s "$TQ/created.log"
+assert "judge: confirmed changes, job in failed/" in_failed real
+# A second judged round with changes to make goes to the user.
+echo second >> "$TMP/wt-real/real.txt"; git -C "$TMP/wt-real" commit -q -am second
+: > "$TQ/claude.log"; Q add "$TMP/wt-real" fix "Real" >/dev/null; out="$(Q run)"
+assert_contains "judge: two judged rounds need the user" "$out" \
+  "FAILED fix/real: needs your decision: the branch still had changes to make after two judged rounds (judge: $PR_QUEUE_DIR/reviews/fix-real-"
+assert "judge: two rounds, no PR"            test ! -s "$TQ/created.log"
+
+reset_pr; echo "needs changes" > "$TQ/verdict"; echo escalate > "$TQ/judge_verdict"; mkwt critical
+Q add "$TMP/wt-critical" fix "Critical" >/dev/null; out="$(Q run)"
+assert_contains "judge: an escalation needs the user" "$out" \
+  "FAILED fix/critical: needs your decision: the judge rejected a finding that would be critical if real (judge: $PR_QUEUE_DIR/reviews/fix-critical-"
+assert "judge: escalation, no e2e"           test ! -s "$TQ/npm.log"
+assert "judge: escalation, job in failed/"   in_failed critical
+
+# No judge when a review didn't run, or with PR_QUEUE_JUDGE=0.
+reset_pr; echo garbage > "$TQ/verdict"; echo "needs changes" > "$TQ/tests_verdict"; mkwt halfrun
+Q add "$TMP/wt-halfrun" fix "Half run" >/dev/null; out="$(Q run)"
+assert "judge: not when a review didn't run" test -z "$(judge_line)"
+assert_contains "judge: that review named"   "$out" "FAILED fix/halfrun: the review didn't run"
+assert_contains "judge: and the other's findings" "$out" "; the test review found changes to make (test review: $PR_QUEUE_DIR/reviews/fix-halfrun-"
+reset_pr; echo "needs changes" > "$TQ/verdict"; mkwt plain
+Q add "$TMP/wt-plain" fix "Plain" >/dev/null; out="$(PR_QUEUE_JUDGE=0 Q run)"
+assert "PR_QUEUE_JUDGE=0: no judge"          test -z "$(judge_line)"
+assert_contains "PR_QUEUE_JUDGE=0: the review fails the job" "$out" "FAILED fix/plain: the review found changes to make (review: "
+assert_not_contains "PR_QUEUE_JUDGE=0: no judging" "$out" "judging"
+assert_not_contains "PR_QUEUE_JUDGE=0: no judgement named" "$out" "judge:"
+out="$(PR_QUEUE_JUDGE=maybe Q run)";         assert_contains "run: bad PR_QUEUE_JUDGE refused" "$out" "PR_QUEUE_JUDGE must be 0"
+
+# A TERM to the runner's process group while the judge works stops the judge's session too.
+reset_pr; rm -rf "$TQ/hung" "$TQ/tmp"; mkdir -p "$TQ/tmp"; echo "needs changes" > "$TQ/verdict"; touch "$TQ/judge_hang"; mkwt stopjudge
+Q add "$TMP/wt-stopjudge" fix "Stop judge" >/dev/null
+PATH="$TQ/bin:$PATH" TMPDIR="$TQ/tmp" python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+  bash "$ROOT/scripts/pr-queue.sh" run </dev/null >/dev/null 2>&1 &
+rpid=$!
+for _ in $(seq 100); do [ -s "$TQ/hung" ] && break; sleep 0.1; done
+assert "judge stopped: the judge's session started" test -s "$TQ/hung"
+t0=$SECONDS; kill -TERM -- "-$rpid"; { wait "$rpid"; } 2>/dev/null
+for _ in $(seq 100); do
+  if gone "$(cat "$TQ/hung")" && [ -z "$(ls -A "$TQ/tmp")" ] && flock -n "$RQ/run.lock" true; then break; fi
+  sleep 0.1
+done
+assert "judge stopped: its session ended"    gone "$(cat "$TQ/hung")"
+assert "judge stopped: at once, not after the session's 30 s" test $((SECONDS - t0)) -lt 10
+assert "judge stopped: no temp files left"   test -z "$(ls -A "$TQ/tmp")"
+assert "judge stopped: the job stayed in running/" test -n "$(find "$RQ/running" -name '*stopjudge.job')"
+rm -f "$TQ/judge_hang" "$RQ"/running/*
 
 # --- a job left in running/ by a dead runner goes to failed/ ---
 printf 'worktree=/x\nbranch=fix/dead\n' > "$RQ/running/1-fix-dead.job"

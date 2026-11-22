@@ -390,14 +390,16 @@ rm "$STUB/hook"
 out="$(rv --judge "$W" "$TMP/code-review.md" "$TMP/test-review.md")"
 assert_contains "judge: ready commit not judged again" "$out" "already judged as ready"
 assert "judge: no second session"             test ! -f "$STUB/args"
-# Only on the same reviews: other review files, or a review that changed, are judged again.
-out="$(rv --judge "$W" "$TMP/code-review.md")"
-assert "judge: other reviews are judged"      test -f "$STUB/args"
-echo "2. important: a.js:9: a new finding." >> "$TMP/code-review.md"
+# Only on the same reviews: other review files are judged again. The same file with new text (a review run
+# again, as the queue does after a failed e2e run) isn't.
 out="$(cd "$TMP" && rv --judge "$W" code-review.md)"
-assert "judge: a changed review is judged"    test -f "$STUB/args"
+assert "judge: other reviews are judged"      test -f "$STUB/args"
 assert_contains "judge: a relative path given as absolute" "$(cat "$STUB/args")" \
   "Reviews to judge (read each with cat): $(readlink -f "$TMP")/code-review.md"
+echo "2. important: a.js:9: a new finding." >> "$TMP/code-review.md"
+out="$(rv --judge "$W" "$TMP/code-review.md")"
+assert_contains "judge: the same review run again isn't judged again" "$out" "already judged as ready"
+assert "judge: and starts no session"         test ! -f "$STUB/args"
 
 # A judgement that needs changes; then, on the next commit, an escalation; then a second round of changes.
 # Rulings of commits HEAD doesn't descend from don't count: another repo's branch of the same name (a commit
@@ -441,6 +443,16 @@ commit 23; printf 'Verdict: escalate\n' > "$STUB/result"
 assert_contains "escalate from a code review -> exit 2" "$(rv "$W")" "exit=2"
 printf 'Verdict: failed\n' > "$STUB/result"
 assert_contains "judge: failed -> exit 2"     "$(rv --judge "$W" "$TMP/code-review.md")" "exit=2"
+failed="$REVIEW_DIR/feat-notes-$sha-judge.md"
+# Only an earlier "needs changes" makes a second round, not an escalation (commit 21) or a judge that failed
+# (commit 23): the two rulings that needed changes (commits 20 and 22) are set aside for this.
+mkdir "$TMP/aside"; mv "$first" "$REVIEW_DIR/feat-notes-$(git -C "$W" rev-parse --short=12 HEAD~1)-judge.md" "$TMP/aside/"
+commit 24; printf 'To fix: 1\nVerdict: needs changes\n' > "$STUB/result"
+out="$(rv --judge "$W" "$TMP/code-review.md")"
+assert_contains "judge: an earlier escalation or failure is no first round" "$out" "exit=1"
+assert_contains "judge: though the escalation is given" "$(cat "$STUB/args")" "$escalated"
+assert_contains "judge: and the failed one"   "$(cat "$STUB/args")" "$failed"
+mv "$TMP/aside"/* "$REVIEW_DIR/"
 assert_contains "judge: a missing review file" "$(rv --judge "$W" "$TMP/nope.md")" "no such review file: $TMP/nope.md"
 assert_contains "judge: needs a review file"  "$(rv --judge "$W")" "usage: review.sh"
 cp "$ROOT/scripts/review.sh" "$TMP/bare/"

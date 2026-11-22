@@ -33,8 +33,8 @@
 # and exits 0, or 2 if it didn't run.
 # A judge gets the review files (the ones that need changes) and the branch's earlier judgements, decides for
 # each blocking finding whether it is real and worth fixing, and lists what the agent must fix. It is saved
-# as <branch>-<sha>-judge.md, with a hash of the reviews it judged; a commit already judged ready on the same
-# reviews isn't judged again. Its last verdict line is "ready" (exit 0: nothing to fix), "needs changes" (exit
+# as <branch>-<sha>-judge.md, with the paths of the reviews it judged; a commit already judged ready on the same
+# reviews (the same kinds, at the same level) isn't judged again. Its last verdict line is "ready" (exit 0: nothing to fix), "needs changes" (exit
 # 1: the To fix list goes to the agent) or "escalate" (exit 3: it rejected a finding that would be critical if
 # real, and the user decides). "Needs changes" in a second judgement of the branch (the judgement of a commit
 # HEAD descends from needed changes too) also exits 3: after two judged rounds the user decides, not the queue
@@ -183,8 +183,9 @@ in your system prompt, otherwise \"Verdict: ready\". If the skill is not availab
     ;;
   judge)
     out="$base-judge.md"
-    # The reviews it judges (their paths and contents): a ready judgement counts only for the same ones.
-    judged="Judged reviews: $(sha256sum -- "${reviews[@]}" | sha256sum | cut -d' ' -f1)"
+    # The reviews it judges, by path (a review's path holds its commit, level and kind): a ready judgement
+    # counts only for the same ones. Not by content: a review run again always has new text (its cost and time).
+    judged="Judged reviews: $(printf '%s\n' "${reviews[@]}" | sort | paste -sd' ')"
     if [ "$(verdict "$out")" = ready ] && grep -qxF "$judged" "$out"; then
       cat "$out"; echo "already judged as ready"; echo "(saved to $out)"; exit 0
     fi

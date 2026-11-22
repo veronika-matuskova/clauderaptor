@@ -45,7 +45,8 @@ INSERT INTO jobs (job_id, repo, branch, round, ended, outcome, fail_reason) VALU
  ('f6', 'app', 'feat/six', 1, '2026-10-27T09:00:00.000Z', 'failed', 'conflict'),
  ('e7', 'app', '<script>alert(1)</script>\"><img src=x onerror=alert(1)>', 1, '2026-10-27T10:00:00.000Z', 'escalated', 'judge'),
  ('r8', 'app', 'feat/six', NULL, '2026-10-27T11:00:00.000Z', 'replaced', 'replaced'),
- ('e9', 'app', 'feat/esc-old', 1, '2026-10-20T10:00:00.000Z', 'escalated', 'judge');
+ ('e9', 'app', 'feat/esc-old', 1, '2026-10-20T10:00:00.000Z', 'escalated', 'judge'),
+ ('q10', 'app', 'feat/queued', 1, NULL, NULL, NULL);
 WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i WHERE n < 5)
 INSERT INTO reviews (id, repo, kind, level, verdict, cost_usd, mut_tried, mut_caught, finished)
  SELECT 'cm' || n, 'app', 'code', 'medium', CASE n WHEN 1 THEN 'ready' ELSE 'needs changes' END, 0.5, NULL, NULL,
@@ -90,11 +91,12 @@ assert_contains "mutation kill rate" "$T" "40 of 50 mutants caught: 80% (n=50)"
 assert_contains "cost per kind/level and per ready verdict" "$T" "code high 5 \$6.00 \$1.20 100% (n=5) \$1.20"
 assert_contains "cost per ready: few ready, high cost each" "$T" "code medium 5 \$2.50 \$0.50 20% (n=5) \$2.50"
 assert_contains "a share below $((5)) is not enough data" "$T" "suite – 1 \$9.00 \$9.00 not enough data (n=1)"
-assert_contains "by repo" "$T" "app 7 3 not enough data (n=3) 1 4 \$5.10"
+assert_contains "by repo: finished rounds only, not the queued job" "$T" "app 7 3 not enough data (n=3) 1 4 \$5.10"
+assert_contains "the timeline counts the same finished rounds" "$T" "Rounds per day n=11"
 assert_contains "weekly trends with 4 weeks" "$T" "Week of Rounds Merged First-pass yield Review cost 2026-10-05 1 1 not enough data (n=1) – 2026-10-12 1 1 not enough data (n=1) – 2026-10-19 2 1 not enough data (n=1) – 2026-10-26 7 2 not enough data (n=2) \$11.10"
 assert_contains "rounds per day" "$T" "2026-10-26 5 2"
 assert_contains "queue review cost per day, no suite audits" "$T" "2026-10-27 \$8.60 12"
-assert_contains "data note: row counts" "$T" "jobs 12 reviews 18 findings 24"
+assert_contains "data note: row counts" "$T" "jobs 13 reviews 18 findings 24"
 assert_contains "data note: stays on this machine" "$T" "The data stays on this machine"
 assert_contains "transcript tables missing: no table yet" "$T" "sessions no table yet"
 

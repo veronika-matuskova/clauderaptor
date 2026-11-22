@@ -508,7 +508,7 @@ def s_timeline(db):
 def s_repos(db):
     rows = db.q("SELECT ifnull(repo, '(unknown)'), COUNT(*), SUM(outcome = 'merged'), "
                 "SUM(outcome = 'merged' AND round = 1), SUM(outcome IN ('failed', 'escalated')) "
-                "FROM jobs WHERE round IS NOT NULL GROUP BY 1 ORDER BY 1")
+                "FROM jobs WHERE round IS NOT NULL AND ended IS NOT NULL GROUP BY 1 ORDER BY 1")  # finished rounds
     cost = dict(db.q("SELECT ifnull(repo, '(unknown)'), SUM(cost_usd) FROM reviews WHERE kind IN %s GROUP BY 1"
                      % QUEUE_KINDS))
     med = {}

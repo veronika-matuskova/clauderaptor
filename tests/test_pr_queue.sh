@@ -414,10 +414,16 @@ reset_pr; printf 'none\npending\npass\n' > "$TQ/checks_seq"; mkwt slow
 Q add "$TMP/wt-slow" fix "Slow" >/dev/null; out="$(Q run)"
 assert_contains "slow checks: merged"        "$out" "MERGED fix/slow"
 assert "slow checks: polled until done"      test "$(grep -c '^pr checks' "$TQ/gh.log")" -ge 4
+# none, pending, pass, pass: polls counts every poll (4), not the passing ones (2).
+assert_contains "events: slow checks, every poll counted" \
+  "$(ev fix/slow 'one("checks_finished")["result"], one("checks_finished")["polls"]')" "('pass', $(grep -c '^pr checks' "$TQ/gh.log"))"
+assert_contains "events: slow checks, 4 polls" "$(ev fix/slow 'one("checks_finished")["polls"]')" "4"
 reset_pr; printf 'pass\npending\npass\n' > "$TQ/checks_seq"; mkwt late
 Q add "$TMP/wt-late" fix "Late" >/dev/null; out="$(Q run)"
 assert_contains "late check: waited for it"  "$out" "MERGED fix/late"
 assert "late check: polled after the pending" test "$(grep -c '^pr checks' "$TQ/gh.log")" -ge 4
+assert_contains "events: late check, every poll counted" \
+  "$(ev fix/late 'one("checks_finished")["result"], one("checks_finished")["polls"]')" "('pass', $(grep -c '^pr checks' "$TQ/gh.log"))"
 reset_pr; echo cancel > "$TQ/checks_seq"; mkwt cancel
 Q add "$TMP/wt-cancel" fix "Cancel" >/dev/null; out="$(Q run)"
 assert_contains "cancelled check: failed"    "$out" "checks failed on #7: Checks"

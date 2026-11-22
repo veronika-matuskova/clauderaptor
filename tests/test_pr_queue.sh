@@ -82,7 +82,7 @@ EOF
 # claude -p (run by review.sh): logs "code <prompt>" for a code review, "tests <first line>" for a test review,
 # "judge <its reviews line>" for a judge, and reports the verdict in $TQ/verdict, $TQ/tests_verdict (default
 # ready) or $TQ/judge_verdict (default needs changes). $TQ/claude_fail makes them all fail.
-# With $TQ/sync, each session waits up to 5 s for the other one to start, and logs in sync.log if it did.
+# With $TQ/sync, each session waits up to 30 s for the other one to start, and logs in sync.log if it did.
 # With $TQ/hang, each session logs its pid in $TQ/hung and hangs for 30 s; on TERM it takes 0.5 s to end.
 # $TQ/judge_hang does the same for a judge only.
 cat > "$TQ/bin/claude" <<'EOF'
@@ -101,7 +101,7 @@ if [ "$kind" = judge ] && [ -f "$TQ/judge_hang" ]; then trap 'sleep 0.5; exit 1'
 if [ -f "$TQ/hang" ]; then trap 'sleep 0.5; exit 1' TERM; echo "$$" >> "$TQ/hung"; sleep 30; fi
 if [ -f "$TQ/sync" ] && [ -n "$other" ]; then
   touch "$TQ/started-$kind"
-  for _ in $(seq 50); do
+  for _ in $(seq 300); do
     if [ -f "$TQ/started-$other" ]; then echo "$kind saw $other" >> "$TQ/sync.log"; break; fi
     sleep 0.1
   done
@@ -150,6 +150,17 @@ test_reviews() { grep '^tests ' "$TQ/claude.log"; }
 in_done() { test -n "$(find "$RQ/done" -name "*$1.job")"; }
 # shellcheck disable=SC2329
 in_failed() { test -n "$(find "$RQ/failed" -name "*$1.job")"; }
+# hold <lock file>: holds the lock in the background until release (at most 60 s), and returns once it is held
+# (at most 30 s), so that what runs next finds it held however slow the machine is.
+hold() {
+  rm -f "$TQ/held" "$TQ/release"
+  # shellcheck disable=SC2016  # expands in the holder
+  flock "$1" bash -c 'touch "$1"; for _ in $(seq 1200); do [ -e "$2" ] && break; sleep 0.05; done' _ "$TQ/held" "$TQ/release" &
+  HOLDER=$!
+  for _ in $(seq 600); do [ -e "$TQ/held" ] && break; sleep 0.05; done
+}
+# release: ends the hold, and waits until the lock is free.
+release() { touch "$TQ/release"; wait "$HOLDER"; }
 # Stats events (events.sh) go to the default file, $PR_QUEUE_DIR/events.jsonl.
 unset STATS_EVENTS STATS_EVENTS_FILE
 EVENTS="$PR_QUEUE_DIR/events.jsonl"
@@ -547,15 +558,16 @@ assert_not_contains "events: left open, not merged" "$(ev fix/open 'names()')" "
 reset_pr; mkwt e2ewait
 Q add --review none --tests none "$TMP/wt-e2ewait" fix "E2e wait" >/dev/null
 # The lock is held until the job's e2e_waiting is in the events file (at most 30 s), and 1 s more, in which an
-# e2e_started (sent without the lock) is noted in $TQ/started_early. Then it is released; the time of the release
-# (ms, as in ts) goes to $TQ/released. The queue can't send e2e_started while the lock is held, so no load makes
-# this fail: the 1 s only bounds how soon an e2e_started sent too early shows up.
+# e2e_started (sent without the lock) is noted in $TQ/started_early. Then it is released; the number of lines the
+# events file had at the release goes to $TQ/released. The queue can't send e2e_started while the lock is held,
+# so no load makes this fail: the 1 s only bounds how soon an e2e_started sent too early shows up. The order is
+# read from the file's lines, not from clock times: a clock can step back between two events (one did on CI).
 rm -f "$TQ/released" "$TQ/started_early"
 # shellcheck disable=SC2016  # expands in the holder
 flock "$PR_QUEUE_DIR/e2e.lock" bash -c 'seen() { grep "\"branch\":\"fix/e2ewait\"" "$1" 2>/dev/null | grep -q "\"event\":\"$2\""; }
   for _ in $(seq 600); do seen "$1" e2e_waiting && break; sleep 0.05; done
   for _ in $(seq 20); do seen "$1" e2e_started && { touch "$3"; break; }; sleep 0.05; done
-  date +%s%3N > "$2"' _ "$EVENTS" "$TQ/released" "$TQ/started_early" &
+  wc -l < "$1" > "$2"' _ "$EVENTS" "$TQ/released" "$TQ/started_early" &
 for _ in $(seq 600); do flock -n "$PR_QUEUE_DIR/e2e.lock" true || break; sleep 0.05; done   # until it is held
 out="$(Q run)"; wait
 assert_contains "events: waited, then merged" "$out" "MERGED fix/e2ewait"
@@ -564,10 +576,10 @@ assert_contains "events: clean when main is in" "$(ev fix/e2ewait 'one("main_mer
 assert_contains "events: --review/--tests none queued" "$(ev fix/e2ewait 'one("job_queued")["review"], one("job_queued")["tests"]')" "('none', 'none')"
 assert "events: the lock was released after e2e_waiting" test -s "$TQ/released"
 assert "events: no e2e_started while the lock was held" test ! -e "$TQ/started_early"
-# ts (ms) of an event, in ms since the epoch, against the release: e2e_waiting before it, e2e_started after.
-ms='(lambda r: round(__import__("datetime").datetime.fromisoformat(r["ts"].replace("Z", "+00:00")).timestamp() * 1000))'
+# The line of an event in the file, against the lines at the release: e2e_waiting among them, e2e_started after.
+line_of='(lambda e: [i for i, l in enumerate(open(sys.argv[1]), 1) if json.loads(l) == one(e)][0])'
 assert_contains "events: e2e_waiting while the lock was held, e2e_started once it was free" \
-  "$(ev fix/e2ewait "($ms(one('e2e_waiting')) <= $(cat "$TQ/released"), $ms(one('e2e_started')) >= $(cat "$TQ/released"))")" "(True, True)"
+  "$(ev fix/e2ewait "($line_of('e2e_waiting') <= $(cat "$TQ/released"), $line_of('e2e_started') > $(cat "$TQ/released"))")" "(True, True)"
 
 # --- an events path the queue can't write to changes no outcome ---
 mkdir -p "$TMP/evdir"
@@ -777,10 +789,10 @@ git -C "$R" worktree prune; rm -f "$TQ/kill_rm" "$TQ/kill_job"
 
 # --- one runner at a time per repo, and the lock command ---
 reset_pr; mkwt busy2; Q add "$TMP/wt-busy2" fix "Busy" >/dev/null
-flock "$RQ/run.lock" sleep 2 & sleep 0.3
+hold "$RQ/run.lock"
 out="$(Q run)";                              assert_contains "second runner exits" "$out" "repo: a runner is already working on the queue"
 assert "second runner: the job stays queued" test -n "$(find "$RQ/queue" -name '*busy2.job')"
-wait; rm -f "$RQ"/queue/*
+release; rm -f "$RQ"/queue/*
 
 # --- each repo has its own queue ---
 # R2: a second main checkout (a clone of the same origin, so the stubs work), with its own queue. Its jobs fail at
@@ -801,9 +813,9 @@ out="$(Q status)"
 assert_contains "repos: status shows each repo" "$out" "repo2 ($R2):"
 assert_contains "repos: and its jobs"        "$out" "fix/two"
 # A runner busy on one repo doesn't hold up another repo's jobs.
-flock "$RQ/run.lock" sleep 3 & sleep 0.3
+hold "$RQ/run.lock"
 out="$(PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 Q run)"; touch "$TQ/e2e_fail"
-wait
+release
 assert_contains "repos: the busy repo is skipped" "$out" "repo: a runner is already working on the queue"
 assert_contains "repos: and named at the end, once" "$out" "jobs left in the queue of: repo (see above)"
 assert_contains "repos: the other repo's job ran" "$out" "fix/two"
@@ -943,7 +955,8 @@ for sig in INT TERM HUP; do
   PR_QUEUE_POLL=30 PATH="$TQ/bin:$PATH" TMPDIR="$TQ/tmp" python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
     bash "$ROOT/scripts/queue/pr-queue.sh" run </dev/null >/dev/null 2>&1 &
   rpid=$!
-  for _ in $(seq 100); do [ "$(wc -l 2>/dev/null < "$TQ/hung")" = 4 ] && break; sleep 0.1; done
+  # Up to 30 s: with another suite running at the same time (a second checkout), 10 s was once not enough.
+  for _ in $(seq 300); do [ "$(wc -l 2>/dev/null < "$TQ/hung")" = 4 ] && break; sleep 0.1; done
   assert "several repos, $sig: all four sessions started" test "$(wc -l < "$TQ/hung")" = 4
   t0=$SECONDS
   if [ "$sig" = INT ]; then kill -INT -- "-$rpid"; else kill -"$sig" "$rpid"; fi
@@ -965,11 +978,11 @@ mkdir -p "$PR_QUEUE_DIR/queue" "$PR_QUEUE_DIR/running" "$PR_QUEUE_DIR/failed" "$
 old_branch_job "$TMP/wt-old" fix/old > "$PR_QUEUE_DIR/queue/1-fix-old.job"; echo body > "$PR_QUEUE_DIR/queue/1-fix-old.body"
 old_branch_job "$TMP/wt-old" fix/old > "$PR_QUEUE_DIR/running/2-fix-old.job"
 old_branch_job "$TMP/gone" fix/gone > "$PR_QUEUE_DIR/failed/3-fix-gone.job"
-flock "$PR_QUEUE_DIR/run.lock" sleep 2 & sleep 0.3
+hold "$PR_QUEUE_DIR/run.lock"
 out="$(Q status)"
 assert_contains "old queue: kept while an old runner works on it" "$out" "a runner of the old version still works"
 assert "old queue: not moved yet"            test -f "$PR_QUEUE_DIR/queue/1-fix-old.job"
-wait
+release
 out="$(Q status)"
 assert "old queue: a job to its repo's queue" test -f "$RQ/queue/1-fix-old.job"
 assert "old queue: with its body"            test -f "$RQ/queue/1-fix-old.body"
@@ -993,12 +1006,12 @@ assert_contains "old queue: run moves its jobs and runs them" "$out" "FAILED fix
 assert "old queue: run moved it"             test ! -e "$PR_QUEUE_DIR/queue"
 # While a runner of the old version holds the old lock, `run` refuses: it could run a second job of a repo.
 reset_pr; mkwt oldlock; Q add "$TMP/wt-oldlock" fix "Old lock" >/dev/null
-flock "$PR_QUEUE_DIR/run.lock" sleep 2 & sleep 0.3
+hold "$PR_QUEUE_DIR/run.lock"
 out="$(Q run)"; rc=$?
 assert_contains "old runner: run refuses"    "$out" "a runner of the old version (one queue for all repos) is still working"
 assert "old runner: exits with an error"     test "$rc" = 1
 assert "old runner: the job stays queued"    test -n "$(find "$RQ/queue" -name '*oldlock.job')"
-wait; rm -f "$RQ"/queue/*
+release; rm -f "$RQ"/queue/*
 out="$(Q lock echo hi)";                     assert_contains "lock runs the command" "$out" "hi"
 out="$(Q bogus)";                            assert_contains "usage on a bad command" "$out" "pr-queue.sh add"
 

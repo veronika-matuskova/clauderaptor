@@ -1,18 +1,20 @@
 # shellcheck shell=bash
-# Tests for scripts/stats/stats.py ingest: synthetic queue state (events, review files, sidecars, results.log) made in
+# Tests for apps/stats/stats.py ingest: synthetic queue state (events, review files, sidecars, results.log) made in
 # the temp dir, ingested into a db there.
 # shellcheck source=tests/lib.sh
 source "$(dirname "$0")/lib.sh"
 
-ST="$ROOT/scripts/stats/stats.py"
+ST="$ROOT/apps/stats/stats.py"
 export TZ=UTC PR_QUEUE_DIR="$TMP/state"
 unset REVIEW_DIR STATS_EVENTS_FILE CLAUDERAPTOR_STATS_DIR
-export XDG_STATE_HOME="$TMP/xdg"
+export XDG_STATE_HOME="$TMP/xdg" HOME="$TMP/home"
+unset CLAUDE_CONFIG_DIR
 R="$PR_QUEUE_DIR/reviews"; EV="$PR_QUEUE_DIR/events.jsonl"
 mkdir -p "$R" "$PR_QUEUE_DIR/repos/app" "$PR_QUEUE_DIR/repos/tool/failed" "$TMP/out"
 DB="$TMP/out/stats.db"
 
-ingest() { python3 -I -B "$ST" ingest --db "${1:-$DB}" 2>&1; }
+# Transcripts from $PROJ (an empty folder unless a test sets it), never the real ~/.claude.
+ingest() { python3 -I -B "$ST" ingest --db "${1:-$DB}" --projects "${PROJ:-$TMP/noprojects}" 2>&1; }
 # q <sql>: the rows, one per line, columns joined by |
 q() {
   python3 -I -B -c 'import sqlite3, sys
@@ -283,9 +285,9 @@ assert_contains "a review is linked to the next round of its branch after it" \
 assert_contains "results.log times are local" "$(TZ=Europe/Prague py 'print(s.local_ts("2026-01-01 10:00:00"))')" "2026-01-01T09:00:00.000Z"
 assert_contains "a review named in a FAILED line is linked to that round" \
   "$(q "SELECT r.repo, j.fail_reason FROM reviews r JOIN jobs j ON j.job_id = r.job_id WHERE r.id = 'feat-a-111111111111-medium-notests.md'")" "app|review_code"
-out="$(py 'print(" ".join(s.fail_reason(x) for x in ["the test review found changes to make (test review: f)", "the review found changes to make; the test review found changes to make", "the review didn'"'"'t run: x", "git push failed", "checks failed on #1: t", "#4 does not show abc as its head", "the full e2e suite failed", "no local e2e pass recorded for a", "f got commits after the review; queue it again", "worktree /w is gone", "/w is no longer on feat/x", "uncommitted changes in /w", "merging #2 failed", "something new"]))')"
+out="$(py 'print(" ".join(s.fail_reason(x) for x in ["the test review found changes to make (test review: f)", "the review found changes to make; the test review found changes to make", "the review didn'"'"'t run: x", "git push failed", "checks failed on #1: t", "no checks reported on #5 after 600s", "#4 does not show abc as its head", "the full e2e suite failed", "no local e2e pass recorded for a", "f got commits after the review; queue it again", "worktree /w is gone", "/w is no longer on feat/x", "uncommitted changes in /w", "merging #2 failed", "something new"]))')"
 assert_contains "failure texts map to the events' reasons" "$out" \
-  "review_tests review_code review_error push checks_failed head e2e no_e2e_pass moved not_ready not_ready not_ready merge other"
+  "review_tests review_code review_error push checks_failed checks_timeout head e2e no_e2e_pass moved not_ready not_ready not_ready merge other"
 
 echo "-- idempotent"
 snap() { q "SELECT (SELECT COUNT(*) FROM events_raw), (SELECT COUNT(*) FROM jobs), (SELECT COUNT(*) FROM reviews), (SELECT COUNT(*) FROM findings), (SELECT group_concat(job_id || round || ifnull(outcome,''), ',') FROM (SELECT * FROM jobs ORDER BY job_id)), (SELECT group_concat(id || ifnull(job_id,'') || ifnull(cost_usd,''), ',') FROM (SELECT * FROM reviews ORDER BY id))"; }
@@ -311,7 +313,7 @@ assert_contains "judge rulings: confirmed" "$got" "confirmed|2|0.5|0.5"
 assert_contains "judge rulings: downgraded" "$got" "downgraded|1|0.25|0.5"
 assert_contains "judge rulings: rejected" "$got" "rejected|1|0.25|0.5"
 assert_contains "cost by kind and level" "$(q "SELECT kind, level, reviews, cost_usd FROM v_cost_by_kind_level WHERE kind = 'code' AND level = 'high'")" "code|high|1|1.3"
-assert "schema version recorded once" test "$(q "SELECT COUNT(*) || ':' || MAX(version) FROM schema_version")" = "1:3"
+assert "schema version recorded once" test "$(q "SELECT COUNT(*) || ':' || MAX(version) FROM schema_version")" = "1:5"
 
 echo "-- a version 1 db is migrated"
 DB2="$TMP/out/v1.db"
@@ -334,7 +336,7 @@ d = sqlite3.connect(sys.argv[2])
 c.executemany("INSERT INTO ingest_state VALUES (?, ?, ?, ?, ?)", d.execute("SELECT * FROM ingest_state"))
 c.commit()' "$DB2" "$DB"
 ingest "$DB2" >/dev/null
-assert "migrated: version 3" test "$(q "SELECT group_concat(version) FROM schema_version")" = 3
+assert "migrated: version 5" test "$(q "SELECT group_concat(version) FROM schema_version")" = 5
 assert "migrated: jobs.found added and filled" test "$(q "SELECT COUNT(*) FROM jobs WHERE found = 'code,tests'")" -eq 1
 assert "migrated: review files read again, rulings filled" test "$(q "SELECT COUNT(*) FROM findings WHERE ruling = 'confirmed'")" -eq 2
 assert "migrated: tests_skipped filled" test "$(q "SELECT tests_skipped FROM reviews WHERE id = 'feat-c-444444444444-low.md'")" = 1
@@ -407,6 +409,520 @@ assert_contains "rounds to merge leave it out" "$(q "SELECT rounds FROM v_rounds
 F3="$(q "SELECT group_concat(fail_reason || ':' || failures) FROM (SELECT * FROM v_failures_by_reason ORDER BY fail_reason)")"
 assert "failure counts leave it out, and count an escalated job" test "$F3" = "judge:1,review_code:1"
 unset DB2
+
+echo "-- transcripts: synthetic sessions of each role"
+S4="$TMP/state4"; R4="$S4/reviews"; PROJ="$TMP/projects"; DB2="$TMP/out/tokens.db"
+mkdir -p "$R4" "$S4/repos/app" "$PROJ/-home-u-code-app" "$PROJ/-home-u-code-other-repos-wrong/s-agent/subagents"
+CANARY="CANARY-SECRET-7f3a91"
+WT=/home/u/code/app/repos/app-feat-x
+# line <ts> [<msg_id> <model> <in> <out> <cache_w> <cache_w_1h> <cache_r>]: a transcript line of session $SID
+# with $EP, $CWD and $BR; with a message id, an assistant message with that usage and secret content.
+line() {
+  if [ $# -eq 1 ]; then
+    printf '{"type":"user","sessionId":"%s","timestamp":"%s","entrypoint":"%s","cwd":"%s","gitBranch":"%s","message":{"role":"user","content":"%s prompt"}}\n' \
+      "$SID" "$1" "$EP" "$CWD" "$BR" "$CANARY"
+  else
+    printf '{"type":"assistant","sessionId":"%s","timestamp":"%s","entrypoint":"%s","cwd":"%s","gitBranch":"%s","isSidechain":false,"message":{"id":"%s","model":"%s","role":"assistant","content":[{"type":"text","text":"%s answer"}],"usage":{"input_tokens":%s,"output_tokens":%s,"cache_creation_input_tokens":%s,"cache_read_input_tokens":%s,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":%s},"service_tier":"standard"}}}\n' \
+      "$SID" "$1" "$EP" "$CWD" "$BR" "$2" "$3" "$CANARY" "$4" "$5" "$6" "$8" "$7"
+  fi
+}
+O=claude-opus-5-5
+# The agent, in a worktree, though its transcripts' folder name points elsewhere: linked by cwd, not that name.
+SID=s-agent EP=sdk-cli CWD="$WT/src" BR=feat/x
+{ line 2026-11-10T10:00:00.000Z
+  # one message streamed in three chunks that repeat its usage: counted once
+  line 2026-11-10T10:00:01.000Z m1 $O 1000000 100000 200000 100000 1000000
+  line 2026-11-10T10:00:02.000Z m1 $O 1000000 100000 200000 100000 1000000
+  line 2026-11-10T10:00:03.000Z m1 $O 1000000 100000 200000 100000 1000000
+  printf '{"type":"session-owner","sessionId":"s-agent","accountUuid":"CANARY-ACCT-1111","organizationUuid":"CANARY-ORG-2222"}\n'
+  line 2026-11-10T10:30:00.000Z; } > "$PROJ/-home-u-code-other-repos-wrong/s-agent.jsonl"
+SID=s-agent EP=sdk-cli CWD="$WT" BR=feat/x
+{ line 2026-11-10T10:05:00.000Z m2 claude-haiku-5-5 1000000 0 0 0 0; } \
+  > "$PROJ/-home-u-code-other-repos-wrong/s-agent/subagents/agent-a1.jsonl"
+SID=s-review EP=sdk-cli CWD="$WT" BR=feat/x
+line 2026-11-10T11:00:00.000Z r1 $O 10 20 30 0 40 > "$PROJ/-home-u-code-app/s-review.jsonl"
+SID=s-judge; line 2026-11-10T11:10:00.000Z j1 $O 1 2 3 0 4 > "$PROJ/-home-u-code-app/s-judge.jsonl"
+SID=s-suite; line 2026-11-10T11:20:00.000Z u1 $O 1 1 1 0 1 > "$PROJ/-home-u-code-app/s-suite.jsonl"
+# A review from before the sidecars: the sdk-cli session in a worktree that ended as it was written.
+SID=s-oldrev; { line 2026-11-10T12:00:00.000Z o1 $O 5 5 5 0 5; line 2026-11-10T12:04:00.000Z; } > "$PROJ/-home-u-code-app/s-oldrev.jsonl"
+# An agent session that was still running when a review of its branch, with no session of its own, was
+# written: it stays an agent.
+SID=s-long CWD=/home/u/code/app/repos/app-feat-w BR=feat/w
+{ line 2026-11-10T10:00:00.000Z; line 2026-11-10T14:00:00.000Z; } > "$PROJ/-home-u-code-app/s-long.jsonl"
+# Ended 2 minutes after a review of its branch was written: no review either.
+SID=s-late CWD=/home/u/code/app/repos/app-feat-v BR=feat/v
+{ line 2026-11-10T11:00:00.000Z; line 2026-11-10T12:02:00.000Z; } > "$PROJ/-home-u-code-app/s-late.jsonl"
+# A review of its branch written 301 s after it ended: past the 5 minutes, no review.
+SID=s-gap CWD=/home/u/code/app/repos/app-feat-t BR=feat/t
+{ line 2026-11-10T11:00:00.000Z; line 2026-11-10T12:00:00.000Z; } > "$PROJ/-home-u-code-app/s-gap.jsonl"
+# Two reviews of its branch written after it ended: the nearer one.
+SID=s-near CWD=/home/u/code/app/repos/app-feat-u BR=feat/u
+{ line 2026-11-10T11:00:00.000Z; line 2026-11-10T12:00:00.000Z; } > "$PROJ/-home-u-code-app/s-near.jsonl"
+SID=s-main EP=cli CWD=/home/u/code/app BR=main
+line 2026-11-10T09:00:00.000Z x1 claude-mystery-9 100 100 0 0 0 > "$PROJ/-home-u-code-app/s-main.jsonl"
+SID=s-main2 EP=cli CWD=/home/u/code/app/repos/app BR=main
+line 2026-11-10T09:00:00.000Z x2 $O 0 0 0 0 0 > "$PROJ/-home-u-code-app/s-main2.jsonl"
+SID=s-cliwt EP=cli CWD="$WT" BR=feat/x; line 2026-11-10T09:00:00.000Z > "$PROJ/-home-u-code-app/s-cliwt.jsonl"
+SID=s-tmp EP=sdk-cli CWD=/tmp/x/eval BR=main; line 2026-11-10T09:00:00.000Z > "$PROJ/-home-u-code-app/s-tmp.jsonl"
+# A worktree outside repos/, named <repo>-*.
+SID=s-side EP=sdk-cli CWD=/home/u/code/app-side BR=feat/z; line 2026-11-10T09:00:00.000Z > "$PROJ/-home-u-code-app/s-side.jsonl"
+# A session that moves on: its first cwd and branch count.
+SID=s-move EP=sdk-cli CWD="$WT" BR=feat/x
+{ line 2026-11-10T09:00:00.000Z; CWD=/tmp/z BR=main EP=cli line 2026-11-10T09:10:00.000Z; } > "$PROJ/-home-u-code-app/s-move.jsonl"
+# Subagents: a review's; one of the main session that cd's into a worktree (most of its lines there, in two
+# folders, each with fewer lines than another worktree's); one that stays in the main checkout; one whose parent has no transcript.
+mkdir -p "$PROJ/-home-u-code-app/s-review/subagents" "$PROJ/-home-u-code-app/s-main/subagents" "$PROJ/-home-u-code-app/s-ghost/subagents"
+SID=s-review EP=sdk-cli CWD="$WT" BR=feat/x
+line 2026-11-10T11:00:10.000Z r2 $O 100 0 0 0 0 > "$PROJ/-home-u-code-app/s-review/subagents/agent-r2.jsonl"
+SID=s-main EP=cli CWD=/home/u/code/app BR=main
+SM1="$PROJ/-home-u-code-app/s-main/subagents/agent-m1.jsonl"
+{ line 2026-11-10T10:10:00.000Z
+  CWD=/home/u/code/app/repos/app-feat-q BR=feat/q line 2026-11-10T10:11:00.000Z
+  CWD=/home/u/code/app/repos/app-feat-q BR=feat/q line 2026-11-10T10:11:30.000Z
+  CWD="$WT" BR=feat/x line 2026-11-10T10:12:00.000Z m3 $O 1000000 0 0 0 0
+  CWD="$WT/src" BR=feat/x line 2026-11-10T10:14:00.000Z
+  CWD="$WT" BR=feat/x line 2026-11-10T10:15:00.000Z; } > "$SM1"
+line 2026-11-10T10:20:00.000Z m4 $O 0 0 0 0 10 > "$PROJ/-home-u-code-app/s-main/subagents/agent-m2.jsonl"
+line 2026-11-10T10:20:00.000Z > "$PROJ/-home-u-code-app/s-ghost/subagents/agent-g.jsonl"
+# Only a line still being written: no session yet.
+SID=s-partial; line 2026-11-10T09:00:00.000Z | head -c 40 > "$PROJ/-home-u-code-app/s-partial.jsonl"
+printf '{"v":1,"kind":"tests","branch":"feat/x","file":"feat-x-abcabcabcabc-tests.md","session_id":"s-review","cost_usd":0.5,"finished":"2026-11-10T11:00:30.000Z"}\n' \
+  > "$R4/feat-x-abcabcabcabc-tests.json"
+printf '{"v":1,"kind":"judge","branch":"feat/x","file":"feat-x-abcabcabcabc-judge.md","session_id":"s-judge","cost_usd":0.25,"finished":"2026-11-10T11:10:30.000Z"}\n' \
+  > "$R4/feat-x-abcabcabcabc-judge.json"
+printf '{"v":1,"kind":"suite","file":"app-suite-abcabcabcabc.md","session_id":"s-suite","cost_usd":2,"finished":"2026-11-10T11:20:30.000Z"}\n' \
+  > "$R4/app-suite-abcabcabcabc.json"
+# shellcheck disable=SC2016  # literal dollar sign, not an expansion
+printf '# Review of feat/x at abcabcabcabc (/code-review medium, cost $1.00, 60 s)\nVerdict: ready\n' > "$R4/feat-x-abcabcabcabc-medium.md"
+touch -d '2026-11-10 12:04:30' "$R4/feat-x-abcabcabcabc-medium.md"
+# shellcheck disable=SC2016  # literal dollar sign, not an expansion
+printf '# Review of feat/w at dddddddddddd (/code-review medium, cost $1.00, 60 s)\nVerdict: ready\n' > "$R4/feat-w-dddddddddddd-medium.md"
+touch -d '2026-11-10 12:00:00' "$R4/feat-w-dddddddddddd-medium.md"
+# shellcheck disable=SC2016  # literal dollar sign, not an expansion
+printf '# Review of feat/v at ffffffffffff (/code-review medium, cost $1.00, 60 s)\nVerdict: ready\n' > "$R4/feat-v-ffffffffffff-medium.md"
+touch -d '2026-11-10 12:00:00' "$R4/feat-v-ffffffffffff-medium.md"
+# shellcheck disable=SC2016  # literal dollar sign, not an expansion
+printf '# Review of feat/t at 777777777777 (/code-review medium, cost $1.00, 60 s)\nVerdict: ready\n' > "$R4/feat-t-777777777777-medium.md"
+touch -d '2026-11-10 12:05:01' "$R4/feat-t-777777777777-medium.md"
+# shellcheck disable=SC2016  # literal dollar sign, not an expansion
+printf '# Review of feat/u at eeeeeeeeeeee (/code-review medium, cost $1.00, 60 s)\nVerdict: ready\n' > "$R4/feat-u-eeeeeeeeeeee-medium.md"
+touch -d '2026-11-10 12:04:00' "$R4/feat-u-eeeeeeeeeeee-medium.md"
+# shellcheck disable=SC2016  # literal dollar sign, not an expansion
+printf '# Test review of feat/u at eeeeeeeeeeee (cost $1.00, 60 s)\nVerdict: ready\n' > "$R4/feat-u-eeeeeeeeeeee-tests.md"
+touch -d '2026-11-10 12:01:00' "$R4/feat-u-eeeeeeeeeeee-tests.md"
+ev2 2026-11-10T13:00:00.000Z merged mx feat/x '"pr":1' | sed 's/"repo":"one"/"repo":"app"/' > "$S4/events.jsonl"
+out="$(PR_QUEUE_DIR="$S4" ingest "$DB2")"; rc=$?
+assert "ingest with transcripts exits 0" test "$rc" -eq 0
+assert_contains "the summary counts the transcripts" "$out" "21 transcripts read, 11 new messages"
+assert_contains "the summary names the model with no price" "$out" "no price for claude-mystery-9"
+assert_not_contains "a model with no tokens is not unpriced" "$out" "$O:"
+
+echo "-- transcripts: nothing but the allowlist is stored"
+dump="$(python3 -I -B -c 'import sqlite3, sys
+print("\n".join(sqlite3.connect(sys.argv[1]).iterdump()))' "$DB2")"
+assert_not_contains "no message content" "$dump" "$CANARY"
+assert_not_contains "no account or organization id" "$dump" "CANARY-ACCT"
+assert_not_contains "no organization id" "$dump" "CANARY-ORG"
+assert_not_contains "no cwd path" "$dump" "/home/u/code"
+assert_not_contains "no transcript folder name (it is the cwd)" "$dump" "-home-u-code"
+assert_contains "the cwd as a hash" "$(q "SELECT cwd_hash FROM sessions WHERE session_id = 's-main'")" \
+  "$(printf %s /home/u/code/app | sha256sum | cut -c1-16)"
+
+echo "-- transcripts: roles, repo and branch"
+SQ="SELECT role, ifnull(repo,''), ifnull(worktree,''), ifnull(branch,''), ifnull(parent_session,''), msgs FROM sessions WHERE session_id"
+assert_contains "sdk-cli in a worktree: agent, linked by cwd and gitBranch" "$(q "$SQ = 's-agent'")" "agent|app|app-feat-x|feat/x||1"
+assert_contains "a subagent's file: subagent, linked to its parent" "$(q "$SQ = 's-agent:agent-a1'")" "subagent|app|app-feat-x|feat/x|s-agent|1"
+assert_contains "a test review's sidecar session: review" "$(q "$SQ = 's-review'")" "review|app"
+assert_contains "a judge's sidecar session: judge" "$(q "$SQ = 's-judge'")" "judge|app"
+assert_contains "a suite audit's sidecar session: suite" "$(q "$SQ = 's-suite'")" "suite|app"
+assert_contains "no sidecar, ended as a review of its branch was written: review" \
+  "$(q "SELECT role, review_id FROM sessions WHERE session_id = 's-oldrev'")" "review|feat-x-abcabcabcabc-medium.md"
+assert_contains "a session still running when a review of its branch was written stays an agent" \
+  "$(q "SELECT role, ifnull(review_id,'none') FROM sessions WHERE session_id = 's-long'")" "agent|none"
+assert_contains "a session that ended after a review of its branch was written stays an agent" \
+  "$(q "SELECT role, ifnull(review_id,'none') FROM sessions WHERE session_id = 's-late'")" "agent|none"
+assert_contains "a review written 301 s after a session ended is not its" \
+  "$(q "SELECT role, ifnull(review_id,'none') FROM sessions WHERE session_id = 's-gap'")" "agent|none"
+assert_contains "of two reviews written after a session ended, the nearer one is its" \
+  "$(q "SELECT role, review_id FROM sessions WHERE session_id = 's-near'")" "review|feat-u-eeeeeeeeeeee-tests.md"
+assert_contains "cli in the main checkout: main" "$(q "$SQ = 's-main'")" "main|app|app|main"
+assert_contains "cli in a main checkout under repos/: main" "$(q "$SQ = 's-main2'")" "main|app|app|main"
+assert_contains "cli in a worktree: other" "$(q "$SQ = 's-cliwt'")" "other|app"
+assert_contains "sdk-cli in a temp dir: other" "$(q "$SQ = 's-tmp'")" "other|||main"
+assert_contains "sdk-cli in a <repo>-* folder outside repos/: agent" "$(q "$SQ = 's-side'")" "agent|app|app-side|feat/z"
+assert_contains "the first cwd, branch and entrypoint count" "$(q "$SQ = 's-move'")" "agent|app|app-feat-x|feat/x"
+RE="SELECT role, role_eff, ifnull(repo,''), ifnull(worktree,''), ifnull(branch,''), link FROM sessions WHERE session_id"
+assert_contains "a review's subagent rolls up into review" "$(q "$RE = 's-review:agent-r2'")" "subagent|review|app|app-feat-x|feat/x|worktree"
+assert_contains "a main session's subagent in a worktree: its most frequent worktree and branch, rolled up into agent" \
+  "$(q "$RE = 's-main:agent-m1'")" "subagent|agent|app|app-feat-x|feat/x|worktree"
+assert_contains "a main session's subagent in the main checkout stays main" "$(q "$RE = 's-main:agent-m2'")" "subagent|main|app|app|main|cwd"
+assert_contains "a subagent whose parent has no transcript stays subagent" "$(q "$RE = 's-ghost:agent-g'")" "subagent|subagent|app|app|main|cwd"
+assert_contains "an agent's subagent rolls up into agent" "$(q "$RE = 's-agent:agent-a1'")" "subagent|agent|app|app-feat-x|feat/x"
+assert_contains "the lines per place of a subagent" "$(q "SELECT group_concat(worktree || ':' || branch || ':' || lines, ',') FROM (SELECT * FROM session_places WHERE session_id = 's-main:agent-m1' ORDER BY worktree, lines)")" \
+  "app:main:1,app-feat-q:feat/q:2,app-feat-x:feat/x:1,app-feat-x:feat/x:2"
+assert "a file with only a partial line makes no session yet" test "$(q "SELECT COUNT(*) FROM sessions WHERE session_id = 's-partial'")" -eq 0
+assert_contains "start and end of a session" "$(q "SELECT start, end, entrypoint FROM sessions WHERE session_id = 's-agent'")" \
+  "2026-11-10T10:00:00.000Z|2026-11-10T10:30:00.000Z|sdk-cli"
+
+echo "-- transcripts: usage, dedupe and prices"
+U="SELECT model, day, tokens_in, tokens_out, cache_w, cache_w_1h, cache_r, msgs, ifnull(cost_usd_est,'null') FROM usage_daily WHERE session_id"
+assert_contains "a message's repeated usage counts once, priced by its parts" "$(q "$U = 's-agent'")" \
+  "$O|2026-11-10|1000000|100000|200000|100000|1000000|1|7.5"
+assert_contains "a subagent's usage, at its model's price" "$(q "$U = 's-agent:agent-a1'")" "claude-haiku-5-5|2026-11-10|1000000|0|0|0|0|1|0.1"
+assert_contains "an unknown model: null cost" "$(q "$U = 's-main'")" "claude-mystery-9|2026-11-10|100|100|0|0|0|1|null"
+assert_contains "the prices table, with its source" "$(q "SELECT usd_in, usd_out, usd_cache_w, usd_cache_w_1h, usd_cache_r, source FROM prices WHERE model = '$O'")" "4.0|20.0|5.0|8.0|0.2|Claude API"
+out="$(py 'print(s.price_for("claude-opus-5-5", "2026-11-02"), s.price_for("claude-opus-5-5", "2026-11-03"), s.price_for("nope", "2026-12-01"))
+s.PRICES.append(("claude-opus-5-5", "2027-01-01", 1, 2, 3, 4, 5))
+print(s.price_for("claude-opus-5-5", "2026-12-31")[0], s.price_for("claude-opus-5-5", "2027-01-01")[0], s.price_for("claude-opus-5-5", "2027-06-01")[0])
+print(s.cost_est("claude-opus-5-5", "2026-11-02", 1, 0, 0, 0, 0), s.cost_est("x", "2026-11-10", 0, 0, 0, 0, 0))')"
+assert_contains "no price before a model's first effective date" "$out" "None (4.0, 20.0, 5.0, 8.0, 0.2) None"
+assert_contains "the price in effect on the day" "$out" $'\n4.0 1 1\n'
+assert_contains "cost: null without a price, 0 without tokens" "$out" "None 0.0"
+
+echo "-- transcripts: views"
+assert_contains "tokens by role: agent, with its subagent and the main session's subagent in a worktree" \
+  "$(q "SELECT sessions, subagent_sessions, msgs, tokens_in, tokens_out, tokens_cache_w, tokens_cache_r, cost_usd_est, subagent_cost_usd_est, unpriced_msgs FROM v_tokens_by_role WHERE role = 'agent' AND repo = 'app'")" \
+  "3|2|3|3000000|100000|200000|1000000|11.6|4.1|0"
+assert "tokens by role: no subagent row once rolled up" test "$(q "SELECT COUNT(*) FROM v_tokens_by_role WHERE role = 'subagent'")" -eq 0
+got="$(q "SELECT role, sessions, subagent_sessions, tokens, subagent_tokens, subagent_token_share, cost_usd_est, subagent_cost_usd_est, subagent_cost_share FROM v_subagent_share WHERE role = 'review'")"
+# cost: r1 (10*4 + 20*20 + 30*5 + 40*0.2) + o1 (5*4 + 5*20 + 5*5 + 5*0.2) + r2 (100*4) = 598 + 146 + 400 per MTok
+assert_contains "subagent share of a role's tokens and cost" "$got" "review|3|1|220|100|0.4545|0.0011|0.0004|0.3497"
+assert_contains "tokens by role: unpriced messages counted" "$(q "SELECT ifnull(cost_usd_est,'null'), unpriced_msgs FROM v_tokens_by_role WHERE role = 'main'")" "0.0|1"
+assert_contains "cache hit rate: cache reads / all input" "$(q "SELECT tokens_cache_r, tokens_input, cache_hit_rate FROM v_cache_hit_rate WHERE role = 'agent'")" \
+  "1000000|4200000|0.2381"
+assert "cache hit rate: per rolled-up role, no subagent row" \
+  test "$(q "SELECT group_concat(role) FROM (SELECT role FROM v_cache_hit_rate ORDER BY role)")" = "agent,judge,main,review,suite"
+assert_contains "cost per merged branch: agent and its subagent (est.), review and judge from the review files" \
+  "$(q "SELECT repo, branch, job_id, agent_sessions, agent_cost_usd_est, review_cost_usd, judge_cost_usd FROM v_cost_per_merged_branch")" \
+  "app|feat/x|mx|3|11.6|1.5|0.25"
+
+# A role whose tokens all come from subagents is still that role in each view.
+P5="$TMP/projects5"; mkdir -p "$P5/p/s-boss/subagents"
+SID=s-boss EP=cli CWD=/home/u/code/app BR=main; line 2026-11-10T09:00:00.000Z > "$P5/p/s-boss.jsonl"
+CWD="$WT" BR=feat/x line 2026-11-10T09:01:00.000Z b1 $O 10 0 0 0 30 > "$P5/p/s-boss/subagents/agent-b.jsonl"
+PROJ="$P5" PR_QUEUE_DIR="$S4" ingest "$TMP/out/boss.db" >/dev/null
+got="$(DB2="$TMP/out/boss.db" q "SELECT (SELECT group_concat(role) FROM v_tokens_by_role), (SELECT group_concat(role) FROM v_cache_hit_rate), (SELECT group_concat(role) FROM v_subagent_share)")"
+assert "only a subagent's tokens: the views name its rolled-up role" test "$got" = "agent|agent|agent"
+assert_contains "and its subagent share is all of it" "$(DB2="$TMP/out/boss.db" q "SELECT subagent_token_share, subagent_cost_share, cache_hit_rate FROM v_subagent_share, v_cache_hit_rate")" "1.0|1.0|0.75"
+
+echo "-- transcripts: review matching, merges, repo names, bad transcripts"
+S6="$TMP/state6"; P6="$TMP/projects6"; DB6="$TMP/out/six.db"
+mkdir -p "$S6/reviews" "$S6/repos/app" "$S6/repos/app-x" "$P6/p" "$P6/p/s-dir.jsonl"
+W6=/home/u/code/app/repos/app-feat-r
+# Two sessions of one branch end before one review without a sidecar: the review goes to the one that ended
+# last before it was written (the review's session), not to the agent that ended first.
+SID=s6-agent EP=sdk-cli CWD="$W6" BR=feat/r
+{ line 2026-11-10T11:00:00.000Z a61 $O 1000000 0 0 0 0; line 2026-11-10T12:00:00.000Z; } > "$P6/p/s6-agent.jsonl"
+SID=s6-rev; { line 2026-11-10T12:01:00.000Z; line 2026-11-10T12:02:00.000Z; } > "$P6/p/s6-rev.jsonl"
+# shellcheck disable=SC2016  # literal dollar sign, not an expansion
+printf '# Review of feat/r at 999999999999 (/code-review medium, cost $1.00, 60 s)\nVerdict: ready\n' > "$S6/reviews/feat-r-999999999999-medium.md"
+touch -d '2026-11-10 12:02:05' "$S6/reviews/feat-r-999999999999-medium.md"
+# feat/r merged twice: each merge counts only the sessions and reviews since the one before.
+SID=s6-agent2; line 2026-11-11T10:00:00.000Z a62 $O 2000000 0 0 0 0 > "$P6/p/s6-agent2.jsonl"
+SID=s6-agent3; line 2026-11-12T10:00:00.000Z a63 $O 3000000 0 0 0 0 > "$P6/p/s6-agent3.jsonl"
+printf '{"v":1,"kind":"code","branch":"feat/r","level":"low","file":"feat-r-888888888888-low.md","cost_usd":0.7,"finished":"2026-11-11T11:00:00.000Z"}\n' > "$S6/reviews/feat-r-888888888888-low.json"
+printf '{"v":1,"kind":"judge","branch":"feat/r","file":"feat-r-888888888888-judge.md","cost_usd":0.2,"finished":"2026-11-11T11:10:00.000Z"}\n' > "$S6/reviews/feat-r-888888888888-judge.json"
+{ ev2 2026-11-10T13:00:00.000Z merged r-m1 feat/r '"pr":1'
+  ev2 2026-11-11T13:00:00.000Z merged r-m2 feat/r '"pr":2'; } | sed 's/"repo":"one"/"repo":"app"/' > "$S6/events.jsonl"
+# A worktree of repo app-x: the longer repo name wins over app.
+SID=s6-x CWD=/home/u/code/app/repos/app-x-feat BR=feat/q; line 2026-11-10T09:00:00.000Z > "$P6/p/s6-x.jsonl"
+# A cwd that ends in a folder named repos; and a transcript that can't be read (a folder): skipped, counted.
+SID=s6-repos CWD=/home/u/repos/app/repos/ BR=main; line 2026-11-10T09:00:00.000Z > "$P6/p/s6-repos.jsonl"
+out="$(PROJ="$P6" PR_QUEUE_DIR="$S6" ingest "$DB6")"; rc=$?
+assert "a bad transcript doesn't stop the ingest" test "$rc" -eq 0
+assert_contains "it is counted as skipped" "$out" "skipped 1 transcripts that could not be read (IsADirectoryError 1)"
+assert_contains "and the others are read" "$out" "6 transcripts read"
+Q6() { DB2="$DB6" q "$1"; }
+assert_contains "the review goes to the session that ended last before it" \
+  "$(Q6 "SELECT group_concat(session_id || ':' || role || ':' || ifnull(review_id,''), ' ') FROM (SELECT * FROM sessions WHERE session_id IN ('s6-agent', 's6-rev') ORDER BY session_id)")" \
+  "s6-agent:agent: s6-rev:review:feat-r-999999999999-medium.md"
+got="$(Q6 "SELECT job_id, agent_sessions, agent_cost_usd_est, review_cost_usd, ifnull(judge_cost_usd,'none') FROM v_cost_per_merged_branch ORDER BY merged_at")"
+assert_contains "first merge: only what came before it" "$got" "r-m1|1|4.0|1.0|none"
+assert_contains "second merge: only what came since the first" "$got" "r-m2|1|8.0|0.7|0.2"
+assert_contains "the longest repo name a worktree starts with" "$(Q6 "SELECT repo, worktree FROM sessions WHERE session_id = 's6-x'")" "app-x|app-x-feat"
+assert_contains "a cwd ending in repos: the folder before it" "$(Q6 "SELECT worktree, place FROM sessions WHERE session_id = 's6-repos'")" "app|repos"
+# Any error in one transcript, after some of its rows were written: they are undone, the rest is read.
+P7="$TMP/projects7"; mkdir -p "$P7/p"
+SID=s7-boom EP=sdk-cli CWD=/home/u/boom BR=main; line 2026-11-10T09:00:00.000Z b71 $O 1 1 0 0 0 > "$P7/p/s7-boom.jsonl"
+SID=s7-ok CWD=/home/u/ok; line 2026-11-10T09:00:00.000Z b72 $O 1 1 0 0 0 > "$P7/p/s7-ok.jsonl"
+out="$(PR_QUEUE_DIR="$S6" py "
+real = s.cwd_facts
+def boom(cwd):
+    if cwd and 'boom' in cwd:
+        raise ValueError('x')
+    return real(cwd)
+s.cwd_facts = boom
+s.ingest('$TMP/out/seven.db', '$P7')" 2>&1)"
+assert_contains "an error that is no OSError: skipped and counted" "$out" "skipped 1 transcripts that could not be read (ValueError 1)"
+assert "its rows are undone, the other transcript's kept" \
+  test "$(DB2="$TMP/out/seven.db" q "SELECT group_concat(session_id) FROM (SELECT session_id FROM usage_msgs UNION SELECT session_id FROM sessions)")" = "s7-ok"
+assert "and where it stopped is not saved: the next run reads it again" \
+  test "$(DB2="$TMP/out/seven.db" q "SELECT COUNT(*) FROM ingest_state WHERE path LIKE 'transcript:%'")" -eq 1
+out="$(py 'h = s.cwd_facts("/home/u/repos/app/repos"); print(h[1:], s.cwd_facts("/home/u/repos/app/repos/")[1:], s.cwd_facts("/a/repos/b/repos/c")[1:])')"
+assert_contains "cwd_facts: the last repos/ with a folder after it" "$out" "('app', 'repos') ('app', 'repos') ('c', 'repos')"
+
+echo "-- transcripts: incremental, partial line, reread"
+M="$PROJ/-home-u-code-app/s-main.jsonl"
+nm() { q "SELECT COUNT(*) FROM usage_msgs WHERE session_id = 's-main'"; }
+MK="$(py "print(s.transcript_key('$M'))")"
+SID=s-main EP=cli CWD=/home/u/code/app BR=main
+line 2026-11-11T09:00:00.000Z x3 $O 1 1 0 0 0 >> "$M"
+line 2026-11-11T09:01:00.000Z x4 $O 1 1 0 0 0 | head -c 50 >> "$M"
+out="$(PR_QUEUE_DIR="$S4" ingest "$DB2")"
+assert "an appended message is read" test "$(nm)" -eq 2
+assert_contains "only the new message is new" "$out" "1 new messages"
+assert "the offset stops before the partial line" test "$(q "SELECT offset FROM ingest_state WHERE path = '$MK'")" -lt "$(stat -c %s "$M")"
+line 2026-11-11T09:01:00.000Z x4 $O 1 1 0 0 0 | tail -c +51 >> "$M"
+PR_QUEUE_DIR="$S4" ingest "$DB2" >/dev/null
+assert "the completed line is read on the next run" test "$(nm)" -eq 3
+assert_contains "and the session's end and days follow" "$(q "SELECT end, (SELECT COUNT(*) FROM usage_daily WHERE session_id = 's-main') FROM sessions WHERE session_id = 's-main'")" "2026-11-11T09:01:00.000Z|2"
+SID=s-main EP=sdk-cli CWD=/tmp/q BR=hotfix; line 2026-11-11T08:00:00.000Z >> "$M"
+PR_QUEUE_DIR="$S4" ingest "$DB2" >/dev/null
+assert_contains "a later run keeps the session's first branch, earliest start and latest end" \
+  "$(q "SELECT role, branch, start, end FROM sessions WHERE session_id = 's-main'")" "main|main|2026-11-10T09:00:00.000Z|2026-11-11T09:01:00.000Z"
+cp "$M" "$TMP/m.tmp"; mv "$TMP/m.tmp" "$M"
+SID=s-main EP=cli CWD="$WT" BR=feat/x; line 2026-11-11T10:00:00.000Z >> "$SM1"
+PR_QUEUE_DIR="$S4" ingest "$DB2" >/dev/null
+assert "a later run adds to a subagent's lines in a place" \
+  test "$(q "SELECT lines FROM session_places WHERE session_id = 's-main:agent-m1' AND worktree = 'app-feat-x' ORDER BY lines DESC LIMIT 1")" -eq 3
+cp "$SM1" "$TMP/m.tmp"; mv "$TMP/m.tmp" "$SM1"
+out="$(PR_QUEUE_DIR="$S4" ingest "$DB2")"
+assert_contains "another inode is read again, its messages not counted twice" "$out" "0 new messages"
+assert "the same messages" test "$(nm)" -eq 3
+assert "a subagent read again: its places are not counted twice" \
+  test "$(q "SELECT SUM(lines) FROM session_places WHERE session_id = 's-main:agent-m1'")" -eq 7
+assert "read from the start" test "$(q "SELECT offset FROM ingest_state WHERE path = '$MK'")" -eq "$(stat -c %s "$M")"
+SID=s-main EP=cli CWD=/home/u/code/app BR=main; line 2026-11-12T09:00:00.000Z x5 $O 1 1 0 0 0 > "$M"
+PR_QUEUE_DIR="$S4" ingest "$DB2" >/dev/null
+assert "a shrunk file is read again from the start" test "$(nm)" -eq 4
+assert "its offset is the new size" test "$(q "SELECT offset FROM ingest_state WHERE path = '$MK'")" -eq "$(stat -c %s "$M")"
+a="$(q "SELECT group_concat(session_id || role || msgs, ',') FROM (SELECT * FROM sessions ORDER BY session_id)")"
+PR_QUEUE_DIR="$S4" ingest "$DB2" >/dev/null
+assert "a second run changes no session" test "$a" = "$(q "SELECT group_concat(session_id || role || msgs, ',') FROM (SELECT * FROM sessions ORDER BY session_id)")"
+
+echo "-- transcripts: the default folder"
+mkdir -p "$HOME/.claude/projects/p"; cp "$PROJ/-home-u-code-app/s-review.jsonl" "$HOME/.claude/projects/p/"
+DB3="$TMP/out/default-projects.db"
+out="$(PR_QUEUE_DIR="$S4" python3 -I -B "$ST" ingest --db "$DB3" 2>&1)"
+assert_contains "\$HOME/.claude/projects without --projects" "$out" "1 transcripts read"
+out="$(CLAUDE_CONFIG_DIR="$TMP/nowhere" PR_QUEUE_DIR="$S4" python3 -I -B "$ST" ingest --db "$TMP/out/cfg.db" 2>&1)"
+assert_contains "\$CLAUDE_CONFIG_DIR/projects when it is set" "$out" "0 transcripts read"
+
+echo "-- a version 3 db is migrated"
+DB3="$TMP/out/v3.db"; cp "$DB2" "$DB3"
+python3 -I -B -c 'import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.executescript("DROP VIEW v_tokens_by_role; DROP VIEW v_cache_hit_rate; DROP VIEW v_cost_per_merged_branch; "
+  "DROP TABLE sessions; DROP TABLE session_places; DROP TABLE usage_msgs; DROP TABLE usage_daily; DROP TABLE prices; "
+  "DELETE FROM schema_version; INSERT INTO schema_version VALUES (3);")
+c.execute("DELETE FROM ingest_state WHERE path LIKE ?", ("transcript:%",))
+c.commit()' "$DB3"
+PR_QUEUE_DIR="$S4" ingest "$DB3" >/dev/null
+DB2="$DB3"
+assert "migrated: version 5" test "$(q "SELECT group_concat(version) FROM schema_version")" = 5
+assert "migrated: the sessions are read" test "$(q "SELECT COUNT(*) FROM sessions")" -eq 20
+assert_contains "migrated: the views work" "$(q "SELECT agent_cost_usd_est FROM v_cost_per_merged_branch")" "11.6"
+unset DB2 PROJ
+
+echo "-- sessions linked to jobs"
+S8="$TMP/state8"; P8="$TMP/projects8"; DB8="$TMP/out/eight.db"
+mkdir -p "$S8/reviews" "$S8/repos/app/done" "$S8/repos/app/failed" "$S8/repos/tool/done" "$P8/p/s8-main/subagents"
+# jobfile <repo> <dir> <queued UTC time> <branch> <worktree folder>: a job file named by its queue time in ns
+jobfile() { printf 'worktree=/home/u/code/app/repos/%s\nbranch=%s\ntype=feat\ndescription=d\n' "$5" "$4" \
+  > "$S8/repos/$1/$2/$(date -ud "$3" +%s)000000000-${4//\//-}.job"; }
+jobfile app "done" 2026-11-10T10:05:00Z feat/q app-q
+jobfile app failed 2026-11-10T10:08:00Z feat/q2 app-q2
+jobfile tool "done" 2026-11-10T11:03:00Z feat/t tool-t
+jobfile app "done" 2026-11-10T11:10:01Z feat/late app-late
+jobfile app "done" 2026-11-10T11:59:00Z feat/before app-before
+jobfile app "done" 2026-11-09T09:00:00Z feat/w app-wt8
+jobfile app "done" 2026-11-09T09:00:00Z feat/k app-feat-k
+jobfile app "done" 2026-11-09T09:00:00Z feat/r1 app-reused
+jobfile app failed 2026-11-09T09:30:00Z feat/r2 app-reused
+SID=s8-main EP=cli CWD=/home/u/code/app BR=main; line 2026-11-10T09:00:00.000Z > "$P8/p/s8-main.jsonl"
+SA="$P8/p/s8-main/subagents"
+# In the main checkout, ended 5 minutes before feat/q was queued (and 8 before feat/q2): the nearest, feat/q.
+line 2026-11-10T10:00:00.000Z q1 $O 1000000 0 0 0 0 > "$SA/agent-q.jsonl"
+# Ended 10 min 1 s before the next job of its repo (another repo's job came 3 minutes after): not linked.
+line 2026-11-10T11:00:00.000Z > "$SA/agent-far.jsonl"
+# Ended after the job that came before it: not linked.
+line 2026-11-10T12:00:00.000Z > "$SA/agent-after.jsonl"
+# In a worktree, on the main checkout's branch: the branch of the job file that names the worktree.
+CWD=/home/u/code/app/repos/app-wt8 line 2026-11-12T09:00:00.000Z > "$SA/agent-wt.jsonl"
+# In a worktree two branches' job files name, far from any job: not linked.
+CWD=/home/u/code/app/repos/app-reused line 2026-11-12T09:00:00.000Z > "$SA/agent-reused.jsonl"
+# Its branch was queued: kept.
+CWD=/home/u/code/app/repos/app-feat-k BR=feat/k line 2026-11-10T10:00:00.000Z > "$SA/agent-k.jsonl"
+# An agent session in a worktree on main that ended 2 minutes before a job_queued event of its repo.
+SID=s8-agent EP=sdk-cli CWD=/home/u/code/app/repos/app-nob BR=main
+line 2026-11-10T13:00:00.000Z e1 $O 2000000 0 0 0 0 > "$P8/p/s8-agent.jsonl"
+{ printf '{"v":1,"ts":"2026-11-10T13:02:00.000Z","event":"job_queued","repo":"app","branch":"feat/e","job_id":"x-feat-e","sha":"e1"}\n'
+  printf '{"v":1,"ts":"2026-11-10T14:00:00.000Z","event":"merged","repo":"app","branch":"feat/e","job_id":"x-feat-e","sha":"e1"}\n'
+  printf '{"v":1,"ts":"2026-11-10T14:00:00.000Z","event":"merged","repo":"app","branch":"feat/q","job_id":"y-feat-q","sha":"q1"}\n'
+} > "$S8/events.jsonl"
+PROJ="$P8" PR_QUEUE_DIR="$S8" ingest "$DB8" >/dev/null
+Q8() { DB2="$DB8" q "$1"; }
+L8="SELECT role_eff, ifnull(branch_eff, ''), link FROM sessions WHERE session_id"
+assert_contains "a main session's subagent: the job queued nearest after it ended, as an agent" "$(Q8 "$L8 = 's8-main:agent-q'")" "agent|feat/q|queued"
+assert_contains "its transcript's own branch is kept" "$(Q8 "SELECT branch FROM sessions WHERE session_id = 's8-main:agent-q'")" "main"
+assert_contains "over 10 minutes, or another repo's job: not linked" "$(Q8 "$L8 = 's8-main:agent-far'")" "main|main|cwd"
+assert_contains "only a job queued after it ended" "$(Q8 "$L8 = 's8-main:agent-after'")" "main|main|cwd"
+assert_contains "a worktree one job file names: that job's branch" "$(Q8 "$L8 = 's8-main:agent-wt'")" "agent|feat/w|job_worktree"
+assert_contains "a worktree of two branches, far from jobs: not linked" "$(Q8 "$L8 = 's8-main:agent-reused'")" "agent|main|worktree"
+assert_contains "a branch that was queued is kept" "$(Q8 "$L8 = 's8-main:agent-k'")" "agent|feat/k|worktree"
+assert_contains "an agent session on main: the job_queued event 2 minutes after it" "$(Q8 "$L8 = 's8-agent'")" "agent|feat/e|queued"
+assert_contains "the linked sessions' cost counts toward their merged branches" \
+  "$(Q8 "SELECT group_concat(branch || ':' || agent_sessions || ':' || agent_cost_usd_est, ' ') FROM (SELECT * FROM v_cost_per_merged_branch ORDER BY branch)")" \
+  "feat/e:1:8.0 feat/q:1:4.0"
+a="$(Q8 "SELECT group_concat(session_id || role_eff || branch_eff || link, ',') FROM (SELECT * FROM sessions ORDER BY session_id)")"
+PROJ="$P8" PR_QUEUE_DIR="$S8" ingest "$DB8" >/dev/null
+assert "linking again changes nothing" test "$a" = "$(Q8 "SELECT group_concat(session_id || role_eff || branch_eff || link, ',') FROM (SELECT * FROM sessions ORDER BY session_id)")"
+out="$(PR_QUEUE_DIR="$S8" py 'print(sorted((j["repo"], j["branch"], j["worktree"], j["queued"]) for j in s.job_files(__import__("os").environ["PR_QUEUE_DIR"]))[0])')"
+assert_contains "job_files: repo, branch, worktree folder and the queue time from the name" "$out" "('app', 'feat/before', 'app-before', $(date -ud 2026-11-10T11:59:00Z +%s).0)"
+
+echo "-- a version 4 db is migrated"
+DB4="$TMP/out/v4.db"; cp "$DB8" "$DB4"
+python3 -I -B -c 'import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.executescript("DROP VIEW v_cost_per_merged_branch; DROP VIEW v_escaped_defects; DROP VIEW v_flaky_checks; "
+  "ALTER TABLE sessions DROP COLUMN branch_eff; DROP TABLE meta; DROP TABLE checks; DROP TABLE main_commits; "
+  "DROP TABLE main_commit_files; DROP TABLE rule_changes; DELETE FROM schema_version; INSERT INTO schema_version VALUES (4);")
+c.commit()' "$DB4"
+PROJ="$P8" PR_QUEUE_DIR="$S8" ingest "$DB4" >/dev/null
+assert "migrated from 4: version 5" test "$(DB2="$DB4" q "SELECT group_concat(version) FROM schema_version")" = 5
+assert_contains "migrated from 4: branch_eff filled, the view works" \
+  "$(DB2="$DB4" q "SELECT group_concat(branch || ':' || agent_sessions, ' ') FROM (SELECT * FROM v_cost_per_merged_branch ORDER BY branch)")" "feat/e:1 feat/q:1"
+
+echo "-- git: main's commits, rule changes, escaped defects"
+S9="$TMP/state9"; G="$TMP/g/app"; DB9="$TMP/out/nine.db"
+mkdir -p "$S9/reviews" "$S9/repos/app/done" "$S9/repos/gone" "$G"
+echo "$G" > "$S9/repos/app/checkout"; echo "$TMP/nowhere" > "$S9/repos/gone/checkout"
+git -C "$G" init -q -b main
+# gc <date> <subject> <file...>: a commit at that date that changes the files
+gc() { local d="$1" m="$2" f; shift 2
+  for f; do mkdir -p "$(dirname "$G/$f")"; echo "$m" >> "$G/$f"; done
+  git -C "$G" add -A && GIT_AUTHOR_DATE="$d" GIT_COMMITTER_DATE="$d" git -C "$G" commit -qm "$m"; }
+sha() { git -C "$G" rev-parse HEAD; }
+printf 'worktree=/w/app-x\nbranch=feat/x\ntype=feat\ndescription=add x\n' > "$S9/repos/app/done/1-feat-x.job"
+printf 'worktree=/w/app-xfix\nbranch=fix/x-bug\ntype=fix\ndescription=repair x\n' > "$S9/repos/app/done/2-fix-x-bug.job"
+printf 'worktree=/w/app-n\nbranch=feat/n\ntype=feat\ndescription=no queue merge\n' > "$S9/repos/app/done/3-feat-n.job"
+gc 2026-11-01T10:00:00+01:00 "init" a.txt CLAUDE.md
+# feat/n's commit, though the queue never merged it (no merged job): not one of the escaped view's branches.
+gc 2026-11-01T12:00:00+01:00 "feat: no queue merge (#0)" x.txt
+gc 2026-11-02T10:00:00+01:00 "feat: add x (#1)" x.txt claude/other.md
+gc 2026-11-03T10:00:00+01:00 "feat: add y (#2)" y.txt scripts/queue/review.sh; Y="$(sha)"
+gc 2026-11-05T10:00:00+01:00 "fix: repair x (#3)" x.txt; FIXX="$(sha)"
+git -C "$G" checkout -q -b side HEAD~1
+gc 2026-11-04T10:00:00+01:00 "z work" z.txt "claude/agents/a b.md"
+git -C "$G" checkout -q main
+GIT_AUTHOR_DATE=2026-11-06T10:00:00+01:00 GIT_COMMITTER_DATE=2026-11-06T10:00:00+01:00 \
+  git -C "$G" merge -q --no-ff -m "Merge pull request #4 from o/feat/z" side
+gc 2026-11-07T10:00:00+01:00 "chore: touch y (#5)" y.txt claude/rules/r.md
+gc 2026-11-10T10:00:00+01:00 'Revert "Merge pull request #4 from o/feat/z"' z.txt; REV="$(sha)"
+gc 2026-11-20T10:00:00+01:00 "fix: y late" y.txt docs/CLAUDE.md
+{ for b in feat/x fix/x-bug feat/z; do
+    printf '{"v":1,"ts":"2026-11-08T10:00:00.000Z","event":"merged","repo":"app","branch":"%s","job_id":"m-%s"}\n' "$b" "${b//\//-}"
+  done
+  printf '{"v":1,"ts":"2026-11-08T10:00:00.000Z","event":"merged","repo":"app","branch":"feat/y","job_id":"m-y","merge_sha":"%s"}\n' "$Y"
+} > "$S9/events.jsonl"
+out="$(PR_QUEUE_DIR="$S9" ingest "$DB9")"
+assert_contains "git's numbers in the summary (a checkout that is gone is skipped)" "$out" "git: 9 main commits and 5 rule changes from 1 repos"
+Q9() { DB2="$DB9" q "$1"; }
+assert_contains "main's commits: first parent only, UTC, the branch from job files, merge_sha or the merge subject" \
+  "$(Q9 "SELECT group_concat(ts || ' ' || ifnull(branch, '-') || ' ' || kind, ', ') FROM (SELECT * FROM main_commits ORDER BY ts)")" \
+  "2026-11-01T09:00:00.000Z - other, 2026-11-01T11:00:00.000Z feat/n other, 2026-11-02T09:00:00.000Z feat/x other, 2026-11-03T09:00:00.000Z feat/y other, 2026-11-05T09:00:00.000Z fix/x-bug fix, 2026-11-06T09:00:00.000Z feat/z other, 2026-11-07T09:00:00.000Z - other, 2026-11-10T09:00:00.000Z - revert, 2026-11-20T09:00:00.000Z - fix"
+assert "the side branch's own commit is not one of main's" test "$(Q9 "SELECT COUNT(*) FROM main_commits WHERE subject = 'z work'")" -eq 0
+assert_contains "a merge's files: its diff to the first parent" "$(Q9 "SELECT group_concat(path, ',') FROM (SELECT path FROM main_commit_files f JOIN main_commits c USING (repo, sha) WHERE c.branch = 'feat/z' ORDER BY path)")" \
+  "claude/agents/a b.md,z.txt"
+assert_contains "rule changes: rules, agents, any CLAUDE.md, review.sh; short sha, date, subject" \
+  "$(Q9 "SELECT group_concat(substr(ts, 1, 10) || ' ' || subject, ', ') FROM (SELECT * FROM rule_changes ORDER BY ts)")" \
+  "2026-11-01 init, 2026-11-03 feat: add y (#2), 2026-11-06 Merge pull request #4 from o/feat/z, 2026-11-07 chore: touch y (#5), 2026-11-20 fix: y late"
+assert "rule changes: the short sha" test "$(Q9 "SELECT sha FROM rule_changes WHERE subject = 'init'")" = "$(git -C "$G" rev-parse --short HEAD~8)"
+assert "escaped: the queue's merged branches; a fix within 14 days on their files; a revert; not a chore, nor a fix 17 days later" \
+  test "$(Q9 "SELECT group_concat(branch || ':' || ifnull(fixed_by, '-'), ' ') FROM (SELECT * FROM v_escaped_defects ORDER BY branch)")" \
+  = "feat/x:$FIXX feat/y:- feat/z:$REV fix/x-bug:-"
+# git that fails only on the rules log: the repo keeps its rows, and the ingest goes on.
+mkdir -p "$TMP/gitstub"
+# shellcheck disable=SC2016  # the stub's own $a and $@, not this script's
+printf '#!/usr/bin/env bash\nfor a; do [ "$a" = scripts/queue/review.sh ] && exit 1; done\nexec %q "$@"\n' "$(command -v git)" > "$TMP/gitstub/git"
+chmod +x "$TMP/gitstub/git"
+out="$(PATH="$TMP/gitstub:$PATH" PR_QUEUE_DIR="$S9" ingest "$DB9")"; rc=$?
+assert "the rules log fails: exit 0" test "$rc" -eq 0
+assert_contains "the rules log fails: no repo read" "$out" "git: 0 main commits and 0 rule changes from 0 repos"
+assert "the rules log fails: the repo keeps its commits and rule changes" \
+  test "$(Q9 "SELECT (SELECT COUNT(*) FROM main_commits) || ':' || (SELECT COUNT(*) FROM rule_changes)")" = "9:5"
+gc 2026-11-21T10:00:00+01:00 "local only" a.txt
+git -C "$G" update-ref refs/remotes/origin/main HEAD~1
+echo "$TMP/g/nogit" > "$S9/repos/gone/checkout"; mkdir -p "$TMP/g/nogit"
+out="$(PR_QUEUE_DIR="$S9" ingest "$DB9")"
+assert_contains "origin/main over HEAD; read again, not added to; a folder that isn't a checkout is skipped" "$out" "git: 9 main commits and 5 rule changes from 1 repos"
+assert "the same rows" test "$(Q9 "SELECT COUNT(*) FROM main_commits")" -eq 9
+echo "$TMP/g/nogit" > "$S9/repos/app/checkout"
+PR_QUEUE_DIR="$S9" ingest "$DB9" >/dev/null
+assert "a repo whose git fails keeps its rows" test "$(Q9 "SELECT COUNT(*) FROM main_commits WHERE repo = 'app'")" -eq 9
+
+echo "-- git: fixes before or with a merge, shared titles, a fix: subject of a feat/ branch"
+S11="$TMP/state11"; G="$TMP/g/lib"; DB11="$TMP/out/eleven.db"
+mkdir -p "$S11/reviews" "$S11/repos/lib/done" "$S11/repos/lib/failed" "$G"
+echo "$G" > "$S11/repos/lib/checkout"
+git -C "$G" init -q -b main
+printf 'worktree=/w/lib-p\nbranch=feat/p\ntype=feat\ndescription=add p\n' > "$S11/repos/lib/done/1-feat-p.job"
+# Two branches' job files with one title: its squash commit gets no branch.
+printf 'worktree=/w/lib-s1\nbranch=feat/s1\ntype=chore\ndescription=same title\n' > "$S11/repos/lib/done/2-feat-s1.job"
+printf 'worktree=/w/lib-s2\nbranch=feat/s2\ntype=chore\ndescription=same title\n' > "$S11/repos/lib/failed/3-feat-s2.job"
+# A feat/ branch merged under a "fix: ..." subject: not a fix.
+printf 'worktree=/w/lib-f\nbranch=feat/fixy\ntype=fix\ndescription=tidy p\n' > "$S11/repos/lib/done/4-feat-fixy.job"
+gc 2026-11-01T10:00:00+01:00 "fix: early p" p.txt
+gc 2026-11-02T10:00:00+01:00 "feat: add p (#1)" p.txt
+gc 2026-11-02T10:00:00+01:00 "fix: same time p" p.txt
+gc 2026-11-03T10:00:00+01:00 "chore: same title (#2)" s.txt
+gc 2026-11-04T10:00:00+01:00 "fix: tidy p (#3)" p.txt
+{ for b in feat/p feat/s1 feat/fixy; do
+    printf '{"v":1,"ts":"2026-11-08T10:00:00.000Z","event":"merged","repo":"lib","branch":"%s","job_id":"m-%s"}\n' "$b" "${b//\//-}"
+  done; } > "$S11/events.jsonl"
+PR_QUEUE_DIR="$S11" ingest "$DB11" >/dev/null
+Q11() { DB2="$DB11" q "$1"; }
+assert "a shared title: no branch; a feat/ branch's fix: subject: kind other; a fix: of no branch: fix" \
+  test "$(Q11 "SELECT group_concat(subject || '|' || ifnull(branch, '-') || '|' || kind, ', ') FROM (SELECT * FROM main_commits ORDER BY ts, subject)")" \
+  = "fix: early p|-|fix, feat: add p (#1)|feat/p|other, fix: same time p|-|fix, chore: same title (#2)|-|other, fix: tidy p (#3)|feat/fixy|other"
+assert "escaped: not by a fix merged before the branch or at the same time, nor by a feat/ branch's fix: subject" \
+  test "$(Q11 "SELECT group_concat(branch || ':' || ifnull(fixed_by, '-'), ' ') FROM (SELECT * FROM v_escaped_defects ORDER BY branch)")" \
+  = "feat/fixy:- feat/p:-"
+
+echo "-- flaky CI checks"
+S10="$TMP/state10"; mkdir -p "$S10/reviews"
+# ck <ts> <event> <job> <branch> <sha> [<result>]
+ck() { printf '{"v":1,"ts":"%s","event":"%s","repo":"%s","branch":"%s","job_id":"%s","sha":"%s"%s}\n' \
+  "$1" "$2" "${CKREPO:-app}" "$4" "$3" "$5" "${6:+,\"result\":\"$6\"}"; }
+{ ck 2026-11-10T10:00:00.000Z job_queued a1 feat/a qa
+  ck 2026-11-10T10:10:00.000Z checks_finished a1 feat/a m1 fail
+  ck 2026-11-10T11:00:00.000Z job_queued a2 feat/a qa
+  ck 2026-11-10T11:10:00.000Z checks_finished a2 feat/a m2 pass
+  ck 2026-11-10T10:00:00.000Z job_queued b1 feat/b qb
+  ck 2026-11-10T10:10:00.000Z checks_finished b1 feat/b b1 fail
+  ck 2026-11-10T11:00:00.000Z job_queued b2 feat/b qb2
+  ck 2026-11-10T11:10:00.000Z checks_finished b2 feat/b b2 pass
+  # Another repo's job of the same branch, queued at the same commit, passes on the same sha: not feat/b's pass.
+  CKREPO=other ck 2026-11-10T10:30:00.000Z job_queued o1 feat/b qb
+  CKREPO=other ck 2026-11-10T10:40:00.000Z checks_finished o1 feat/b b1 pass
+  ck 2026-11-10T10:10:00.000Z checks_finished c1 feat/c c1 fail
+  ck 2026-11-10T10:20:00.000Z checks_finished c2 feat/c c1 pass
+  ck 2026-11-10T10:00:00.000Z checks_finished d1 feat/d d1 pass
+  ck 2026-11-10T10:30:00.000Z checks_finished d2 feat/d d1 fail
+  ck 2026-11-10T10:40:00.000Z checks_finished d3 feat/d d1 timeout
+} > "$S10/events.jsonl"
+PR_QUEUE_DIR="$S10" ingest "$TMP/out/ten.db" >/dev/null
+assert_contains "flaky: passed later on the same sha, or queued again at the same commit; not after new commits, nor a pass before, nor another repo's" \
+  "$(DB2="$TMP/out/ten.db" q "SELECT group_concat(branch || ':' || ifnull(passed_at, '-'), ' ') FROM (SELECT * FROM v_flaky_checks ORDER BY branch)")" \
+  "feat/a:2026-11-10T11:10:00.000Z feat/b:- feat/c:2026-11-10T10:20:00.000Z feat/d:-"
+assert "checks: only pass and fail" test "$(DB2="$TMP/out/ten.db" q "SELECT COUNT(*) FROM checks")" -eq 9
+
+echo "-- the last ingest's time"
+before="$(date -u +%Y-%m-%dT%H:%M:%S)"
+PR_QUEUE_DIR="$S10" ingest "$TMP/out/ten.db" >/dev/null
+got="$(DB2="$TMP/out/ten.db" q "SELECT value FROM meta WHERE key = 'last_ingest'")"
+assert "meta's last_ingest: UTC ISO with ms" python3 -I -c 'import re, sys; sys.exit(not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", sys.argv[1]))' "$got"
+assert "and it is this run's time" test "${got:0:19}" '>' "$before" -o "${got:0:19}" = "$before"
 
 echo "-- no bytecode in the checkout"
 # Run as a script and imported (the py helper), stats.py leaves no __pycache__ next to it.

@@ -2,6 +2,20 @@
 # Runs the test suite before every commit (enabled by scripts/setup/install.sh via core.hooksPath).
 # Skip once with: git commit --no-verify
 cd "$(git rev-parse --show-toplevel)" || exit 1
+# Stats data (db, events, report) lives in the state dir, never in the repo: refuse it even when force-added.
+# Keep the patterns in step with .gitignore.
+bad=()
+while IFS= read -r -d '' f; do
+  case "${f##*/}" in
+    *.db | *.sqlite | *.sqlite3 | *.db-journal | *.db-wal | events*.jsonl | report.html) bad+=("$f") ;;
+  esac
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+if [ "${#bad[@]}" -gt 0 ]; then
+  echo "pre-commit: refusing to commit stats data (it stays in ~/.local/state, never in the repo):"
+  printf '  %s\n' "${bad[@]}"
+  echo "pre-commit: unstage them (git rm --cached <file>), commit aborted"
+  exit 1
+fi
 log="$(mktemp)"; trap 'rm -f "$log"' EXIT
 if tests/run.sh >"$log" 2>&1; then
   echo "pre-commit: all tests passed"

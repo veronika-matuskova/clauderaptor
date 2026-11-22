@@ -10,3 +10,12 @@ tasks/*
 
 # Skills synced from claude.ai (written by Claude Code via the skills symlink)
 claude/skills/synced/
+
+# Stats data lives in the state dir (~/.local/state), never in the repo (the pre-commit hook also refuses it)
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+events*.jsonl
+report.html

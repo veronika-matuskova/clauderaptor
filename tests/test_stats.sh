@@ -341,6 +341,53 @@ assert "migrated: tests_skipped filled" test "$(q "SELECT tests_skipped FROM rev
 assert "migrated: the views are the new ones" test "$(q "SELECT group_concat(DISTINCT kind) FROM v_findings_by_severity")" = "code,tests"
 unset DB2
 
+echo "-- linking reviews to jobs, sidecar-only reviews, a branch in two repos"
+S2="$TMP/state2"; R2="$S2/reviews"; DB2="$TMP/out/links.db"
+mkdir -p "$R2" "$S2/repos/one/failed" "$S2/repos/two/failed"
+ev2() {  # ev2 <ts> <event> <job_id> <branch> <extra json fields>
+  printf '{"v":1,"ts":"%s","event":"%s","repo":"one","branch":"%s","job_id":"%s","sha":"abc","pid":1%s}\n' \
+    "$1" "$2" "$4" "$3" "${5:+,$5}"
+}
+# feat/r's test review ran in j100 and failed, ran again in j200 (which wrote the file), and j300 got it cached.
+# shellcheck disable=SC2016  # literal dollar sign, not an expansion
+printf '# Test review of feat/r at aaaaaaaaaaaa (cost $0.50, 60 s)\nVerdict: ready\n' > "$R2/feat-r-aaaaaaaaaaaa-tests.md"
+printf '{"v":1,"kind":"tests","file":"feat-r-aaaaaaaaaaaa-tests.md","cost_usd":0.5,"finished":"2026-04-01T11:04:59.000Z"}\n' \
+  > "$R2/feat-r-aaaaaaaaaaaa-tests.json"
+F2='"kind":"tests","review_file":"feat-r-aaaaaaaaaaaa-tests.md"'
+# feat/s's review, written at 10:45: j-late started after it (10:50) and ended first, j-cover started before it.
+# shellcheck disable=SC2016  # literal dollar sign, not an expansion
+printf '# Review of feat/s at bbbbbbbbbbbb (/code-review medium, cost $0.20, 30 s)\nVerdict: ready\n' > "$R2/feat-s-bbbbbbbbbbbb-medium.md"
+touch -d '2026-04-01 10:45:00' "$R2/feat-s-bbbbbbbbbbbb-medium.md"
+{ ev2 2026-04-01T10:00:00.000Z job_started j100 feat/r
+  ev2 2026-04-01T10:30:00.000Z review_finished j100 feat/r "$F2"
+  ev2 2026-04-01T11:00:00.000Z job_started j200 feat/r
+  ev2 2026-04-01T11:05:00.000Z review_finished j200 feat/r "$F2"
+  ev2 2026-04-01T12:00:00.000Z review_finished j300 feat/r "$F2"
+  ev2 2026-04-01T10:30:00.000Z job_started j-cover feat/s
+  ev2 2026-04-01T11:00:00.000Z job_failed j-cover feat/s '"reason":"review_code"'
+  ev2 2026-04-01T10:50:00.000Z job_started j-late feat/s
+  ev2 2026-04-01T10:55:00.000Z job_failed j-late feat/s '"reason":"review_code"'; } > "$S2/events.jsonl"
+# A review with only its sidecar (no .md).
+printf '{"v":1,"kind":"code","branch":"feat/q","level":"low","file":"feat-q-cccccccccccc-low.md","cost_usd":0.33}\n' \
+  > "$R2/feat-q-cccccccccccc-low.json"
+# feat/dup has job files in two repos, so its old results.log line can't name one.
+printf 'worktree=/x/one-wt\nbranch=feat/dup\n' > "$S2/repos/one/failed/1-feat-dup.job"
+printf 'worktree=/x/two-wt\nbranch=feat/dup\n' > "$S2/repos/two/failed/2-feat-dup.job"
+printf 'worktree=/x/one-wt2\nbranch=feat/solo\n' > "$S2/repos/one/failed/3-feat-solo.job"
+printf '2026-01-01 10:00:00 FAILED feat/dup: git fetch failed (log: x)\n2026-01-01 10:05:00 FAILED feat/solo: git fetch failed (log: x)\n' \
+  > "$S2/results.log"
+PR_QUEUE_DIR="$S2" ingest "$DB2" >/dev/null
+L="SELECT ifnull(job_id,''), ifnull(cached,'') FROM reviews WHERE id"
+assert_contains "a review run again: linked to the run that wrote the file" "$(q "$L = 'feat-r-aaaaaaaaaaaa-tests.md'")" "j200|"
+assert_contains "a review_finished > 120 s after it is a cache hit" "$(q "$L = 'feat-r-aaaaaaaaaaaa-tests.md'")" "|1"
+assert_contains "by time: the job that covers the review, not one started after it" \
+  "$(q "$L = 'feat-s-bbbbbbbbbbbb-medium.md'")" "j-cover|"
+assert_contains "a review with only a sidecar is stored" \
+  "$(q "SELECT kind, level, branch, cost_usd, sidecar FROM reviews WHERE id = 'feat-q-cccccccccccc-low.md'")" "code|low|feat/q|0.33|1"
+assert_contains "a branch in two repos' job files: no repo" "$(q "SELECT ifnull(repo,'none') FROM jobs WHERE branch = 'feat/dup'")" "none"
+assert_contains "a branch in one repo's job files: that repo" "$(q "SELECT ifnull(repo,'none') FROM jobs WHERE branch = 'feat/solo'")" "one"
+unset DB2
+
 echo "-- no bytecode in the checkout"
 # Run as a script and imported (the py helper), stats.py leaves no __pycache__ next to it.
 assert "no __pycache__ in scripts/" test -z "$(find "$ROOT/scripts" -name __pycache__)"

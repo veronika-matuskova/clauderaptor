@@ -458,8 +458,7 @@ def rebuild_jobs(db, state):
     Returns {review file basename: job_id} of the reviews that results.log lines name."""
     jobs = {}
     first_event = {}  # repo -> the time of its first event
-    review_job = {}   # review basename -> (ts, job_id, repo) of its first review_finished event
-    finished_ts = {}  # review basename -> every review_finished time
+    review_events = {}  # review basename -> (ts, job_id, repo) of each of its review_finished events
     for ts, ev, js in db.execute("SELECT ts, event, json FROM events_raw ORDER BY ts, hash"):
         try:
             d = json.loads(js)
@@ -498,8 +497,7 @@ def rebuild_jobs(db, state):
             j["fail_reason"] = j["fail_reason"] or d.get("reason")
         elif ev == "review_finished" and isinstance(d.get("review_file"), str):
             name = os.path.basename(d["review_file"])
-            review_job.setdefault(name, (ts, jid, repo))
-            finished_ts.setdefault(name, []).append(ts)
+            review_events.setdefault(name, []).append((ts, jid, repo))
     named = {}
     branch_repo = job_repos(state)
     for path, repo in results_logs(state):
@@ -542,12 +540,13 @@ def rebuild_jobs(db, state):
             "review_level", "tests", "source", "found"]
     db.executemany("INSERT INTO jobs (%s) VALUES (%s)" % (", ".join(cols), ", ".join("?" * len(cols))),
                    [[j[c] for c in cols] for j in jobs.values()])
-    return review_job, finished_ts, named, branch_repo
+    return review_events, named, branch_repo
 
 
-def link_reviews(db, review_job, finished_ts, named, branch_repo):
-    """Each review's job, repo and cache hits: from its review_finished events, else from the results.log line
-    that names it, else the first job of its branch that ended after it."""
+def link_reviews(db, review_events, named, branch_repo):
+    """Each review's job, repo and cache hits: from its review_finished events (the one nearest the time the
+    file was written: a review run again at the same commit overwrites it), else from the results.log line that
+    names it, else the first job of its branch that ended after it and started before it."""
     jobs_by_branch = {}
     for jid, repo, branch, started, ended in db.execute(
             "SELECT job_id, repo, branch, started, ended FROM jobs WHERE ended IS NOT NULL ORDER BY ended"):
@@ -557,11 +556,16 @@ def link_reviews(db, review_job, finished_ts, named, branch_repo):
     for rid, branch, kind, finished, sidecar, repo in db.execute(
             "SELECT id, branch, kind, finished, sidecar, repo FROM reviews").fetchall():
         jid = cached = None
-        if rid in review_job:
-            jid, jrepo = review_job[rid][1], review_job[rid][2]
-            # a review_finished well after the review was written is a cached "already reviewed as ready"
+        evs = review_events.get(rid)
+        ev_repo = None
+        if evs:
             if finished:
-                cached = sum(1 for t in finished_ts[rid] if t and epoch(t) - epoch(finished) > 120)
+                near = min(evs, key=lambda e: (abs(epoch(e[0]) - epoch(finished)) if e[0] else float("inf"), e[0] or ""))
+                # a review_finished well after the review was written is a cached "already reviewed as ready"
+                cached = sum(1 for t, _, _ in evs if t and epoch(t) - epoch(finished) > 120)
+            else:
+                near = evs[0]
+            jid, ev_repo = near[1], near[2]
         elif rid in named:
             jid = named[rid]
         elif finished and branch in jobs_by_branch:
@@ -569,7 +573,7 @@ def link_reviews(db, review_job, finished_ts, named, branch_repo):
                 if ended >= finished and (not started or started <= finished):
                     jid = cand
                     break
-        r = repo_of.get(jid) or (review_job[rid][2] if rid in review_job else None) or repo or branch_repo.get(branch)
+        r = repo_of.get(jid) or ev_repo or repo or branch_repo.get(branch)
         updates.append((jid, r, cached, rid))
     db.executemany("UPDATE reviews SET job_id = ?, repo = ?, cached = ? WHERE id = ?", updates)
 

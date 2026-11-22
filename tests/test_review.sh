@@ -4,7 +4,7 @@
 source "$(dirname "$0")/lib.sh"
 
 mkdir -p "$TMP/bin"
-unset REVIEW_TIMEOUT
+unset REVIEW_TIMEOUT REVIEW_MODEL REVIEW_EFFORT REVIEW_CONFIG   # the documented overrides, if the user exported one
 # The user's rules: a stand-in for ~/.claude, which the tests never touch.
 export REVIEW_DIR="$TMP/reviews" STUB="$TMP/stub" CLAUDE_CONFIG_DIR="$TMP/claude-config"
 # rules is a link, as install.sh makes ~/.claude/rules.
@@ -157,9 +157,12 @@ assert "config: no effort -> no session"  test ! -f "$STUB/args"
 out="$(REVIEW_CONFIG="$TMP/nope.conf" rv "$W")"
 assert_contains "config: missing file -> exit 2" "$out" "exit=2"
 assert_contains "config: missing file says so" "$out" "missing $TMP/nope.conf"
+assert "config: missing file -> no session" test ! -f "$STUB/args"
 printf 'code_effort_medium=high\n' > "$TMP/nomodel.conf"
 out="$(REVIEW_CONFIG="$TMP/nomodel.conf" rv "$W")"
-assert_contains "config: no model -> exit 2" "$out" "no code_model in $TMP/nomodel.conf"
+assert_contains "config: no model -> exit 2" "$out" "exit=2"
+assert_contains "config: no model says so" "$out" "no code_model in $TMP/nomodel.conf"
+assert "config: no model -> no session" test ! -f "$STUB/args"
 printf 'code_model=opus\ncode_effort_medium=high\nfalse\n' > "$TMP/broken.conf"
 commit 29; out="$(REVIEW_CONFIG="$TMP/broken.conf" rv "$W")"
 assert_contains "config: a failing file -> exit 2" "$out" "exit=2"

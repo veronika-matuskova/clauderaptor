@@ -18,12 +18,21 @@ Outside WSL it prints the report's path instead. $STATS_EDGE overrides msedge.ex
 $STATS_WINDOWS_USERS_DIR /mnt/c/Users (for tests).
 The cost-and-tokens section reads stats.py's transcript views (v_tokens_by_role, v_cache_hit_rate,
 v_subagent_share, v_cost_per_merged_branch) and says "no data yet" while a db doesn't have them.
+The first section, "Queue now", isn't from the db: at render time it reads the queue's own files in $PR_QUEUE_DIR
+(default ${XDG_STATE_HOME:-~/.local/state}/pr-queue), so every Refresh shows the queue as it is. Per repo
+(repos/<repo>/): the running jobs (running/*.job) with their step, from the job's last event in events.jsonl (or
+$STATS_EVENTS_FILE) that names one (STEPS, REVIEW_STEPS), and how long ago that event was; the queued ones
+(queue/*.job, in name order) and how long each has waited (the ns time at the start of the job's name); and
+"needs attention": the last 5 FAILED lines of results.log, for branches whose last line there is FAILED and that
+have no newer job (none queued or running, and none in done/ queued after the line's time). Done jobs aren't listed. Every
+value from those files is escaped (branch names are untrusted); paths are shown as text, never as links.
 """
 import argparse
 import base64
 import datetime
 import html
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -32,6 +41,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 
 sys.dont_write_bytecode = True  # importing stats.py leaves no __pycache__ in the checkout
@@ -606,6 +616,170 @@ def s_data(db, path):
     return section("Data", body, "data")
 
 
+# --- the queue now: read from the queue's files at render time, not from the db -------------------------------
+
+NEEDS_ATTENTION = 5  # FAILED lines shown per repo
+# A running job's step, from its last event that names one (other events, like review_finished, leave it as it is).
+STEPS = {"job_queued": "merging main", "job_started": "merging main", "main_merged": "reviewing",
+         "e2e_waiting": "waiting for the e2e lock", "e2e_started": "e2e", "pr_opened": "waiting for CI",
+         "checks_finished": "merging"}
+REVIEW_STEPS = {"code": "code review", "tests": "test review", "judge": "judge"}
+RESULT_LINE = re.compile(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) ([A-Z]+) ([^\s:]+): (.*)")  # FAILED, MERGED, READY
+
+
+def queue_state_dir():
+    return os.environ.get("PR_QUEUE_DIR") or os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "pr-queue")
+
+
+def ago(seconds):
+    s = max(0, int(seconds))
+    if s < 60:
+        return "%d s" % s
+    if s < 3600:
+        return "%d min" % (s // 60)
+    if s < 86400:
+        return "%d h %02d min" % (s // 3600, s % 3600 // 60)
+    return "%d d %d h" % (s // 86400, s % 86400 // 3600)
+
+
+def job_files(folder):
+    """(job_id, path) of a folder's job files, oldest first (a job_id starts with its queue time in ns)."""
+    try:
+        names = sorted(n for n in os.listdir(folder) if n.endswith(".job"))
+    except OSError:
+        return []
+    return [(n[:-4], os.path.join(folder, n)) for n in names]
+
+
+def job_fields(path):
+    out = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                k, eq, v = line.rstrip("\n").partition("=")
+                if eq and k not in out:
+                    out[k] = v
+    except OSError:
+        pass
+    return out
+
+
+def job_time(job_id):
+    """The queue time (epoch seconds) at the start of a job_id, or None."""
+    m = re.match(r"(\d{10,})-", job_id)
+    return int(m.group(1)) / 1e9 if m else None
+
+
+def job_steps(events_file, job_ids):
+    """job_id -> (step, epoch of its event) of the running jobs, from their last event that names a step."""
+    out = {}
+    try:
+        fh = open(events_file, encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    with fh:
+        for line in fh:
+            if not any(j in line for j in job_ids):
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict) or d.get("job_id") not in job_ids:
+                continue
+            ev = d.get("event")
+            step = REVIEW_STEPS.get(d.get("kind")) if ev == "review_started" else STEPS.get(ev)
+            ts = stats.norm_ts(d["ts"]) if isinstance(d.get("ts"), str) else None
+            if step and ts:
+                out[d["job_id"]] = (step, stats.epoch(ts))
+    return out
+
+
+def needs_attention(rq, busy, done):
+    """The last NEEDS_ATTENTION FAILED lines of a repo's results.log, newest first, as (time, branch, reason): only
+    a branch whose last line there is FAILED (not a later MERGED or READY), and only if the branch has no newer
+    job: none queued or running (busy), and none in done/ queued after the line (done: branch -> the queue times
+    of its done jobs)."""
+    last = {}
+    try:
+        with open(os.path.join(rq, "results.log"), encoding="utf-8", errors="replace") as fh:
+            for n, line in enumerate(fh):
+                m = RESULT_LINE.match(line.rstrip("\n"))
+                if m:
+                    last[m.group(3)] = (n, m.group(1), m.group(4)) if m.group(2) == "FAILED" else None
+    except OSError:
+        return []
+    out = []
+    for branch, line in last.items():
+        if line is None:
+            continue
+        n, when, reason = line
+        ts = stats.local_ts(when)
+        at = stats.epoch(ts) if ts else None
+        if branch in busy or any(at is None or t > at for t in done.get(branch, ())):
+            continue
+        out.append((n, when, branch, reason))
+    return [(w, b, r) for _, w, b, r in sorted(out, reverse=True)[:NEEDS_ATTENTION]]
+
+
+def queue_repo(rq, events_file, now):
+    running = job_files(os.path.join(rq, "running"))
+    queued = job_files(os.path.join(rq, "queue"))
+    busy = {job_fields(p).get("branch") for _, p in running + queued}
+    done = {}
+    for jid, p in job_files(os.path.join(rq, "done")):
+        t = job_time(jid)
+        done.setdefault(job_fields(p).get("branch"), []).append(t if t is not None else float("inf"))
+    failed = needs_attention(rq, busy, done)
+    if not (running or queued or failed):
+        return '<p class="empty">Nothing running or queued.</p>'
+    steps = job_steps(events_file, {jid for jid, _ in running})
+    body = []
+    if running:
+        rows = []
+        for jid, p in running:
+            step, at = steps.get(jid, ("running", None))
+            rows.append('<li><span class="qb">%s</span>: %s%s</li>' % (
+                e(job_fields(p).get("branch") or jid), e(step), "" if at is None else e(", for " + ago(now - at))))
+        body.append('<h4>Running</h4><ul class="q">%s</ul>' % "".join(rows))
+    if queued:
+        rows = []
+        for jid, p in queued:
+            t = job_time(jid)
+            rows.append('<li><span class="qb">%s</span>%s</li>' % (
+                e(job_fields(p).get("branch") or jid), "" if t is None else e(", waiting " + ago(now - t))))
+        body.append('<h4>Queued</h4><ol class="q">%s</ol>' % "".join(rows))
+    if failed:
+        rows = []
+        for when, branch, reason in failed:
+            mark = '<strong class="decide">needs your decision</strong> ' if "needs your decision" in reason else ""
+            rows.append('<li>%s<span class="sub">%s</span> <span class="qb">%s</span>: %s</li>' % (
+                mark, e(when), e(branch), e(reason)))
+        body.append('<h4>Needs attention</h4><ul class="q">%s</ul>' % "".join(rows))
+    return "".join(body)
+
+
+def s_queue_now(now=None):
+    """The queue as it is now, per repo: running (with the step), queued and failed branches that need attention."""
+    now = time.time() if now is None else now
+    state = queue_state_dir()
+    asof = '<p class="sub">As of %s.</p>' % e(datetime.datetime.fromtimestamp(now).strftime("%H:%M:%S"))
+    if not os.path.isdir(state):
+        return section("Queue now", asof + '<p class="empty">no queue state at %s</p>' % e(state), "queue-now")
+    events_file = os.environ.get("STATS_EVENTS_FILE") or os.path.join(state, "events.jsonl")
+    rdir = os.path.join(state, "repos")
+    try:
+        repos = sorted(n for n in os.listdir(rdir) if os.path.isdir(os.path.join(rdir, n)))
+    except OSError:
+        repos = []
+    if not repos:
+        return section("Queue now", asof + '<p class="empty">No repos in the queue yet.</p>', "queue-now")
+    body = "".join("<h3>%s</h3>%s" % (e(r), queue_repo(os.path.join(rdir, r), events_file, now))
+                   for r in repos)
+    return section("Queue now", asof + body, "queue-now")
+
+
 CSS = """
 .viz-root{color-scheme:light;--surface-1:#fcfcfb;--page:#f9f9f7;--text-primary:#0b0b0b;--text-secondary:#52514e;
 --muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;--border:rgba(11,11,11,.10);--series-1:#2a78d6;--series-2:#eb6834;
@@ -642,6 +816,8 @@ th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--grid);overfl
 th{color:var(--text-secondary);font-weight:600}td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;overflow-wrap:normal}
 details{margin:6px 0}summary{cursor:pointer;color:var(--text-secondary);font-size:12px}
 .hints li{margin:6px 0}
+h4{font-size:13px;margin:10px 0 4px;color:var(--text-secondary)}ul.q,ol.q{margin:0;padding-left:22px}
+.q li{margin:2px 0;overflow-wrap:anywhere}.qb{font-weight:600}.decide{color:var(--series-2)}
 .refresh{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:6px 0 0}
 .refresh button{font:inherit;padding:3px 12px;border:1px solid var(--axis);border-radius:6px;cursor:pointer;
 background:var(--surface-1);color:var(--text-primary)}.refresh button:disabled{opacity:.6;cursor:default}
@@ -661,7 +837,7 @@ SAFE = re.compile(r"[A-Za-z0-9_-]{16,}")  # what secrets.token_urlsafe makes
 def render(dbpath):
     db = Db(dbpath)
     m = metrics(db)
-    parts = [s_headline(m), s_rework(db, m), s_review_value(db, m), s_tokens(db), s_timeline(db), s_repos(db),
+    parts = [s_queue_now(), s_headline(m), s_rework(db, m), s_review_value(db, m), s_tokens(db), s_timeline(db), s_repos(db),
              s_hints(m), s_data(db, dbpath)]
     # The button stays hidden in the file (no script there); the served page's script shows it.
     refresh = ('<p class="refresh"><button id="refresh" type="button" hidden>Refresh</button>'

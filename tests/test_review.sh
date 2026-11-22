@@ -15,7 +15,8 @@ mkdir -p "$CLAUDE_CONFIG_DIR/rules/team"; echo "User nested rule: ask before del
 mkdir -p "$STUB"
 # $STUB/result: the review text to return; $STUB/fail: exit 1 instead; $STUB/hook: a script to run first.
 # $STUB/slow_stop: on TERM, take 0.5 s to end. Logs its cwd and args (and removes neither, so a test can tell
-# whether it ran), and copies the system prompt file it is given to $STUB/sysprompt.
+# whether it ran), and copies the system prompt file it is given to $STUB/sysprompt. $STUB/json: print it
+# instead of the canned JSON.
 cat > "$TMP/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 [ -f "$STUB/slow_stop" ] && trap 'sleep 0.5; exit 1' TERM
@@ -23,6 +24,7 @@ pwd > "$STUB/cwd"; printf '%s\n' "$@" > "$STUB/args"; readlink /proc/$$/fd/0 > "
 prev=""; for a in "$@"; do [ "$prev" = --append-system-prompt-file ] && cp "$a" "$STUB/sysprompt"; prev="$a"; done
 [ -f "$STUB/fail" ] && exit 1
 [ -f "$STUB/hook" ] && bash "$STUB/hook"
+[ -f "$STUB/json" ] && exec cat "$STUB/json"
 python3 -I -c 'import json, sys; print(json.dumps({"result": open(sys.argv[1]).read(), "total_cost_usd": 0.42, "duration_ms": 61000}))' "$STUB/result"
 EOF
 # timeout: logs the limit it was given ($STUB/timeout), then runs the real one.
@@ -544,6 +546,114 @@ assert_contains "no cap: the review didn't run (exit 2)" "$out" "exit=2"
 assert_contains "no cap: capped.sh's message"  "$out" "CAP_OFF=1 runs it without a cap"
 assert "no cap: no claude -p"                  test ! -f "$STUB/args"
 
+# --- the sidecar <review>.json: the session's numbers and ids, never its text ---
+# full_json <result>: claude's JSON with every field the sidecar reads, and a canary in the result.
+full_json() {
+  python3 -I -c 'import json, sys; print(json.dumps({"type": "result", "result": sys.argv[1], "session_id": "sess-1234",
+    "total_cost_usd": 0.47, "duration_ms": 477000, "duration_api_ms": 401000, "num_turns": 12, "is_error": False,
+    "usage": {"input_tokens": 11, "output_tokens": 22, "cache_creation_input_tokens": 33, "cache_read_input_tokens": 44,
+              "server_tool_use": {"web_search_requests": 0}},
+    "modelUsage": {"claude-opus-5-5": {"inputTokens": 5, "outputTokens": 6, "cacheReadInputTokens": 7,
+                                       "cacheCreationInputTokens": 8, "costUSD": 0.4, "contextWindow": 200000},
+                   "claude-haiku": {"inputTokens": 1, "outputTokens": 2, "cacheReadInputTokens": 3,
+                                    "cacheCreationInputTokens": 4, "costUSD": 0.07}}}))' "$1" > "$STUB/json"
+}
+# sc <file> <python expression of d, the sidecar>: prints the value as JSON (sorted keys)
+sc() { python3 -I -c 'import json, sys; d = json.load(open(sys.argv[1])); print(json.dumps(eval(sys.argv[2]), sort_keys=True))' "$1" "$2" 2>&1; }
+keys='["branch", "cost_usd", "duration_api_ms", "duration_ms", "exit", "file", "finished", "kind", "level", "model_usage", "num_turns", "session_id", "sha", "tests_skipped", "usage", "v", "verdict"]'
+nums='[0.47, 477000, 401000, 12]'
+usage='{"cache_creation_input_tokens": 33, "cache_read_input_tokens": 44, "input_tokens": 11, "output_tokens": 22}'
+musage='{"claude-haiku": {"cacheCreationInputTokens": 4, "cacheReadInputTokens": 3, "costUSD": 0.07, "inputTokens": 1, "outputTokens": 2}, "claude-opus-5-5": {"cacheCreationInputTokens": 8, "cacheReadInputTokens": 7, "costUSD": 0.4, "inputTokens": 5, "outputTokens": 6}}'
+nums_of='[d["cost_usd"], d["duration_ms"], d["duration_api_ms"], d["num_turns"]]'
+ids_of='[d["v"], d["kind"], d["branch"], d["sha"], d["level"], d["file"], d["session_id"], d["tests_skipped"]]'
+commit sc1; full_json $'CANARY-7f3a the save is not awaited.\nVerdict: needs changes'
+out="$(rv "$W" high)"; j="$REVIEW_DIR/feat-notes-$sha-high.json"; full="$(git -C "$W" rev-parse HEAD)"
+assert_contains "sidecar: the review still runs" "$out" "exit=1"
+assert "sidecar: written next to the review"  test -f "$j"
+assert_contains "sidecar: only its fields"    "$(sc "$j" 'sorted(d)')" "$keys"
+assert_contains "sidecar: code ids"           "$(sc "$j" "$ids_of")" "[1, \"code\", \"feat/notes\", \"$full\", \"high\", \"feat-notes-$sha-high.md\", \"sess-1234\", false]"
+assert_contains "sidecar: cost, times, turns" "$(sc "$j" "$nums_of")" "$nums"
+assert_contains "sidecar: usage, tokens only" "$(sc "$j" 'd["usage"]')" "$usage"
+assert_contains "sidecar: model usage, tokens and cost only" "$(sc "$j" 'd["model_usage"]')" "$musage"
+assert_contains "sidecar: verdict and exit"   "$(sc "$j" '[d["verdict"], d["exit"]]')" '["needs changes", 1]'
+assert "sidecar: finished in UTC ISO 8601"    grep -qE '"finished": "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"' "$j"
+assert_not_contains "sidecar: not the review text" "$(cat "$j")" "CANARY"
+assert_not_contains "sidecar: nor the prompt" "$(cat "$j")" "code-review"
+assert "sidecar: private (0600)"              test "$(stat -c %a "$j")" = 600
+assert "sidecar: no temp file left"           test -z "$(find "$REVIEW_DIR" -name '.sidecar-*')"
+assert_contains "sidecar: the review is unchanged" "$(cat "$REVIEW_DIR/feat-notes-$sha-high.md")" "CANARY-7f3a"
+full_json $'CANARY-7f3a\nVerdict: ready'
+out="$(rv --tests "$W")"; j="$REVIEW_DIR/feat-notes-$sha-tests.json"
+assert_contains "sidecar: tests ids"          "$(sc "$j" "$ids_of")" "[1, \"tests\", \"feat/notes\", \"$full\", null, \"feat-notes-$sha-tests.md\", \"sess-1234\", null]"
+assert_contains "sidecar: tests numbers"      "$(sc "$j" "$nums_of + [d[\"usage\"], d[\"model_usage\"]]")" "${nums%]}, $usage, $musage]"
+assert_contains "sidecar: tests verdict and exit" "$(sc "$j" '[d["verdict"], d["exit"]]')" '["ready", 0]'
+assert_not_contains "sidecar: tests: not the text" "$(cat "$j")" "CANARY"
+# A cached "already reviewed as ready" run writes no new sidecar.
+rm "$j"; out="$(rv --tests "$W")"
+assert_contains "sidecar: cached run"         "$out" "already reviewed as ready"
+assert "sidecar: cached run writes none"      test ! -e "$j"
+full_json $'CANARY-7f3a\nTo fix: none\nEscalate: 1\nVerdict: escalate'
+out="$(rv --judge "$W" "$TMP/code-review.md")"; j="$REVIEW_DIR/feat-notes-$sha-judge.json"
+assert_contains "sidecar: judge escalates"    "$out" "exit=3"
+assert_contains "sidecar: judge ids"          "$(sc "$j" "$ids_of")" "[1, \"judge\", \"feat/notes\", \"$full\", null, \"feat-notes-$sha-judge.md\", \"sess-1234\", null]"
+assert_contains "sidecar: judge numbers"      "$(sc "$j" "$nums_of + [d[\"usage\"], d[\"model_usage\"]]")" "${nums%]}, $usage, $musage]"
+assert_contains "sidecar: judge verdict and exit" "$(sc "$j" '[d["verdict"], d["exit"]]')" '["escalate", 3]'
+assert_not_contains "sidecar: judge: not the text" "$(cat "$j")" "CANARY"
+full_json $'CANARY-7f3a\nCounts: mutation 0, missing 0'
+msha="$(git -C "$M" rev-parse --short=12 HEAD)"; mfull="$(git -C "$M" rev-parse HEAD)"
+out="$(rv --suite "$M")"; j="$REVIEW_DIR/repo-suite-$msha.json"
+assert_contains "sidecar: suite runs"         "$out" "exit=0"
+assert_contains "sidecar: suite ids"          "$(sc "$j" "$ids_of")" "[1, \"suite\", \"main\", \"$mfull\", null, \"repo-suite-$msha.md\", \"sess-1234\", null]"
+assert_contains "sidecar: suite numbers"      "$(sc "$j" "$nums_of + [d[\"usage\"], d[\"model_usage\"]]")" "${nums%]}, $usage, $musage]"
+assert_contains "sidecar: suite: no verdict, exit 0" "$(sc "$j" '[d["verdict"], d["exit"]]')" '[null, 0]'
+assert_not_contains "sidecar: suite: not the text" "$(cat "$j")" "CANARY"
+full_json 'CANARY-7f3a I looked around.'
+out="$(rv --suite "$M")"
+assert_contains "sidecar: an audit with no Counts line" "$out" "exit=2"
+assert_contains "sidecar: its exit code"      "$(sc "$j" '[d["verdict"], d["exit"]]')" '[null, 2]'
+# A sidecar that can't be written (a folder in its place) changes neither the output nor the exit code.
+commit sc2; full_json $'CANARY-7f3a x.\nVerdict: needs changes'
+before_out="$(rv "$W")"; before_md="$(cat "$REVIEW_DIR/feat-notes-$sha-medium.md")"
+j="$REVIEW_DIR/feat-notes-$sha-medium.json"; rm "$j" "$REVIEW_DIR/feat-notes-$sha-medium.md"; mkdir -p "$j/in"
+out="$(rv "$W")"
+assert_contains "sidecar unwritable: exit as before" "$out" "exit=1"
+assert "sidecar unwritable: the same output"  test "$out" = "$before_out"
+assert "sidecar unwritable: the same review"  test "$(cat "$REVIEW_DIR/feat-notes-$sha-medium.md")" = "$before_md"
+assert "sidecar unwritable: no temp file left" test -z "$(find "$REVIEW_DIR" -name '.sidecar-*')"
+rm -r "$j"; full_json $'x.\nVerdict: ready'; mkdir "$j"
+assert_contains "sidecar unwritable: ready stays exit 0" "$(rv "$W")" "exit=0"
+rm -r "$j"
+# An earlier sidecar of the same review is removed first: a write that fails (python3 stubbed to fail it) leaves
+# none, not the old one next to the new review.
+mkdir -p "$TMP/failpy"; REAL_PY="$(command -v python3)"; export REAL_PY
+# shellcheck disable=SC2016  # expands in the stub
+printf '#!/usr/bin/env bash\ncase "$*" in *mkstemp*) exit 1 ;; esac\nexec "$REAL_PY" "$@"\n' > "$TMP/failpy/python3"
+chmod +x "$TMP/failpy/python3"
+commit sc5; full_json $'x.\nVerdict: needs changes'
+before_out="$(rv "$W")"; before_md="$(cat "$REVIEW_DIR/feat-notes-$sha-medium.md")"; j="$REVIEW_DIR/feat-notes-$sha-medium.json"
+assert "stale sidecar: the first one written" test -f "$j"
+out="$(PATH="$TMP/failpy:$TMP/bin:$PATH" bash "$ROOT/scripts/queue/review.sh" "$W" 2>&1; echo "exit=$?")"
+assert "stale sidecar: removed when the new one fails" test ! -e "$j"
+assert "stale sidecar: the same output"       test "$out" = "$before_out"
+assert "stale sidecar: the same review"       test "$(cat "$REVIEW_DIR/feat-notes-$sha-medium.md")" = "$before_md"
+# tests_skipped: true for a code review that left the tests out
+commit sc6; full_json $'x.\nVerdict: ready'
+out="$(REVIEW_SKIP_TESTS=1 rv "$W")"; j="$REVIEW_DIR/feat-notes-$sha-medium-notests.json"
+assert_contains "sidecar: tests left out"     "$(sc "$j" '[d["kind"], d["level"], d["file"], d["tests_skipped"]]')" \
+  "[\"code\", \"medium\", \"feat-notes-$sha-medium-notests.md\", true]"
+# Fields missing from claude's JSON (or of the wrong type) are null.
+commit sc3; printf '{"result": "Verdict: ready\\n"}\n' > "$STUB/json"
+out="$(rv "$W")"; j="$REVIEW_DIR/feat-notes-$sha-medium.json"
+assert_contains "sidecar, fields missing: the review runs" "$out" "exit=0"
+assert_contains "sidecar, fields missing: nulls" "$(sc "$j" '[d["session_id"]] + '"$nums_of"' + [d["usage"], d["model_usage"]]')" \
+  '[null, null, null, null, null, null, null]'
+assert_contains "sidecar, fields missing: still its ids" "$(sc "$j" '[d["kind"], d["verdict"], d["exit"]]')" '["code", "ready", 0]'
+commit sc4; printf '%s\n' '{"result": "Verdict: ready\n", "session_id": 5, "num_turns": true, "usage": {"input_tokens": "9"}, "modelUsage": {"m": {"costUSD": "1"}}}' > "$STUB/json"
+out="$(rv "$W")"; j="$REVIEW_DIR/feat-notes-$sha-medium.json"
+assert_contains "sidecar, wrong types: nulls" "$(sc "$j" '[d["session_id"], d["num_turns"], d["usage"]["input_tokens"], d["model_usage"]["m"]["costUSD"]]')" \
+  '[null, null, null, null]'
+rm "$STUB/json"
+
 printf 'Counts: mutation 0, missing 0, empty 0, duplicate 0, not atomic 0, rule 0\nVerdict: ready\n' > "$STUB/result"
 assert_contains "bad level"       "$(rv "$W" max)" "level must be low, medium, high or xhigh"
 assert_contains "not a checkout"  "$(rv "$TMP")" "is not a git checkout"
@@ -551,6 +661,7 @@ git -C "$W" checkout -q --detach
 assert_contains "detached HEAD"   "$(rv "$W")" "is not on a branch"
 assert_contains "detached HEAD: --tests too" "$(rv --tests "$W")" "is not on a branch"
 assert_contains "detached HEAD: an audit is fine" "$(rv --suite "$W")" "exit=0"
+assert_contains "detached HEAD: the sidecar's branch is null" "$(sc "$REVIEW_DIR/wt-suite-$(git -C "$W" rev-parse --short=12 HEAD).json" 'd["branch"]')" "null"
 assert_contains "usage"           "$(rv)" "usage: review.sh"
 
 finish

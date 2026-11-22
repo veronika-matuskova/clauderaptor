@@ -541,16 +541,19 @@ assert_contains "no wait: it ran"            "$out" "FAILED fix/next"
 assert_contains "no wait: the first repo's jobs ran" "$out" "FAILED fix/second"
 assert "no wait: no job left queued"         test -z "$(find "$RQ/queue" "$RQ2/queue" -name '*.job')"
 # A repo whose runner has ended gets a new one for a job queued to it later, while another repo's runner still
-# works (its review sessions hang).
+# works (its review sessions hang). The first job's e2e run (1 s) outlasts several polls: a repo whose runner
+# still works isn't taken for one that another runner holds, and so isn't left out.
 reset_pr; rm -rf "$TQ/hung"; touch "$TQ/e2e_fail" "$TQ/hang"; mkwt slow; mkwt2 b1; mkwt2 b2
+echo 'sleep 1' > "$TQ/on_e2e"
 Q add "$TMP/wt-slow" fix "Slow" >/dev/null
 Q add --review none --tests none "$TMP/wt2-b1" fix "B1" >/dev/null
-PATH="$TQ/bin:$PATH" bash "$ROOT/scripts/pr-queue.sh" run </dev/null >/dev/null 2>&1 & rpid=$!
+PATH="$TQ/bin:$PATH" bash "$ROOT/scripts/pr-queue.sh" run </dev/null >"$TQ/ended.out" 2>&1 & rpid=$!
 for _ in $(seq 100); do grep -q "fix/b1" "$RQ2/results.log" 2>/dev/null && flock -n "$RQ2/run.lock" true && break; sleep 0.1; done
 Q add --review none --tests none "$TMP/wt2-b2" fix "B2" >/dev/null
 for _ in $(seq 100); do grep -q "fix/b2" "$RQ2/results.log" 2>/dev/null && break; sleep 0.1; done
 assert "ended runner: a job queued to its repo later runs" grep -q "fix/b2" "$RQ2/results.log"
 assert "ended runner: while the other repo's job still works" test -n "$(find "$RQ/running" -name '*slow.job')"
+assert_not_contains "ended runner: no working repo left out" "$(cat "$TQ/ended.out")" "a runner is already working"
 kill -TERM "$rpid"; { wait "$rpid"; } 2>/dev/null
 rm -f "$TQ/hang" "$RQ"/running/*
 # A job queued in another repo while the runner works is run too.

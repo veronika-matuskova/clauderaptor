@@ -23,7 +23,8 @@
 # review.sh stops the session too, and waits for it to end. (Started by pr-queue.sh, review.sh ignores SIGINT as
 # a background job: the queue sends it TERM.)
 # The model and effort of each kind of review are set in review.conf, next to this script ($REVIEW_CONFIG to
-# read another file); REVIEW_MODEL and REVIEW_EFFORT override them for one run.
+# read another file); REVIEW_MODEL and REVIEW_EFFORT override them for one run. A commit already reviewed as
+# ready isn't reviewed again with other ones: the cache goes by commit and level, not by model or effort.
 # REVIEW_SKIP_TESTS=1 tells /code-review to leave the quality of tests to the test review.
 # Reviews are saved to $REVIEW_DIR (default $PR_QUEUE_DIR/reviews, the folder pr-queue.sh uses) as
 # <branch>-<sha>-<level>.md (<level>-notests.md with REVIEW_SKIP_TESTS=1) or <branch>-<sha>-tests.md.

@@ -46,8 +46,9 @@
 # HEAD descends from needed changes too) also exits 3: after two judged rounds the user decides, not the queue
 # or its session.
 # REVIEW_BRIEF=<file> gives a code or test review the change's brief (its requirements and acceptance criteria,
-# approved by the user): the review checks the change against each criterion. A judge doesn't get it. (The cache
-# doesn't go by the brief: a commit reviewed as ready without one isn't reviewed again with one.)
+# approved by the user): the review checks the change against each criterion. A judge gets it to check the
+# findings that name a criterion, not to look for others. (The cache doesn't go by the brief: a commit reviewed
+# as ready without one isn't reviewed again with one.)
 # A plan (--plan) reads the request file and the checkout's HEAD, which may move meanwhile (only a note), and
 # writes a brief: requirements, acceptance criteria A1…, out of scope, risk, open questions. It is saved to
 # $BRIEF_DIR (default $PR_QUEUE_DIR/briefs) as <repo>-<sha>-<time>-<random>.md, with a sidecar, and printed. Exit 0 = a
@@ -162,7 +163,7 @@ dir="${REVIEW_DIR:-${PR_QUEUE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/pr-queu
 mkdir -p "$dir" || die "can't create $dir"
 base="$dir/${branch//\//-}-$sha"
 brief=""
-if [ -n "${REVIEW_BRIEF:-}" ] && { [ "$mode" = code ] || [ "$mode" = tests ]; }; then
+if [ -n "${REVIEW_BRIEF:-}" ] && { [ "$mode" = code ] || [ "$mode" = tests ] || [ "$mode" = judge ]; }; then
   [ -f "$REVIEW_BRIEF" ] || die "no such brief: $REVIEW_BRIEF"
   brief="$(readlink -f "$REVIEW_BRIEF")"
 fi
@@ -246,6 +247,12 @@ that names it (e.g. A2) and says what is missing."
 - Reviews to judge (read each with cat): ${reviews[*]}
 - Earlier rulings on this branch, oldest first (read each with cat): ${earlier//$'\n'/ }"
     if [ -z "$earlier" ]; then task+="none"; fi
+    if [ -n "$brief" ]; then
+      task+="
+- The change's brief, approved by the user (read it with cat): $brief. Use it only to rule on findings that name
+  one of its acceptance criteria (e.g. \"A2 not met\"): the criterion is part of what the change must do, so a
+  real one is inside the change. Don't look for criteria the reviews didn't raise."
+    fi
     title="Judgement of $branch at $sha ("
     ;;
   plan)

@@ -745,8 +745,11 @@ commit brief2; rv "$W" >/dev/null
 assert_not_contains "brief: none without REVIEW_BRIEF" "$(cat "$STUB/args")" "brief"
 printf 'Ruling.\nVerdict: ready\n' > "$STUB/result"
 REVIEW_BRIEF="$TMP/the-brief.md" rv --judge "$W" "$TMP/code-review.md" >/dev/null
-assert_contains "brief: the judge runs"       "$(cat "$STUB/args")" "Judge the reviews of one change"
-assert_not_contains "brief: the judge doesn't get it" "$(cat "$STUB/args")" "the-brief.md"
+assert_contains "brief: the judge gets it"    "$(cat "$STUB/args")" "approved by the user (read it with cat): $TMP/the-brief.md"
+assert_contains "brief: only for findings that name a criterion" "$(cat "$STUB/args")" "Don't look for criteria the reviews didn't raise."
+rm "$REVIEW_DIR"/feat-notes-"$sha"-judge.*; rv --judge "$W" "$TMP/code-review.md" >/dev/null
+assert "brief: the judge ran again"           test -f "$STUB/args"
+assert_not_contains "brief: none for the judge without REVIEW_BRIEF" "$(cat "$STUB/args")" "brief"
 commit brief3; out="$(REVIEW_BRIEF="$TMP/nope.md" rv "$W")"
 assert_contains "brief: a missing brief -> exit 2" "$out" "exit=2"
 assert_contains "brief: says so"              "$out" "no such brief: $TMP/nope.md"

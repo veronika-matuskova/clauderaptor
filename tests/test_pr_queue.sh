@@ -364,7 +364,7 @@ assert "brief: stored with the job"          grep -q "the brief text" "$(find "$
 rm "$TMP/brief.md"; out="$(Q run)"
 assert_contains "brief: the code review gets it" "$(cat "$TQ/brief.log")" "code # Brief: x"
 assert_contains "brief: the test review gets it" "$(cat "$TQ/brief.log")" "tests # Brief: x"
-assert_not_contains "brief: the judge doesn't"   "$(cat "$TQ/brief.log")" "judge "
+assert_contains "brief: the judge gets it too"   "$(cat "$TQ/brief.log")" "judge # Brief: x"
 assert "brief: kept with the failed job"     test -n "$(find "$RQ/failed" -name '*fix-brief.brief')"
 rm -f "$TQ/verdict" "$TQ/brief.log"
 out="$(Q add "$TMP/wt-brief" fix "Brief")"; assert_contains "brief: a re-queue keeps it" "$out" "keeping the brief from the earlier job"
@@ -373,6 +373,20 @@ out="$(Q run)"
 assert_contains "brief: the re-queue's reviews get it" "$(cat "$TQ/brief.log")" "code # Brief: x"
 assert_contains "brief: then merged"         "$out" "MERGED fix/brief"
 assert "brief: kept with the done job"       test -n "$(find "$RQ/done" -name '*fix-brief.brief')"
+mkwt brief2 brief2.txt later fix/brief   # a later branch of the same name
+out="$(Q add "$TMP/wt-brief2" fix "Later")"
+assert_contains "brief: the later branch is queued" "$out" "queued fix/brief"
+assert_not_contains "brief: not from a job that merged" "$out" "keeping the brief"
+assert "brief: so the new job has none"      test -z "$(find "$RQ/queue" -name '*fix-brief.brief')"
+printf '# Brief: y\n' > "$TMP/brief2.md"; Q add --brief "$TMP/brief2.md" "$TMP/wt-brief2" fix "Later" >/dev/null
+out="$(Q add --brief none "$TMP/wt-brief2" fix "Later")"
+assert_contains "brief: --brief none drops it" "$out" "no brief for this job"
+assert "brief: none stored"                  test -z "$(find "$RQ/queue" -name '*fix-brief.brief')"
+Q add --brief "$TMP/brief2.md" "$TMP/wt-brief2" fix "Later" >/dev/null
+out="$(Q add "$TMP/wt-brief2" fix "Later")"
+assert_contains "brief: kept from the latest queued job" "$out" "keeping the brief from the earlier job"
+assert "brief: the latest one"               grep -q "Brief: y" "$(find "$RQ/queue" -name '*fix-brief.brief')"
+rm -f "$RQ"/queue/*fix-brief.*
 reset_pr; rm -f "$TQ/brief.log"; mkwt nobrief
 Q add "$TMP/wt-nobrief" fix "No brief" >/dev/null; out="$(Q run)"
 assert "brief: none without --brief"         test ! -s "$TQ/brief.log"

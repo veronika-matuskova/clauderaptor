@@ -12,7 +12,7 @@
   - Give the agent the approved brief. Its report and PR body list each criterion with its proof (the test, or
     the command and its output), and a "Not proven:" line with the criteria it couldn't prove (or "none").
   - Queue the branch with `pr-queue.sh add --brief <brief file>`: both reviews check the change against the
-    criteria. The judge still rules only on the findings the reviews raised.
+    criteria. The judge gets the brief too, but still rules only on the findings the reviews raised.
   - A small fix with nothing to decide may go without a brief.
 - The queue reviews each branch before its e2e run, in two fresh `claude -p` sessions at the same time
   (`scripts/queue/review.sh`): the code, with the built-in `/code-review`, and the tests (`review.sh --tests`: a mutation

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local-only stats of the PR queue: how many rounds a branch takes, what reviews cost, what they find.
 
-  stats.py ingest [--db PATH]   reads the queue's state into a SQLite db
+  stats.py ingest [--db PATH] [--projects DIR]   reads the queue's state and Claude Code's transcripts into a SQLite db
 
 The db (default $CLAUDERAPTOR_STATS_DIR/stats.db, else ${XDG_STATE_HOME:-~/.local/state}/clauderaptor-stats/stats.db)
 stays on this machine: stats.py refuses (exit 2) to write it into a git work tree. Its folder is created 0700,
@@ -16,11 +16,28 @@ Sources, all in $PR_QUEUE_DIR (default ${XDG_STATE_HOME:-~/.local/state}/pr-queu
   authoritative numbers (and tests_skipped, else the -notests in a code review's name).
 - results.log files (repos/*/results.log and the old single queue's): FAILED, MERGED and READY lines fill in
   the rounds of the time before a repo had events.
+- Claude Code's transcripts in --projects DIR (default ${CLAUDE_CONFIG_DIR:-~/.claude}/projects): */*.jsonl, one
+  session each, and */<session>/subagents/*.jsonl, its subagents. Read incrementally like events.jsonl. Only an
+  allowlist of fields is read, and nothing else is stored: message.id, message.model, the token counts in
+  message.usage, timestamp, entrypoint, gitBranch and cwd (stored only as a hash, plus the folder name the
+  repo and worktree come from); the session id is the file's name. Never the messages' content, nor the
+  account or organization ids.
+  Streamed chunks repeat a message's usage: each message.id counts once.
 Ingesting the same files again changes nothing. A db of an older schema version gets the new columns, and its
 review files are read again to fill them.
 Views: v_rounds_per_branch, v_findings_by_severity (code and test reviews only), v_cost_by_kind_level,
 v_failures_by_reason (failed and escalated rounds; a job replaced in the queue never ran, so it is no round)
 and v_judge_rulings (reviewer_precision: the share of the blocking findings it judged that the judge confirmed).
+From the transcripts: v_tokens_by_role (tokens and the estimated API-equivalent cost per role and repo),
+v_subagent_share (the subagents' part of each role), v_cache_hit_rate (cache reads / all input tokens, per role)
+and v_cost_per_merged_branch (the agents' estimated cost, from the transcripts, and the reviews' and judges'
+cost, from the review files, per merged branch). These count a subagent toward its parent's role.
+Session roles: review, judge or suite for a session a review sidecar names; subagent for a subagent's file
+(sessions.role_eff rolls it up into its parent's role, and a subagent of the main session that worked in a
+worktree into agent); for an sdk-cli session in a worktree without a sidecar, the review's kind if a review of
+its branch without a sidecar was written within 5 minutes after the session ended (the reviews from before the
+sidecars), else agent; main for a cli session in a checkout; other for anything else (cli in a worktree, a
+session in a temp dir). A subagent's repo and branch are those of the worktree it spent the most lines in.
 """
 import argparse
 import calendar
@@ -34,7 +51,7 @@ import sqlite3
 import sys
 import time
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -52,6 +69,23 @@ CREATE TABLE IF NOT EXISTS findings (
   review_id TEXT NOT NULL, n INTEGER NOT NULL, sev_norm TEXT, sev_raw TEXT, category TEXT, path TEXT, line INTEGER,
   ruling TEXT, PRIMARY KEY (review_id, n));
 CREATE TABLE IF NOT EXISTS ingest_state (path TEXT PRIMARY KEY, inode INTEGER, size INTEGER, offset INTEGER, mtime REAL);
+CREATE TABLE IF NOT EXISTS sessions (
+  session_id TEXT PRIMARY KEY, role TEXT, repo TEXT, worktree TEXT, branch TEXT, cwd_hash TEXT, place TEXT,
+  entrypoint TEXT, start TEXT, end TEXT, msgs INTEGER, parent_session TEXT, review_id TEXT, role_eff TEXT,
+  link TEXT);
+CREATE TABLE IF NOT EXISTS session_places (
+  session_id TEXT NOT NULL, cwd_hash TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT, place TEXT, lines INTEGER,
+  PRIMARY KEY (session_id, cwd_hash, branch));
+CREATE TABLE IF NOT EXISTS usage_msgs (
+  msg_id TEXT PRIMARY KEY, session_id TEXT, model TEXT, day TEXT,
+  tokens_in INTEGER, tokens_out INTEGER, cache_w INTEGER, cache_w_1h INTEGER, cache_r INTEGER);
+CREATE TABLE IF NOT EXISTS usage_daily (
+  session_id TEXT NOT NULL, model TEXT NOT NULL, day TEXT NOT NULL, tokens_in INTEGER, tokens_out INTEGER,
+  cache_w INTEGER, cache_w_1h INTEGER, cache_r INTEGER, msgs INTEGER, cost_usd_est REAL,
+  PRIMARY KEY (session_id, model, day));
+CREATE TABLE IF NOT EXISTS prices (
+  model TEXT NOT NULL, effective_from TEXT NOT NULL, usd_in REAL, usd_out REAL, usd_cache_w REAL,
+  usd_cache_w_1h REAL, usd_cache_r REAL, source TEXT, PRIMARY KEY (model, effective_from));
 """
 
 # Dropped and made again on every run, so that a new version's views replace an old db's.
@@ -61,6 +95,10 @@ DROP VIEW IF EXISTS v_findings_by_severity;
 DROP VIEW IF EXISTS v_cost_by_kind_level;
 DROP VIEW IF EXISTS v_judge_rulings;
 DROP VIEW IF EXISTS v_failures_by_reason;
+DROP VIEW IF EXISTS v_tokens_by_role;
+DROP VIEW IF EXISTS v_cache_hit_rate;
+DROP VIEW IF EXISTS v_cost_per_merged_branch;
+DROP VIEW IF EXISTS v_subagent_share;
 CREATE VIEW v_rounds_per_branch AS
   SELECT repo, branch, round AS rounds, ended AS merged_at, job_id FROM jobs WHERE outcome = 'merged';
 -- The queue's reviewers' findings: not the judge's rulings, nor the suite audits (not part of the queue).
@@ -83,6 +121,63 @@ CREATE VIEW v_judge_rulings AS
          (SELECT ROUND(1.0 * SUM(ruling = 'confirmed') / COUNT(*), 4) FROM findings WHERE ruling IS NOT NULL)
            AS reviewer_precision
   FROM findings WHERE ruling IS NOT NULL GROUP BY ruling;
+-- Tokens per role and repo, from the transcripts, with each subagent counted toward its parent's role
+-- (sessions.role_eff); subagent_* is the subagents' part. cost_usd_est is what the tokens would cost at API
+-- prices (an estimate: a subscription bills otherwise); unpriced_msgs counts the messages of models without a
+-- price, left out of it. The reviews' own cost (review files, sidecars) is in v_cost_by_kind_level.
+CREATE VIEW v_tokens_by_role AS
+  SELECT s.role_eff AS role, s.repo AS repo, COUNT(DISTINCT s.session_id) AS sessions,
+         COUNT(DISTINCT CASE WHEN s.parent_session IS NOT NULL THEN s.session_id END) AS subagent_sessions,
+         SUM(u.msgs) AS msgs, SUM(u.tokens_in) AS tokens_in, SUM(u.tokens_out) AS tokens_out,
+         SUM(u.cache_w) AS tokens_cache_w, SUM(u.cache_r) AS tokens_cache_r,
+         ROUND(SUM(u.cost_usd_est), 4) AS cost_usd_est,
+         ROUND(SUM(CASE WHEN s.parent_session IS NOT NULL THEN u.cost_usd_est END), 4) AS subagent_cost_usd_est,
+         SUM(CASE WHEN u.cost_usd_est IS NULL THEN u.msgs ELSE 0 END) AS unpriced_msgs
+  FROM sessions s JOIN usage_daily u ON u.session_id = s.session_id GROUP BY s.role_eff, s.repo;
+-- The subagents' share of each rolled-up role's tokens (all four kinds) and estimated cost.
+CREATE VIEW v_subagent_share AS
+  SELECT s.role_eff AS role, COUNT(DISTINCT s.session_id) AS sessions,
+         COUNT(DISTINCT CASE WHEN s.parent_session IS NOT NULL THEN s.session_id END) AS subagent_sessions,
+         SUM(u.tokens_in + u.tokens_out + u.cache_w + u.cache_r) AS tokens,
+         SUM(CASE WHEN s.parent_session IS NOT NULL THEN u.tokens_in + u.tokens_out + u.cache_w + u.cache_r ELSE 0 END)
+           AS subagent_tokens,
+         ROUND(1.0 * SUM(CASE WHEN s.parent_session IS NOT NULL THEN u.tokens_in + u.tokens_out + u.cache_w + u.cache_r
+           ELSE 0 END) / NULLIF(SUM(u.tokens_in + u.tokens_out + u.cache_w + u.cache_r), 0), 4) AS subagent_token_share,
+         ROUND(SUM(u.cost_usd_est), 4) AS cost_usd_est,
+         ROUND(SUM(CASE WHEN s.parent_session IS NOT NULL THEN u.cost_usd_est END), 4) AS subagent_cost_usd_est,
+         ROUND(SUM(CASE WHEN s.parent_session IS NOT NULL THEN u.cost_usd_est ELSE 0 END)
+           / NULLIF(SUM(u.cost_usd_est), 0), 4) AS subagent_cost_share
+  FROM sessions s JOIN usage_daily u ON u.session_id = s.session_id GROUP BY s.role_eff;
+-- The share of the input tokens that came from the prompt cache, per rolled-up role.
+CREATE VIEW v_cache_hit_rate AS
+  SELECT s.role_eff AS role, SUM(u.cache_r) AS tokens_cache_r, SUM(u.tokens_in + u.cache_r + u.cache_w) AS tokens_input,
+         ROUND(1.0 * SUM(u.cache_r) / NULLIF(SUM(u.tokens_in + u.cache_r + u.cache_w), 0), 4) AS cache_hit_rate
+  FROM sessions s JOIN usage_daily u ON u.session_id = s.session_id GROUP BY s.role_eff;
+-- Per merged branch, since its previous merge: the agents' estimated cost (agent sessions, their subagents, and
+-- the main session's subagents that worked in the branch's worktree; linked by the transcripts' repo and branch)
+-- and the reviews' and judges' cost from the review files, which is authoritative.
+CREATE VIEW v_cost_per_merged_branch AS
+  WITH m AS (
+    SELECT j.repo, j.branch, j.job_id, j.ended AS merged_at,
+           (SELECT MAX(p.ended) FROM jobs p WHERE p.repo = j.repo AND p.branch = j.branch AND p.outcome = 'merged'
+              AND p.ended < j.ended) AS since
+    FROM jobs j WHERE j.outcome = 'merged' AND j.repo IS NOT NULL AND j.branch IS NOT NULL),
+  a AS (
+    SELECT s.session_id, s.repo, s.branch, s.start, SUM(u.cost_usd_est) AS cost
+    FROM sessions s JOIN usage_daily u ON u.session_id = s.session_id
+    WHERE s.role_eff = 'agent' GROUP BY s.session_id)
+  SELECT m.repo AS repo, m.branch AS branch, m.merged_at AS merged_at, m.job_id AS job_id,
+         (SELECT COUNT(*) FROM a WHERE a.repo = m.repo AND a.branch = m.branch AND a.start <= m.merged_at
+            AND (m.since IS NULL OR a.start > m.since)) AS agent_sessions,
+         (SELECT ROUND(SUM(a.cost), 4) FROM a WHERE a.repo = m.repo AND a.branch = m.branch AND a.start <= m.merged_at
+            AND (m.since IS NULL OR a.start > m.since)) AS agent_cost_usd_est,
+         (SELECT ROUND(SUM(r.cost_usd), 4) FROM reviews r WHERE r.repo = m.repo AND r.branch = m.branch
+            AND r.kind IN ('code', 'tests') AND r.finished <= m.merged_at AND (m.since IS NULL OR r.finished > m.since))
+           AS review_cost_usd,
+         (SELECT ROUND(SUM(r.cost_usd), 4) FROM reviews r WHERE r.repo = m.repo AND r.branch = m.branch
+            AND r.kind = 'judge' AND r.finished <= m.merged_at AND (m.since IS NULL OR r.finished > m.since))
+           AS judge_cost_usd
+  FROM m;
 """
 
 
@@ -316,17 +411,22 @@ def save_state(db, path, st, offset):
                (path, st.st_ino, st.st_size, offset, st.st_mtime))
 
 
-def ingest_events(db, path):
-    """New complete lines of events.jsonl into events_raw. Returns how many were new."""
+def tail_jsonl(db, path, handle, key=None, restart=None):
+    """Calls handle(text, obj) for each new complete line of a JSON-lines file that holds an object, from where
+    the last run stopped (from the start if the file is another inode or shorter), and saves where it stopped,
+    in ingest_state under key (default: the path). A last line without its newline is left for the next run.
+    restart() is called first when the file is read from its start again. Returns False if the file is missing."""
+    key = key or path
     try:
         st = os.stat(path)
     except OSError:
-        return 0
-    row = db.execute("SELECT inode, offset FROM ingest_state WHERE path = ?", (path,)).fetchone()
+        return False
+    row = db.execute("SELECT inode, offset FROM ingest_state WHERE path = ?", (key,)).fetchone()
     offset = 0
     if row and row[0] == st.st_ino and row[1] <= st.st_size:
         offset = row[1]
-    new = 0
+    if row and offset == 0 and restart:
+        restart()
     with open(path, "rb") as fh:
         fh.seek(offset)
         for raw in fh:
@@ -340,14 +440,24 @@ def ingest_events(db, path):
                 d = json.loads(text.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
                 continue
-            if not isinstance(d, dict):
-                continue
-            h = hashlib.sha256(text).hexdigest()
-            cur = db.execute("INSERT OR IGNORE INTO events_raw (hash, ts, event, json) VALUES (?, ?, ?, ?)",
-                             (h, norm_ts(str(d.get("ts", ""))), d.get("event"), text.decode("utf-8")))
-            new += cur.rowcount
-    save_state(db, path, st, offset)
-    return new
+            if isinstance(d, dict):
+                handle(text, d)
+    save_state(db, key, st, offset)
+    return True
+
+
+def ingest_events(db, path):
+    """New complete lines of events.jsonl into events_raw. Returns how many were new."""
+    new = [0]
+
+    def add(text, d):
+        h = hashlib.sha256(text).hexdigest()
+        cur = db.execute("INSERT OR IGNORE INTO events_raw (hash, ts, event, json) VALUES (?, ?, ?, ?)",
+                         (h, norm_ts(str(d.get("ts", ""))), d.get("event"), text.decode("utf-8")))
+        new[0] += cur.rowcount
+
+    tail_jsonl(db, path, add)
+    return new[0]
 
 
 def ingest_reviews(db, rdir):
@@ -386,6 +496,278 @@ def ingest_reviews(db, rdir):
     return done
 
 
+# --- transcripts ----------------------------------------------------------------------------------------------
+
+# USD per million tokens, by the date they apply from. cache_w is a 5-minute cache write, cache_w_1h a 1-hour one.
+# A day before a model's first row, or a model with no row, has no price: its cost is null and the ingest
+# summary names it.
+PRICE_SOURCE = ("Claude API list prices (first party) from the claude-api skill's model table, cached 2026-11-03: "
+                "cache writes 1.25x input (5 minutes) and 2x (1 hour); Haiku 5.5 at its rate for prompts up to "
+                "100K tokens")
+PRICES = [  # (model, effective_from, in, out, cache_w, cache_w_1h, cache_r)
+    ("claude-opus-5-5", "2026-11-03", 4.00, 20.00, 5.00, 8.00, 0.20),
+    ("claude-sonnet-5-5", "2026-11-03", 2.00, 10.00, 2.50, 4.00, 0.10),
+    ("claude-haiku-5-5", "2026-11-03", 0.10, 0.50, 0.125, 0.20, 0.01),
+]
+
+
+def price_for(model, day):
+    """(in, out, cache_w, cache_w_1h, cache_r) USD per MTok for the model on the day ("YYYY-MM-DD"), or None."""
+    rows = [p for p in PRICES if p[0] == model and p[1] <= (day or "")]
+    return max(rows, key=lambda p: p[1])[2:] if rows else None
+
+
+def cost_est(model, day, tin, tout, cw, cw1h, cr):
+    """The API-equivalent cost of the tokens in USD, or None without a price (0 with no tokens at all)."""
+    if not (tin or tout or cw or cr):
+        return 0.0
+    p = price_for(model, day)
+    if p is None:
+        return None
+    usd_in, usd_out, usd_w, usd_w1h, usd_r = p
+    cw1h = min(cw1h or 0, cw or 0)
+    return ((tin or 0) * usd_in + (tout or 0) * usd_out + ((cw or 0) - cw1h) * usd_w + cw1h * usd_w1h
+            + (cr or 0) * usd_r) / 1e6
+
+
+def default_projects():
+    return os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude"),
+                        "projects")
+
+
+def transcript_files(projects):
+    """(path, session_id, parent session id or None) of each transcript: a session's, then its subagents'. A
+    session's file is named by its sessionId; a subagent's session is "<parent>:agent-<agentId>"."""
+    out = []
+    root = glob.escape(projects)
+    for p in sorted(glob.glob(os.path.join(root, "*", "*.jsonl"))):
+        out.append((p, os.path.basename(p)[:-6], None))
+    for p in sorted(glob.glob(os.path.join(root, "*", "*", "subagents", "*.jsonl"))):
+        parent = os.path.basename(os.path.dirname(os.path.dirname(p)))
+        out.append((p, parent + ":" + os.path.basename(p)[:-6], parent))
+    return out
+
+
+def transcript_key(path):
+    """A transcript's ingest_state key: a hash, since its folder's name is its session's cwd."""
+    return "transcript:" + hashlib.sha256(path.encode("utf-8", "replace")).hexdigest()[:32]
+
+
+def tmp_dirs():
+    import tempfile
+    return {d.rstrip("/") + "/" for d in ("/tmp", "/var/tmp", tempfile.gettempdir())}
+
+
+def cwd_facts(cwd):
+    """(sha256 of the cwd, its folder name, place) of a session's cwd: place is repos (a folder under a repos/),
+    tmp (a temp dir) or dir. Only these are stored, never the path."""
+    if not isinstance(cwd, str) or not cwd:
+        return None, None, None
+    h = hashlib.sha256(cwd.encode("utf-8", "replace")).hexdigest()[:16]
+    parts = cwd.rstrip("/").split("/")
+    if "repos" in parts[:-1]:  # the last repos/ that has a folder after it
+        i = len(parts) - 2 - parts[-2::-1].index("repos")
+        return h, parts[i + 1], "repos"
+    if any((cwd.rstrip("/") + "/").startswith(t) for t in tmp_dirs()):
+        return h, None, "tmp"
+    return h, parts[-1] or None, "dir"
+
+
+def num_tok(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+
+
+def ingest_transcripts(db, projects):
+    """New lines of every transcript (see ingest_transcript). A transcript that can't be read is skipped, its
+    changes undone, and the rest are read. Returns (files read, new msgs, {error name: files skipped})."""
+    files = new = 0
+    skipped = {}
+    for path, sid, parent in transcript_files(projects):
+        db.execute("SAVEPOINT transcript")
+        try:
+            n = ingest_transcript(db, path, sid, parent)
+        except Exception as e:  # noqa: BLE001 -- one bad transcript never stops the ingest
+            db.execute("ROLLBACK TO transcript")
+            skipped[type(e).__name__] = skipped.get(type(e).__name__, 0) + 1
+            n = None
+        db.execute("RELEASE transcript")
+        if n is not None:
+            files += 1
+            new += n
+    return files, new, skipped
+
+
+def ingest_transcript(db, path, sid, parent):
+    """New lines of one transcript: each message's usage once (by message.id), its session's entrypoint, first
+    cwd and branch, first and last time, and its lines per cwd and branch. Reads only the allowlisted fields.
+    Returns how many messages were new, or None if the file is missing."""
+    facts = {"entrypoint": None, "cwd": None, "branch": None, "start": None, "end": None, "lines": 0,
+             "restart": False}
+    msgs = []
+    places = {}  # (cwd, branch) -> lines: where the session's lines were, also after it cd's elsewhere
+
+    def take(text, d):
+        facts["lines"] += 1
+        ts = norm_ts(d["timestamp"]) if isinstance(d.get("timestamp"), str) else None
+        if ts:
+            facts["start"] = min(facts["start"] or ts, ts)
+            facts["end"] = max(facts["end"] or ts, ts)
+        for k, f in (("entrypoint", "entrypoint"), ("cwd", "cwd"), ("branch", "gitBranch")):
+            if facts[k] is None and isinstance(d.get(f), str) and d[f]:
+                facts[k] = d[f]
+        if isinstance(d.get("cwd"), str) and d["cwd"]:
+            pk = (d["cwd"], d["gitBranch"] if isinstance(d.get("gitBranch"), str) else "")
+            places[pk] = places.get(pk, 0) + 1
+        m = d.get("message")
+        if not isinstance(m, dict) or not isinstance(m.get("usage"), dict) or not isinstance(m.get("id"), str):
+            return
+        u = m["usage"]
+        cc = u.get("cache_creation") if isinstance(u.get("cache_creation"), dict) else {}
+        model = m.get("model") if isinstance(m.get("model"), str) else None
+        msgs.append((m["id"], sid, model,
+                     ts[:10] if ts else None, num_tok(u.get("input_tokens")), num_tok(u.get("output_tokens")),
+                     num_tok(u.get("cache_creation_input_tokens")), num_tok(cc.get("ephemeral_1h_input_tokens")),
+                     num_tok(u.get("cache_read_input_tokens"))))
+
+    if not tail_jsonl(db, path, take, transcript_key(path), lambda: facts.update(restart=True)):
+        return None
+    if facts["restart"]:  # read again from the start: its places are counted again
+        db.execute("DELETE FROM session_places WHERE session_id = ?", (sid,))
+    if not facts["lines"]:
+        return 0
+    new = 0
+    for (cwd, branch), n in places.items():
+        h, name, place = cwd_facts(cwd)
+        db.execute("INSERT INTO session_places VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (session_id, cwd_hash, branch) "
+                   "DO UPDATE SET lines = session_places.lines + excluded.lines", (sid, h, branch, name, place, n))
+    for row in msgs:
+        new += db.execute("INSERT OR IGNORE INTO usage_msgs (msg_id, session_id, model, day, tokens_in, tokens_out, "
+                          "cache_w, cache_w_1h, cache_r) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", row).rowcount
+    h, name, place = cwd_facts(facts["cwd"])
+    db.execute(
+        "INSERT INTO sessions (session_id, worktree, branch, cwd_hash, place, entrypoint, start, end, parent_session) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (session_id) DO UPDATE SET "
+        "worktree = CASE WHEN sessions.cwd_hash IS NULL THEN excluded.worktree ELSE sessions.worktree END, "
+        "place = CASE WHEN sessions.cwd_hash IS NULL THEN excluded.place ELSE sessions.place END, "
+        "cwd_hash = COALESCE(sessions.cwd_hash, excluded.cwd_hash), "
+        "branch = COALESCE(sessions.branch, excluded.branch), "
+        "entrypoint = COALESCE(sessions.entrypoint, excluded.entrypoint), "
+        "start = MIN(COALESCE(sessions.start, excluded.start), COALESCE(excluded.start, sessions.start)), "
+        "end = MAX(COALESCE(sessions.end, excluded.end), COALESCE(excluded.end, sessions.end)), "
+        "parent_session = COALESCE(sessions.parent_session, excluded.parent_session)",
+        (sid, name, facts["branch"], h, place, facts["entrypoint"], facts["start"], facts["end"], parent))
+    return new
+
+
+ROLE_BY_KIND = {"code": "review", "tests": "review", "judge": "judge", "suite": "suite"}
+
+
+def repo_of_name(name, known):
+    """The repo a checkout or worktree folder belongs to: the longest known repo it is or starts with "<repo>-"."""
+    if not name:
+        return None
+    return next((k for k in known if name == k or name.startswith(k + "-")), name)
+
+
+def where(name, place, known):
+    """(repo, in a worktree?) of a session's folder name and place."""
+    repo = repo_of_name(name, known) if place in ("repos", "dir") else None
+    if place == "repos":
+        return repo, name not in known
+    return repo, place == "dir" and repo != name
+
+
+def classify_sessions(db, state):
+    """Every session's repo, role, rolled-up role and message count, again. Roles: a session a review sidecar
+    names gets that review's kind; a subagent's file, subagent; an sdk-cli session in a worktree that has no
+    sidecar, and ended at most 5 minutes before a review of its branch without one was written, that review's
+    kind (each review goes to the session that ended last before it, each session takes one; a session still
+    running when the review was written is no review); else an sdk-cli session in a worktree, agent; a cli session in a checkout, main; anything else
+    (cli in a worktree, a temp dir), other.
+    A subagent's repo and branch are those of the worktree it spent the most lines in (link = worktree: an agent
+    the main session started cd's into its worktree), else of its first cwd (link = cwd). Its rolled-up role
+    (role_eff) is its parent's, except that a subagent of a main session that worked in a worktree is an agent."""
+    known = sorted((os.path.basename(p) for p in glob.glob(os.path.join(glob.escape(state), "repos", "*"))
+                    if os.path.isdir(p)), key=len, reverse=True)
+    by_session = {}
+    unnamed = []  # (branch, finished epoch, review id, kind) of the reviews no sidecar ties to a session
+    for rid, kind, sess, branch, finished in db.execute(
+            "SELECT id, kind, session_id, branch, finished FROM reviews"):
+        if sess:
+            by_session.setdefault(sess, (rid, kind))
+        elif branch and finished and kind in ROLE_BY_KIND:
+            unnamed.append((branch, epoch(finished), rid, kind))
+    msgs = dict(db.execute("SELECT session_id, COUNT(*) FROM usage_msgs GROUP BY session_id"))
+    updates = []
+    candidates = []  # (session, branch, end epoch) of the sdk-cli worktree sessions no sidecar names
+    rows = db.execute("SELECT session_id, worktree, place, branch, entrypoint, start, end, parent_session "
+                      "FROM sessions ORDER BY end, session_id").fetchall()
+    best = {}  # subagent -> (worktree, branch, repo) of the worktree it has the most lines in, any subfolder
+    for sid, name, place, branch, n in db.execute(
+            "SELECT p.session_id, p.worktree, p.place, p.branch, SUM(p.lines) AS n FROM session_places p "
+            "JOIN sessions s ON s.session_id = p.session_id WHERE s.parent_session IS NOT NULL "
+            "GROUP BY p.session_id, p.worktree, p.place, p.branch ORDER BY p.session_id, n DESC, p.worktree, p.branch"):
+        repo, wt = where(name, place, known)
+        if wt and sid not in best:
+            best[sid] = (name, branch or None, repo)
+    for sid, name, place, branch, entry, start, end, parent in rows:
+        repo, in_worktree = where(name, place, known)
+        link = "cwd"
+        if sid in best:
+            name, branch, repo = best[sid]
+            link = "worktree"
+        review_id = role = None
+        if sid in by_session:
+            review_id, kind = by_session[sid]
+            role = ROLE_BY_KIND.get(kind, "review")
+        elif parent:
+            role = "subagent"
+        elif entry == "sdk-cli" and in_worktree:
+            role = "agent"
+            if end and branch:
+                candidates.append((sid, branch, epoch(end)))
+        elif entry == "cli" and place in ("repos", "dir") and not in_worktree:
+            role = "main"
+        else:
+            role = "other"
+        updates.append((role, repo, name, branch, link, msgs.get(sid, 0), review_id, sid))
+    # Each review without a sidecar, in the order they were written, goes to the free session of its branch that
+    # ended last at most 5 minutes before it was written; each session takes at most one review.
+    used = {}
+    for b, f, rid, kind in sorted(unnamed, key=lambda r: (r[1], r[2])):
+        near = [(e0, sid) for sid, cb, e0 in candidates if cb == b and sid not in used and e0 <= f <= e0 + 300]
+        if near:
+            used[max(near)[1]] = (rid, kind)
+    updates = [(ROLE_BY_KIND[used[u[-1]][1]],) + u[1:6] + (used[u[-1]][0], u[-1]) if u[-1] in used else u
+               for u in updates]
+    db.executemany("UPDATE sessions SET role = ?, repo = ?, worktree = ?, branch = ?, link = ?, msgs = ?, review_id = ? "
+                   "WHERE session_id = ?", updates)
+    # Rolled up: a subagent counts toward its parent's role (subagent if its parent has no transcript).
+    db.execute("UPDATE sessions SET role_eff = role")
+    db.execute("UPDATE sessions SET role_eff = COALESCE((SELECT CASE WHEN p.role = 'main' AND sessions.link = 'worktree' "
+               "THEN 'agent' ELSE p.role END FROM sessions p WHERE p.session_id = sessions.parent_session), 'subagent') "
+               "WHERE parent_session IS NOT NULL")
+
+
+def rebuild_usage(db):
+    """usage_daily, again from the messages, with each day's estimated cost; prices from PRICES. Returns the
+    models that have tokens but no price."""
+    db.execute("DELETE FROM prices")
+    db.executemany("INSERT INTO prices VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [p + (PRICE_SOURCE,) for p in PRICES])
+    db.execute("DELETE FROM usage_daily")
+    unpriced = set()
+    rows = []
+    for sid, model, day, tin, tout, cw, cw1h, cr, n in db.execute(
+            "SELECT session_id, COALESCE(model, ''), COALESCE(day, ''), SUM(tokens_in), SUM(tokens_out), "
+            "SUM(cache_w), SUM(cache_w_1h), SUM(cache_r), COUNT(*) FROM usage_msgs GROUP BY 1, 2, 3"):
+        c = cost_est(model, day, tin, tout, cw, cw1h, cr)
+        if c is None:
+            unpriced.add(model or "(none)")
+        rows.append((sid, model, day, tin, tout, cw, cw1h, cr, n, c))
+    db.executemany("INSERT INTO usage_daily VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    return sorted(unpriced)
+
+
 # --- jobs -----------------------------------------------------------------------------------------------------
 
 RESULT_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (FAILED|MERGED|READY) (\S+?): (.*)$")
@@ -404,7 +786,8 @@ REASONS = [  # results.log's failure text -> the events' job_failed reason; the 
     (r"git push failed", "push"),
     (r"create-pr\.sh failed|gh pr create failed|no PR found", "pr"),
     (r"as its head", "head"),
-    (r"checks failed on|no checks reported", "checks_failed"),
+    (r"checks failed on", "checks_failed"),
+    (r"no checks reported", "checks_timeout"),  # as pr-queue.sh's job_failed reason
     (r"checks still pending", "checks_timeout"),
     (r"merging #\d+ failed", "merge"),
 ]
@@ -612,6 +995,7 @@ def work_tree_of(path):
 
 MIGRATIONS = {2: [("reviews", "tests_skipped", "INTEGER"), ("findings", "ruling", "TEXT")],
               3: [("jobs", "found", "TEXT")]}
+# Version 4 adds tables only (sessions, usage_msgs, usage_daily, prices): SCHEMA makes them.
 
 
 def migrate(db):
@@ -647,7 +1031,7 @@ def open_db(path):
     return db
 
 
-def ingest(dbpath):
+def ingest(dbpath, projects=None):
     state = os.environ.get("PR_QUEUE_DIR") or os.path.join(
         os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "pr-queue")
     events = os.environ.get("STATS_EVENTS_FILE") or os.path.join(state, "events.jsonl")
@@ -657,11 +1041,23 @@ def ingest(dbpath):
         new = ingest_events(db, events)
         changed = ingest_reviews(db, rdir)
         link_reviews(db, *rebuild_jobs(db, state))
+        files, new_msgs, skipped = ingest_transcripts(db, projects or default_projects())
+        classify_sessions(db, state)
+        unpriced = rebuild_usage(db)
     counts = {t: db.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
-              for t in ("events_raw", "jobs", "reviews", "findings")}
+              for t in ("events_raw", "jobs", "reviews", "findings", "sessions", "usage_msgs")}
+    roles = db.execute("SELECT group_concat(role || ' ' || n, ', ') FROM "
+                       "(SELECT role, COUNT(*) AS n FROM sessions GROUP BY role ORDER BY role)").fetchone()[0]
     db.close()
     print("stats: %d new events, %d reviews read; db has %d events, %d jobs, %d reviews, %d findings (%s)"
           % (new, changed, counts["events_raw"], counts["jobs"], counts["reviews"], counts["findings"], dbpath))
+    print("stats: %d transcripts read, %d new messages; db has %d sessions (%s), %d messages"
+          % (files, new_msgs, counts["sessions"], roles or "none", counts["usage_msgs"]))
+    if unpriced:
+        print("stats: no price for %s: their cost is null" % ", ".join(unpriced))
+    if skipped:
+        print("stats: skipped %d transcripts that could not be read (%s)"
+              % (sum(skipped.values()), ", ".join("%s %d" % kv for kv in sorted(skipped.items()))))
 
 
 def main(argv):
@@ -669,10 +1065,11 @@ def main(argv):
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("ingest", help="read the queue's events, reviews and results into the db")
     p.add_argument("--db", default=None, help="the db file (default: %s)" % default_db())
+    p.add_argument("--projects", default=None, help="Claude Code's transcripts (default: %s)" % default_projects())
     a = ap.parse_args(argv)
     os.umask(0o077)
     if a.cmd == "ingest":
-        ingest(a.db or default_db())
+        ingest(a.db or default_db(), a.projects)
 
 
 if __name__ == "__main__":

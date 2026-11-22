@@ -32,6 +32,8 @@ for f in x.db x.db-journal x.db-wal x.db-shm x.sqlite x.sqlite-journal x.sqlite-
   assert "$f: commit blocked" test "$rc" -ne 0
   assert_contains "$f: names the file" "$out" "  $f"
   assert_contains "$f: says why" "$out" "refusing to commit stats data"
+  assert_contains "$f: says how to unstage" "$out" "git rm --cached"
+  assert_contains "$f: commit aborted" "$out" "commit aborted"
   assert "$f: suite not run" test ! -e "$R/ran"
   git -C "$R" rm -q --cached "$f"; rm -f "$R/$f"
 done

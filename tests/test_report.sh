@@ -104,13 +104,26 @@ assert_contains "transcript tables, no transcripts ingested: empty" "$T" "sessio
 
 echo "-- no network, no script"
 H="$(cat "$OUT")"
-for bad in "//" "<script" "<link" "<img" "url(" "@import"; do
-  assert_not_contains "no $bad in the page" "$H" "$bad"
+# The icon and the logo are the only images, inlined as data: PNGs; with them blanked out, nothing may link out.
+png_re='data:image/png;base64,[A-Za-z0-9+/]*=*'
+assert "the icon and the logo are inlined" test "$(grep -oE "$png_re" "$OUT" | wc -l)" -eq 2
+while read -r uri; do
+  assert "an inlined image decodes to a PNG" test "$(printf '%s' "${uri#*,}" | base64 -d | head -c 4 | tail -c 3)" = PNG
+done < <(grep -oE "$png_re" "$OUT")
+B="$(sed -E "s#$png_re#PNG#g" "$OUT")"
+assert_contains "the icon is a data: PNG" "$B" '<link rel="icon" type="image/png" href="PNG">'
+assert_contains "the logo is a data: PNG" "$B" '<img class="logo" src="PNG" alt="">'
+for bad in "//" "<script" "url(" "@import"; do
+  assert_not_contains "no $bad in the page" "$B" "$bad"
 done
-tags="$(grep -o '<[a-zA-Z][^>]*>' "$OUT")"
-assert_not_contains "no tag with a src" "$tags" "src="
-assert_not_contains "no tag with an href" "$tags" "href="
-assert_contains "a CSP that allows nothing but inline styles" "$H" "default-src 'none'; style-src 'unsafe-inline'"
+tags="$(printf '%s' "$B" | grep -o '<[a-zA-Z][^>]*>' | grep -vxF -e '<link rel="icon" type="image/png" href="PNG">' \
+  -e '<img class="logo" src="PNG" alt="">')"
+assert_not_contains "no other link" "$tags" "<link"
+assert_not_contains "no other img" "$tags" "<img"
+assert_not_contains "no other tag with a src" "$tags" "src="
+assert_not_contains "no other tag with an href" "$tags" "href="
+assert_contains "a CSP that allows nothing but inline styles and data: images" "$H" \
+  "default-src 'none'; style-src 'unsafe-inline'; img-src data:"
 
 echo "-- escaping"
 assert_contains "a hostile branch name is escaped" "$H" "&lt;script&gt;alert(1)&lt;/script&gt;"

@@ -452,6 +452,9 @@ SID=s-long CWD=/home/u/code/app/repos/app-feat-w BR=feat/w
 # Ended 2 minutes after a review of its branch was written: no review either.
 SID=s-late CWD=/home/u/code/app/repos/app-feat-v BR=feat/v
 { line 2026-11-10T11:00:00.000Z; line 2026-11-10T12:02:00.000Z; } > "$PROJ/-home-u-code-app/s-late.jsonl"
+# A review of its branch written 301 s after it ended: past the 5 minutes, no review.
+SID=s-gap CWD=/home/u/code/app/repos/app-feat-t BR=feat/t
+{ line 2026-11-10T11:00:00.000Z; line 2026-11-10T12:00:00.000Z; } > "$PROJ/-home-u-code-app/s-gap.jsonl"
 # Two reviews of its branch written after it ended: the nearer one.
 SID=s-near CWD=/home/u/code/app/repos/app-feat-u BR=feat/u
 { line 2026-11-10T11:00:00.000Z; line 2026-11-10T12:00:00.000Z; } > "$PROJ/-home-u-code-app/s-near.jsonl"
@@ -499,6 +502,9 @@ touch -d '2026-11-10 12:00:00' "$R4/feat-w-dddddddddddd-medium.md"
 printf '# Review of feat/v at ffffffffffff (/code-review medium, cost $1.00, 60 s)\nVerdict: ready\n' > "$R4/feat-v-ffffffffffff-medium.md"
 touch -d '2026-11-10 12:00:00' "$R4/feat-v-ffffffffffff-medium.md"
 # shellcheck disable=SC2016  # literal dollar sign, not an expansion
+printf '# Review of feat/t at 777777777777 (/code-review medium, cost $1.00, 60 s)\nVerdict: ready\n' > "$R4/feat-t-777777777777-medium.md"
+touch -d '2026-11-10 12:05:01' "$R4/feat-t-777777777777-medium.md"
+# shellcheck disable=SC2016  # literal dollar sign, not an expansion
 printf '# Review of feat/u at eeeeeeeeeeee (/code-review medium, cost $1.00, 60 s)\nVerdict: ready\n' > "$R4/feat-u-eeeeeeeeeeee-medium.md"
 touch -d '2026-11-10 12:04:00' "$R4/feat-u-eeeeeeeeeeee-medium.md"
 # shellcheck disable=SC2016  # literal dollar sign, not an expansion
@@ -507,7 +513,7 @@ touch -d '2026-11-10 12:01:00' "$R4/feat-u-eeeeeeeeeeee-tests.md"
 ev2 2026-11-10T13:00:00.000Z merged mx feat/x '"pr":1' | sed 's/"repo":"one"/"repo":"app"/' > "$S4/events.jsonl"
 out="$(PR_QUEUE_DIR="$S4" ingest "$DB2")"; rc=$?
 assert "ingest with transcripts exits 0" test "$rc" -eq 0
-assert_contains "the summary counts the transcripts" "$out" "20 transcripts read, 11 new messages"
+assert_contains "the summary counts the transcripts" "$out" "21 transcripts read, 11 new messages"
 assert_contains "the summary names the model with no price" "$out" "no price for claude-mystery-9"
 assert_not_contains "a model with no tokens is not unpriced" "$out" "$O:"
 
@@ -535,6 +541,8 @@ assert_contains "a session still running when a review of its branch was written
   "$(q "SELECT role, ifnull(review_id,'none') FROM sessions WHERE session_id = 's-long'")" "agent|none"
 assert_contains "a session that ended after a review of its branch was written stays an agent" \
   "$(q "SELECT role, ifnull(review_id,'none') FROM sessions WHERE session_id = 's-late'")" "agent|none"
+assert_contains "a review written 301 s after a session ended is not its" \
+  "$(q "SELECT role, ifnull(review_id,'none') FROM sessions WHERE session_id = 's-gap'")" "agent|none"
 assert_contains "of two reviews written after a session ended, the nearer one is its" \
   "$(q "SELECT role, review_id FROM sessions WHERE session_id = 's-near'")" "review|feat-u-eeeeeeeeeeee-tests.md"
 assert_contains "cli in the main checkout: main" "$(q "$SQ = 's-main'")" "main|app|app|main"
@@ -712,7 +720,7 @@ c.commit()' "$DB3"
 PR_QUEUE_DIR="$S4" ingest "$DB3" >/dev/null
 DB2="$DB3"
 assert "migrated: version 4" test "$(q "SELECT group_concat(version) FROM schema_version")" = 4
-assert "migrated: the sessions are read" test "$(q "SELECT COUNT(*) FROM sessions")" -eq 19
+assert "migrated: the sessions are read" test "$(q "SELECT COUNT(*) FROM sessions")" -eq 20
 assert_contains "migrated: the views work" "$(q "SELECT agent_cost_usd_est FROM v_cost_per_merged_branch")" "11.6"
 unset DB2 PROJ
 

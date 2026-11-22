@@ -110,6 +110,10 @@ assert "the icon and the logo are inlined" test "$(grep -oE "$png_re" "$OUT" | w
 while read -r uri; do
   assert "an inlined image decodes to a PNG" test "$(printf '%s' "${uri#*,}" | base64 -d | head -c 4 | tail -c 3)" = PNG
 done < <(grep -oE "$png_re" "$OUT")
+assert_contains "the icon link inlines icon.png" "$H" \
+  "<link rel=\"icon\" type=\"image/png\" href=\"data:image/png;base64,$(base64 -w0 "$ROOT/scripts/stats/icon.png")\">"
+assert_contains "the logo img inlines logo.png" "$H" \
+  "<img class=\"logo\" src=\"data:image/png;base64,$(base64 -w0 "$ROOT/scripts/stats/logo.png")\" alt=\"\">"
 B="$(sed -E "s#$png_re#PNG#g" "$OUT")"
 assert_contains "the icon is a data: PNG" "$B" '<link rel="icon" type="image/png" href="PNG">'
 assert_contains "the logo is a data: PNG" "$B" '<img class="logo" src="PNG" alt="">'

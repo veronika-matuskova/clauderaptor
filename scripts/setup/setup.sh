@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 # Sets up a machine in one go: runs the setup steps in order and stops at the first one that fails.
 #
-#   scripts/setup/setup.sh                all steps: install tools docker
+#   scripts/setup/setup.sh                all steps: install tools docker caps
 #   scripts/setup/setup.sh tools docker   only the named steps
 #   scripts/setup/setup.sh --list         print each step and its script
 #
 #   install   install.sh        link claude/ into ~/.claude, build settings.json, enable the pre-commit hook
 #   tools     setup-tools.sh    gh + login, shellcheck, SSH commit signing (interactive, sudo)
 #   docker    setup-docker.sh   Docker Engine in WSL (sudo)
+#   caps      setup-caps.sh     let capped.sh cap CPU: delegate the cpu controller to user managers (sudo)
 #
 # The tools step needs your git identity: git config --global user.name / user.email.
 # Run it as your user, not with sudo. Every step is safe to re-run, so after a failure fix the cause and run it again.
 # No `set -e`: every step's failure is handled below, so it can say which step failed and how to retry.
 set -uo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
-ALL=(install tools docker)
-declare -A SCRIPT=([install]=install.sh [tools]=setup-tools.sh [docker]=setup-docker.sh)
+ALL=(install tools docker caps)
+declare -A SCRIPT=([install]=install.sh [tools]=setup-tools.sh [docker]=setup-docker.sh [caps]=setup-caps.sh)
 
 usage() { sed -n '2,/^set /{/^set /d;s/^# \{0,1\}//;p}' "$0"; }
 

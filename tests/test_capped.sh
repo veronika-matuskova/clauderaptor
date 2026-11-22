@@ -5,7 +5,7 @@
 # shellcheck source=tests/lib.sh
 source "$(dirname "$0")/lib.sh"
 # The caps of the caller's environment don't count here: the tests set them where they need them.
-unset CAP_TASKS CAP_MEMORY CAP_TOTAL_TASKS CAP_TOTAL_MEMORY
+unset CAP_TASKS CAP_MEMORY CAP_TOTAL_TASKS CAP_TOTAL_MEMORY CAP_TOTAL_CPU
 
 BIN="$TMP/bin"; mkdir -p "$BIN"
 export NO_SYSTEMD="$TMP/no_systemd" NO_SWAP_CAP="$TMP/no_swap_cap" SLICE_FAILS="$TMP/slice_fails"
@@ -88,7 +88,7 @@ assert "the command's exit code"            test "$rc" = 3
 assert_contains "a scope of its own, in capped.slice" "$(cat "$LOG")" \
   "--scope --quiet --collect --slice=capped.slice --unit=capped-"
 assert_contains "the overall cap on capped.slice" "$(cat "$LOG")" \
-  "systemctl --user set-property --runtime capped.slice TasksMax=4000 MemoryMax=5G MemorySwapMax=0"
+  "systemctl --user set-property --runtime capped.slice TasksMax=4000 MemoryMax=5G MemorySwapMax=0 CPUQuota=$(($(nproc) * 60))%"
 assert_contains "the default caps"          "$(cat "$LOG")" \
   "-p TasksMax=2000 -p MemoryMax=4G -p MemorySwapMax=0 -p TimeoutStopSec=10 -- bash -c"
 assert_contains "the check: the same caps, in capped.slice" "$(cat "$LOG")" \
@@ -98,9 +98,14 @@ u1="$(unit)"; newlog run2; C true
 assert "each call: a unit of its own"       test -n "$u1" -a -n "$(unit)" -a "$u1" != "$(unit)"
 
 newlog caps
-CAP_TASKS=7 CAP_MEMORY=100M CAP_TOTAL_TASKS=9 CAP_TOTAL_MEMORY=1G C true
+CAP_TASKS=7 CAP_MEMORY=100M CAP_TOTAL_TASKS=9 CAP_TOTAL_MEMORY=1G CAP_TOTAL_CPU=150% C true
 assert_contains "CAP_TASKS and CAP_MEMORY"  "$(cat "$LOG")" "-p TasksMax=7 -p MemoryMax=100M"
-assert_contains "CAP_TOTAL_TASKS and CAP_TOTAL_MEMORY" "$(cat "$LOG")" "capped.slice TasksMax=9 MemoryMax=1G"
+assert_contains "CAP_TOTAL_TASKS, CAP_TOTAL_MEMORY and CAP_TOTAL_CPU" "$(cat "$LOG")" \
+  "capped.slice TasksMax=9 MemoryMax=1G MemorySwapMax=0 CPUQuota=150%"
+# The default CPU cap: 60% of the CPUs nproc reports
+newlog cpus; printf '#!/usr/bin/env bash\necho 3\n' > "$BIN/nproc"; chmod +x "$BIN/nproc"
+C true; rm "$BIN/nproc"
+assert_contains "default CPU cap: 60% of the CPUs" "$(cat "$LOG")" "MemorySwapMax=0 CPUQuota=180%"
 assert_contains "arguments kept as they are" "$(C printf '%s|' 'a b' '' c)" "a b||c|"
 # A newer systemd-run: --expand-environment=no, in the check and the real call, so ${...} and $$ stay as they are.
 newlog expand; touch "$EXPANDS"
@@ -219,12 +224,17 @@ if [ -z "$(env -u CAP_OFF bash "$ROOT/scripts/capped.sh" true 2>&1)" ]; then
     echo "pids.max=$(cat "$d/pids.max") memory.max=$(cat "$d/memory.max") swap.max=$(cat "$d/memory.swap.max")"
     s="$(dirname "$d")"
     echo "slice=${s##*/} pids.max=$(cat "$s/pids.max") memory.max=$(cat "$s/memory.max") swap.max=$(cat "$s/memory.swap.max")"
+    if [ -f "$s/cpu.max" ]; then echo "slice cpu.max=$(cat "$s/cpu.max")"; else echo "slice: no cpu controller"; fi
     n="$(bash "$1" bash -c "cut -d: -f3 /proc/self/cgroup")"
     [ "$(dirname "$n")" = "$(dirname "$cg")" ] && [ "$n" != "$cg" ] && echo "nested: a scope of its own in capped.slice"
     setsid sleep '"$m"' </dev/null >/dev/null 2>&1 & sleep 0.2
     [ "$(cut -d: -f3 /proc/$!/cgroup)" = "$cg" ] && echo "setsid child in the scope"' _ "$ROOT/scripts/capped.sh")"
   assert_contains "real: the caps apply"      "$out" "pids.max=30 memory.max=314572800 swap.max=0"
   assert_contains "real: the overall cap applies" "$out" "slice=capped.slice pids.max=4000 memory.max=5368709120 swap.max=0"
+  # With the cpu controller delegated (setup.sh caps), the overall CPU cap applies: 60% of the CPUs per 100 ms
+  if [[ "$out" != *"slice: no cpu controller"* ]]; then
+    assert_contains "real: the overall CPU cap applies" "$out" "slice cpu.max=$(($(nproc) * 60000)) 100000"
+  fi
   assert_contains "real: a nested call, in capped.slice too" "$out" "nested: a scope of its own in capped.slice"
   assert_contains "real: \${...} and \$\$ kept"  "$(env -u CAP_OFF bash "$ROOT/scripts/capped.sh" printf '%s|' '${HOME}' 'a$$b')" '${HOME}|a$$b|'
   assert_contains "real: a setsid child stays in the scope" "$out" "setsid child in the scope"

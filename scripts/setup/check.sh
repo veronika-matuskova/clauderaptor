@@ -2,7 +2,8 @@
 # Checks that this machine has what clauderaptor needs. It only looks: no sudo, nothing installed or changed.
 #   scripts/setup/check.sh
 # One line per check: ok; warn (works, but may cause trouble); FAIL (missing, with what to run).
-#   system     not root, Ubuntu, WSL, systemd, a systemd user instance (capped.sh needs it for its caps)
+#   system     not root, Ubuntu, WSL, systemd, a systemd user instance (capped.sh needs it for its caps), and
+#              the cpu controller in it (warn: without it, capped.sh's overall CPU cap isn't enforced)
 #   git        your git identity, SSH commit signing, the pre-commit hook
 #   tools      git python3 curl gh shellcheck claude docker (FAIL) and node (warn); gh logged in; docker info
 #   install    ~/.claude links into claude/, settings.json is built
@@ -16,6 +17,7 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 MEMINFO="${CHECK_MEMINFO:-/proc/meminfo}"
 OS_RELEASE="${CHECK_OS_RELEASE:-/etc/os-release}"
 SYSTEMD_DIR="${CHECK_SYSTEMD_DIR:-/run/systemd/system}"
+CONTROLLERS="${CHECK_CGROUP_CONTROLLERS:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers}"
 WIN_DRIVE="${CHECK_WINDOWS_DRIVE:-/mnt/c}"
 DEST="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 GIB=1048576  # KiB
@@ -46,6 +48,8 @@ fi
 # The same test as capped.sh's: without one, capped.sh runs commands without a cap
 if has systemd-run && has systemctl && [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "$XDG_RUNTIME_DIR/systemd/private" ]; then
   ok "systemd user instance (capped.sh can apply its caps)"
+  if [[ " $(cat "$CONTROLLERS" 2>/dev/null) " == *" cpu "* ]]; then ok "cpu controller (capped.sh's CPU cap applies)"
+  else warn "no cpu controller in the user manager: capped.sh's CPU cap isn't enforced: run scripts/setup/setup.sh caps"; fi
 else
   fail "no systemd user instance: capped.sh would run mutation loops and tests without a cap"
 fi

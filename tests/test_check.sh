@@ -32,6 +32,7 @@ EOF
   for c in bash awk cat dirname readlink git timeout; do ln -s "$(command -v "$c")" "$BIN/$c"; done
   python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$D/run/systemd/private"
   printf 'ID=ubuntu\nPRETTY_NAME="Ubuntu 24.04 LTS"\n' > "$D/os-release"
+  echo "cpuset cpu io memory pids" > "$D/controllers"
   printf 'MemTotal:       %s kB\nSwapTotal:       3145728 kB\n' $((12 * 1048576)) > "$D/meminfo"
   G="$D/gitconfig"
   git config --file "$G" user.name t; git config --file "$G" user.email t@t
@@ -43,7 +44,7 @@ EOF
 check() {
   OUT="$(env -i PATH="$BIN" HOME="$H" GIT_CONFIG_GLOBAL="$G" GIT_CONFIG_NOSYSTEM=1 XDG_RUNTIME_DIR="$D/run" \
     WSL_DISTRO_NAME=Ubuntu CHECK_MEMINFO="$D/meminfo" CHECK_OS_RELEASE="$D/os-release" CHECK_SYSTEMD_DIR="$D/systemd" \
-    CHECK_WINDOWS_DRIVE="$D/c" "$@" bash "$R/scripts/setup/check.sh" 2>&1)"; RC=$?
+    CHECK_WINDOWS_DRIVE="$D/c" CHECK_CGROUP_CONTROLLERS="$D/controllers" "$@" bash "$R/scripts/setup/check.sh" 2>&1)"; RC=$?
 }
 
 # Everything there: exit 0, every section, no FAIL or warn
@@ -56,6 +57,7 @@ assert_not_contains "good: no warn" "$OUT" "warn "
 assert_contains "good: memory and swap" "$OUT" "ok    memory: 12.0 GiB, swap 3.0 GiB"
 assert_contains "good: room left by the cap" "$OUT" "overall cap (5G) leaves 7.0 GiB for everything else"
 assert_contains "good: CPUs" "$OUT" "ok    CPUs: 8"
+assert_contains "good: cpu controller" "$OUT" "ok    cpu controller"
 assert_contains "good: Windows drive" "$OUT" "Windows drive $D/c"
 assert_contains "good: docker version" "$OUT" "docker: server 29.0.0"
 assert_contains "good: install dir" "$OUT" "links into $R/claude"
@@ -78,6 +80,14 @@ assert "nouser: exits 1" [ "$RC" -eq 1 ]
 assert_contains "nouser: no user instance" "$OUT" "FAIL  no systemd user instance"
 setup norun; rm "$BIN/systemd-run"; check
 assert_contains "norun: no systemd-run means no user instance" "$OUT" "FAIL  no systemd user instance"
+assert_not_contains "norun: no cpu controller line" "$OUT" "cpu controller"
+
+# No cpu controller (systemd 249's default: memory pids): a warning, not a FAIL; cpuset alone isn't cpu
+setup nocpu; echo "cpuset memory pids" > "$D/controllers"; check
+assert "nocpu: exits 0" [ "$RC" -eq 0 ]
+assert_contains "nocpu: warns, says how" "$OUT" "warn  no cpu controller in the user manager: capped.sh's CPU cap isn't enforced: run scripts/setup/setup.sh caps"
+setup nocontrollers; rm "$D/controllers"; check
+assert_contains "no controllers file: warns" "$OUT" "warn  no cpu controller"
 setup nosystemctl; rm "$BIN/systemctl"; check
 assert "nosystemctl: exits 1" [ "$RC" -eq 1 ]
 assert_contains "nosystemctl: no systemctl means no user instance" "$OUT" "FAIL  no systemd user instance"

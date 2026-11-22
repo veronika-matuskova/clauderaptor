@@ -9,7 +9,7 @@ git config --global user.name t; git config --global user.email t@t
 
 # Every step in --list points at a script that exists next to setup.sh
 list="$(bash "$ROOT/scripts/setup/setup.sh" --list)"
-assert "list: install tools docker, in order" [ "$(cut -d' ' -f1 <<<"$list" | tr '\n' ' ')" = "install tools docker " ]
+assert "list: install tools docker caps, in order" [ "$(cut -d' ' -f1 <<<"$list" | tr '\n' ' ')" = "install tools docker caps " ]
 while read -r step script; do
   assert "list: $step -> scripts/setup/$script exists" test -f "$ROOT/scripts/setup/$script"
 done <<<"$list"
@@ -18,7 +18,7 @@ done <<<"$list"
 setup_dir() {
   D="$TMP/$1"; LOG="$D/log"; mkdir -p "$D"; : > "$LOG"
   cp "$ROOT/scripts/setup/setup.sh" "$D/"
-  for s in install.sh setup-tools.sh setup-docker.sh; do
+  for s in install.sh setup-tools.sh setup-docker.sh setup-caps.sh; do
     rc=0; [ "$s" = "${2:-}" ] && rc=3
     printf '#!/usr/bin/env bash\necho %s >> "%s"\necho "output of %s"\nexit %s\n' "$s" "$LOG" "$s" "$rc" > "$D/$s"
     chmod -x "$D/$s"
@@ -29,9 +29,9 @@ setup_dir() {
 setup_dir all
 out="$(bash "$D/setup.sh" 2>&1)"; rc=$?
 assert "all: exits 0" [ "$rc" -eq 0 ]
-assert_contains "all: runs every step in order" "$(cat "$LOG")" $'install.sh\nsetup-tools.sh\nsetup-docker.sh'
+assert_contains "all: runs every step in order" "$(cat "$LOG")" $'install.sh\nsetup-tools.sh\nsetup-docker.sh\nsetup-caps.sh'
 assert_contains "all: shows step output" "$out" "output of setup-tools.sh"
-assert_contains "all: reports done" "$out" "setup done: install tools docker"
+assert_contains "all: reports done" "$out" "setup done: install tools docker caps"
 
 # Named steps: only those, each once
 setup_dir some
@@ -45,7 +45,7 @@ out="$(bash "$D/setup.sh" 2>&1)"; rc=$?
 assert "fail: exits with the step's code" [ "$rc" -eq 3 ]
 assert_not_contains "fail: later steps don't run" "$(cat "$LOG")" "setup-docker.sh"
 assert_contains "fail: names the step" "$out" "tools failed"
-assert_contains "fail: shows the retry command" "$out" "re-run: $D/setup.sh install tools docker"
+assert_contains "fail: shows the retry command" "$out" "re-run: $D/setup.sh install tools docker caps"
 
 # Unknown or empty step: nothing runs
 setup_dir unknown

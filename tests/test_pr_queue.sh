@@ -881,13 +881,19 @@ assert_not_contains "ended runner: no working repo left out" "$(cat "$TQ/ended.o
 kill -TERM "$rpid"; { wait "$rpid"; } 2>/dev/null
 rm -f "$TQ/hang" "$RQ"/running/*
 # A repo whose queue another runner has when this one starts gets a runner of this one once that runner ends,
-# while this one still works on another repo (its e2e run outlasts the other runner's lock), and is said once.
+# while this one still works on another repo, and is said once.
 reset_pr; touch "$TQ/e2e_fail"; mkwt work; mkwt2 held
-echo 'sleep 2' > "$TQ/on_e2e"
+# The other runner holds repo2's queue (hold) until the first job's e2e run sees the busy line. That run then
+# lets go and waits (up to 30 s) until repo2's job has a result, so this runner is still working meanwhile.
 Q add "$TMP/wt-work" fix "Work" >/dev/null; Q add --review none --tests none "$TMP/wt2-held" fix "Held" >/dev/null
-flock "$RQ2/run.lock" sleep 1 & lpid=$!; sleep 0.3
-out="$(PR_QUEUE_POLL=0.2 PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 Q run)"
-wait "$lpid"; rm -f "$TQ/on_e2e"
+# shellcheck disable=SC2016  # expands when on_e2e runs
+printf 'for _ in $(seq 600); do grep -q "repo2: a runner is already working" %q && break; sleep 0.05; done
+touch %q
+for _ in $(seq 600); do grep -q "fix/held" %q 2>/dev/null && break; sleep 0.05; done\n' \
+  "$TQ/busy.out" "$TQ/release" "$RQ2/results.log" > "$TQ/on_e2e"
+hold "$RQ2/run.lock"
+PR_QUEUE_POLL=0.2 PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 Q run > "$TQ/busy.out"; out="$(cat "$TQ/busy.out")"
+release; rm -f "$TQ/on_e2e"
 assert_contains "busy repo: said it was busy" "$out" "repo2: a runner is already working on the queue"
 assert "busy repo: said once"                test "$(grep -c "repo2: a runner is already working" <<<"$out")" = 1
 assert "busy repo: its job ran once the lock was free" grep -q "fix/held" "$RQ2/results.log"
@@ -895,12 +901,14 @@ assert_not_contains "busy repo: not left out at the end" "$out" "jobs left in th
 assert "busy repo: no job left queued"       test -z "$(find "$RQ/queue" "$RQ2/queue" -name '*.job')"
 # A busy repo whose runner empties its queue while this one works on another repo isn't named at the end.
 reset_pr; touch "$TQ/e2e_fail"; mkwt work2; mkwt2 emptied
-echo 'sleep 2' > "$TQ/on_e2e"
+# As above, but the first job's e2e run empties repo2's queue (as its runner would) before it lets go.
 Q add "$TMP/wt-work2" fix "Work2" >/dev/null; Q add "$TMP/wt2-emptied" fix "Emptied" >/dev/null
-# shellcheck disable=SC2016  # $1 expands in the inner bash
-flock "$RQ2/run.lock" bash -c 'sleep 1; rm -f "$1"/queue/*' _ "$RQ2" & lpid=$!; sleep 0.3
-out="$(PR_QUEUE_POLL=0.2 PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 Q run)"
-wait "$lpid"; rm -f "$TQ/on_e2e"
+# shellcheck disable=SC2016  # expands when on_e2e runs
+printf 'for _ in $(seq 600); do grep -q "repo2: a runner is already working" %q && break; sleep 0.05; done
+rm -f %q/queue/*; touch %q\n' "$TQ/busy.out" "$RQ2" "$TQ/release" > "$TQ/on_e2e"
+hold "$RQ2/run.lock"
+PR_QUEUE_POLL=0.2 PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 Q run > "$TQ/busy.out"; out="$(cat "$TQ/busy.out")"
+release; rm -f "$TQ/on_e2e"
 assert_contains "busy repo, emptied: said it was busy" "$out" "repo2: a runner is already working on the queue"
 assert_contains "busy repo, emptied: the queues are empty" "$out" "pr-queue: the queues are empty"
 assert_not_contains "busy repo, emptied: not named at the end" "$out" "jobs left in the queue of"

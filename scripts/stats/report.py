@@ -305,7 +305,7 @@ def hints(m):
     n_cat = sum(c for _, c in m["categories"])
     if m["categories"]:
         cat, c = m["categories"][0]
-        if c >= CATEGORY_MIN and c >= CATEGORY_SHARE * n_cat:
+        if c >= CATEGORY_MIN and c / n_cat >= CATEGORY_SHARE:
             out.append(("category", "[%s] findings keep coming back (%d of %d findings with a category): add a "
                         "rule or agent instruction so branches get it right the first time." % (cat, c, n_cat)))
     for kind, level, n, total, avg, ready in m["levels"]:
@@ -319,7 +319,7 @@ def hints(m):
                     "(first-pass yield %s)." % share(m["first_pass"], m["n_merged"])))
     if m["n_failed"] >= MIN_N and m["failures"]:
         reason, c = m["failures"][0]
-        if c >= TOP_REASON_SHARE * m["n_failed"]:
+        if c / m["n_failed"] >= TOP_REASON_SHARE:
             advice = REASON_ADVICE.get(reason, "look at those rounds for what they have in common")
             out.append(("top-reason", "%s ends %s of the failed rounds: %s." % (reason or "unknown", share(
                 c, m["n_failed"]), advice)))
@@ -397,7 +397,7 @@ def s_review_value(db, m):
     lrows, bars = [], []
     for kind, level, n, total, avg, ready in m["levels"]:
         lrows.append((kind or "–", level or "–", n, money(total), money(avg), share(ready or 0, n),
-                      money(total / ready) if ready else "–"))
+                      money(total / ready) if ready and total is not None else "–"))
         if total is not None:
             name = " ".join(x for x in (kind, level) if x)
             bars.append((name, total, "%s: %s in %d reviews" % (name, money(total), n)))

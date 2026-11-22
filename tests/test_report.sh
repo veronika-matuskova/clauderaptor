@@ -157,6 +157,37 @@ assert "small n: only the category hint" test "$(hints "$TMP/out/few.html")" = '
 assert_contains "small n: precision says not enough data" "$T3" "Reviewer precision not enough data judge-confirmed blocking findings, n=4"
 assert_contains "small n: no ruling bar" "$T3" "Judge rulings on blocking findings n=4 not enough data (n=4)"
 
+echo "-- hints at their exact thresholds"
+# hint_case <name> <sql>: the empty db plus the rows, rendered; prints its hints
+hint_case() { cp "$EMPTY" "$TMP/out/$1.db"; sql "$TMP/out/$1.db" "$2"
+  python3 -I -B "$RP" --db "$TMP/out/$1.db" --out "$TMP/out/$1.html" >/dev/null 2>&1; hints "$TMP/out/$1.html"; }
+# cat_rows <n mutation> <n other>: test-review findings with a category
+cat_rows() { echo "INSERT INTO reviews (id, kind) VALUES ('t', 'tests');
+WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i WHERE n < $(($1 + $2)))
+INSERT INTO findings (review_id, n, sev_norm, category) SELECT 't', n, 'major', CASE WHEN n <= $1 THEN 'mutation' ELSE 'other-' || n END FROM i;"; }
+assert "category: exactly 5 findings fires" test "$(hint_case cat5 "$(cat_rows 5 0)")" = 'data-hint="category" '
+assert "category: 4 findings doesn't" test -z "$(hint_case cat4 "$(cat_rows 4 0)")"
+assert "category: exactly 30% (6 of 20) fires" test "$(hint_case cat30 "$(cat_rows 6 14)")" = 'data-hint="category" '
+assert "category: just below 30% (6 of 21) doesn't" test -z "$(hint_case cat29 "$(cat_rows 6 15)")"
+# ready_rows <ready of 10> <cost each>: code reviews at level high
+ready_rows() { echo "WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i WHERE n < 10)
+INSERT INTO reviews (id, kind, level, verdict, cost_usd) SELECT 'c' || n, 'code', 'high',
+  CASE WHEN n <= $1 THEN 'ready' ELSE 'needs changes' END, $2 FROM i;"; }
+assert "costly-ready: exactly 70% ready at \$1.00 fires" test "$(hint_case ready70 "$(ready_rows 7 1.0)")" = 'data-hint="costly-ready" '
+assert "costly-ready: 60% ready doesn't" test -z "$(hint_case ready60 "$(ready_rows 6 1.0)")"
+assert "costly-ready: 70% ready at \$0.99 doesn't" test -z "$(hint_case ready70c "$(ready_rows 7 0.99)")"
+# fp_rows <first-pass of 10>: merged branches, the rest in round 2
+fp_rows() { echo "WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i WHERE n < 10)
+INSERT INTO jobs (job_id, repo, branch, round, ended, outcome) SELECT 'm' || n, 'app', 'b' || n,
+  CASE WHEN n <= $1 THEN 1 ELSE 2 END, '2026-10-01T10:00:00.000Z', 'merged' FROM i;"; }
+assert "first-pass: exactly 50% doesn't fire" test -z "$(hint_case fp50 "$(fp_rows 5)")"
+assert "first-pass: 40% fires" test "$(hint_case fp40 "$(fp_rows 4)")" = 'data-hint="first-pass" '
+
+echo "-- a review group without any cost"
+out="$(hint_case nocost "INSERT INTO reviews (id, kind, verdict, cost_usd) VALUES ('j', 'judge', 'ready', NULL);")"
+assert "a ready review with no cost: the report is written" test -f "$TMP/out/nocost.html"
+assert_contains "its cost per ready is a dash" "$(text "$TMP/out/nocost.html")" "judge – 1 – – not enough data (n=1) –"
+
 echo "-- the transcript tables (stats.py's next version)"
 TK="$TMP/out/tokens.db"; cp "$FX" "$TK"
 sql "$TK" "

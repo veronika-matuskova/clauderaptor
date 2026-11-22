@@ -4,6 +4,9 @@
 source "$(dirname "$0")/lib.sh"
 
 export TQ="$TMP/t" PR_QUEUE_DIR="$TMP/state" PR_QUEUE_CHECKS_WAIT=0
+# review.sh reads the user's rules: give it a stand-in for ~/.claude, which the tests never touch.
+export CLAUDE_CONFIG_DIR="$TMP/claude-config"; mkdir -p "$CLAUDE_CONFIG_DIR"
+echo "Stand-in user rule." > "$CLAUDE_CONFIG_DIR/CLAUDE.md"
 unset REVIEW_DIR REVIEW_TIMEOUT PR_QUEUE_REVIEW   # reviews go to $PR_QUEUE_DIR/reviews, not a real folder
 mkdir -p "$TQ/bin" "$TQ/passed"
 Q() { PATH="$TQ/bin:$PATH" bash "$ROOT/scripts/pr-queue.sh" "$@" </dev/null 2>&1; }
@@ -79,6 +82,7 @@ EOF
 # With $TQ/hang, each session logs its pid in $TQ/hung and hangs for 30 s; on TERM it takes 0.5 s to end.
 cat > "$TQ/bin/claude" <<'EOF'
 #!/usr/bin/env bash
+prev=""; for a in "$@"; do [ "$prev" = --append-system-prompt-file ] && cp "$a" "$TQ/sysprompt"; prev="$a"; done
 if [[ "$2" == *"code-review skill"* ]]; then
   kind=code other=tests; echo "code $2" >> "$TQ/claude.log"; v="$(cat "$TQ/verdict" 2>/dev/null || echo ready)"
 else
@@ -158,6 +162,7 @@ assert "happy: review saved, without the tests" test -n "$(find "$PR_QUEUE_DIR/r
 assert_contains "happy: tests reviewed too"  "$out" "reviewing the tests of"
 assert_contains "happy: a test review session" "$(test_reviews)" "Review the tests of one change"
 assert "happy: test review saved"            test -n "$(find "$PR_QUEUE_DIR/reviews" -name 'fix-happy-*-tests.md')"
+assert_contains "happy: the user's rules from the stand-in, not ~/.claude" "$(cat "$TQ/sysprompt")" "Stand-in user rule."
 assert_contains "happy: the code review leaves tests to it" "$(code_reviews)" "a separate test review covers them"
 assert_contains "happy: ran e2e"             "$out" "running the full e2e suite"
 assert_contains "happy: merged"              "$out" "MERGED fix/happy: #7 as 1234567"

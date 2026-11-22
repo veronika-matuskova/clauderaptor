@@ -73,26 +73,28 @@ rules() {
   echo "A line \"@<path>\" in these rules imports that file: read it yourself, a path in the repo at commit"
   echo "${1:0:12} (git show ${1:0:12}:<path>), any other path from disk."
   while IFS= read -r f; do
-    printf '\n## The user'"'"'s %s\n\n' "${f#"$cfg"/}"; cat "$f"
+    printf '\n## The user'"'"'s %s\n\n' "${f#"$cfg"/}"; cat "$f" || return 1
   done < <(if [ -f "$cfg/CLAUDE.md" ]; then echo "$cfg/CLAUDE.md"; fi
            if [ -d "$cfg/rules" ]; then find -L "$cfg/rules" -type f -name '*.md' | sort; fi)
+  wait $! || return 1  # the list's exit status (a process substitution's is lost otherwise)
   # -z: paths as they are, not quoted (a non-ASCII path would be). Each entry is "<mode> <type> <object>\t<path>".
   while IFS= read -r -d '' entry; do
     p="${entry#*$'\t'}"
     [[ "$p" =~ (^|/)CLAUDE\.md$|^\.claude/rules/.+\.md$ ]] || continue
     printf '\n## The repo'"'"'s %s\n\n' "$p"
-    if [ "${entry%% *}" != 120000 ]; then git -C "$wt" show "$1:$p"; continue; fi
-    target="$(git -C "$wt" show "$1:$p")"
+    if [ "${entry%% *}" != 120000 ]; then git -C "$wt" show "$1:$p" || return 1; continue; fi
+    target="$(git -C "$wt" show "$1:$p")" || return 1
     linked="$(python3 -I -c 'import posixpath, sys
 p, t = sys.argv[1], sys.argv[2]
 r = posixpath.normpath(posixpath.join(posixpath.dirname(p), t))
 print("" if t.startswith("/") or r == ".." or r.startswith("../") else r)' "$p" "$target")"
     if [ -n "$linked" ] && git -C "$wt" cat-file -e "$1:$linked" 2>/dev/null; then
-      echo "(a link to $linked)"; git -C "$wt" show "$1:$linked"
+      echo "(a link to $linked)"; git -C "$wt" show "$1:$linked" || return 1
     else
       echo "(a link to $target, which is outside the repo or not in it at ${1:0:12}: not read)"
     fi
   done < <(git -C "$wt" ls-tree -r -z "$1")
+  wait $! || return 1  # ls-tree's (a missing commit or tree object)
 }
 
 usage="usage: review.sh <worktree> [low|medium|high|xhigh] | --tests <worktree> | --suite <checkout>"

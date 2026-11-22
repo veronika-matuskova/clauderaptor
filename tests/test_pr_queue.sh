@@ -7,7 +7,7 @@ export TQ="$TMP/t" PR_QUEUE_DIR="$TMP/state" PR_QUEUE_CHECKS_WAIT=0 PR_QUEUE_POL
 # review.sh reads the user's rules: give it a stand-in for ~/.claude, which the tests never touch.
 export CLAUDE_CONFIG_DIR="$TMP/claude-config"; mkdir -p "$CLAUDE_CONFIG_DIR"
 echo "Stand-in user rule." > "$CLAUDE_CONFIG_DIR/CLAUDE.md"
-unset REVIEW_DIR REVIEW_TIMEOUT PR_QUEUE_REVIEW   # reviews go to $PR_QUEUE_DIR/reviews, not a real folder
+unset REVIEW_DIR REVIEW_TIMEOUT PR_QUEUE_REVIEW REVIEW_MODEL REVIEW_EFFORT REVIEW_CONFIG   # reviews go to $PR_QUEUE_DIR/reviews, not a real folder
 mkdir -p "$TQ/bin" "$TQ/passed"
 Q() { PATH="$TQ/bin:$PATH" bash "$ROOT/scripts/pr-queue.sh" "$@" </dev/null 2>&1; }
 

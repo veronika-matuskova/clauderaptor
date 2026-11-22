@@ -397,9 +397,10 @@ kill "$P3"; assert "the new one stops" gone "$P3"
 assert "and removes its serve.json" test ! -e "$SD/serve.json"
 
 echo "-- open: two at the same time"
-STATS_EDGE="$TMP/no-edge/msedge.exe" python3 -I -B "$SV" open --db "$DB" --idle 60 >"$TMP/o1" 2>&1 &
+# The stub wslpath first on the PATH, also where there is none (CI): the missing msedge.exe is what open reports.
+PATH="$TMP/bin:$PATH" STATS_EDGE="$TMP/no-edge/msedge.exe" python3 -I -B "$SV" open --db "$DB" --idle 60 >"$TMP/o1" 2>&1 &
 o1=$!
-STATS_EDGE="$TMP/no-edge/msedge.exe" python3 -I -B "$SV" open --db "$DB" --idle 60 >"$TMP/o2" 2>&1 &
+PATH="$TMP/bin:$PATH" STATS_EDGE="$TMP/no-edge/msedge.exe" python3 -I -B "$SV" open --db "$DB" --idle 60 >"$TMP/o2" 2>&1 &
 o2=$!
 wait "$o1" "$o2"
 P4="$(state "$SD" pid)"; echo "$P4" >> "$TMP/pids"
@@ -410,6 +411,18 @@ assert_contains "outside WSL: a link to open" "$(cat "$TMP/o1")" "the link works
 PORT="$(state "$SD" port)"
 assert "which opens the page" test "$(code "$PORT" GET "${url#http://127.0.0.1:"$PORT"}")" = 200
 kill "$P4"; assert "stops" gone "$P4"
+
+echo "-- open: no wslpath"
+mkdir -p "$TMP/pyonly"; ln -s "$(command -v python3)" "$TMP/pyonly/python3"
+rm -f "$EDGE_ARGV"
+out="$(PATH="$TMP/pyonly" STATS_EDGE="$TMP/bin/msedge.exe" "$TMP/pyonly/python3" -I -B "$SV" open --db "$DB" --idle 60 2>&1)"; rc=$?
+P5="$(state "$SD" pid)"; echo "$P5" >> "$TMP/pids"; PORT="$(state "$SD" port)"
+assert "exit 0" test "$rc" -eq 0
+assert_contains "says wslpath is missing" "$out" "(an Edge app window opens only under WSL: wslpath not found)"
+url="$(sed -n 's/^report: open \(http:[^ ]*\) in a browser.*/\1/p' <<<"$out")"
+assert "and its link opens the page" test "$(code "$PORT" GET "${url#http://127.0.0.1:"$PORT"}")" = 200
+assert "and starts no Edge" test ! -e "$EDGE_ARGV"
+kill "$P5"; assert "stops" gone "$P5"
 
 echo "-- open: refusals start no server"
 mkdir -p "$TMP/users/bob/AppData/Local/Microsoft/Edge"

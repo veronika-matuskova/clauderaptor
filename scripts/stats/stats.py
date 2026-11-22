@@ -29,8 +29,15 @@ Views: v_rounds_per_branch, v_findings_by_severity (code and test reviews only),
 v_failures_by_reason (failed and escalated rounds; a job replaced in the queue never ran, so it is no round)
 and v_judge_rulings (reviewer_precision: the share of the blocking findings it judged that the judge confirmed).
 From the transcripts: v_tokens_by_role (tokens and the estimated API-equivalent cost per role and repo),
-v_cache_hit_rate (cache reads / all input tokens, per role) and v_cost_per_merged_branch (the agents' estimated
-cost, from the transcripts, and the reviews' and judges' cost, from the review files, per merged branch).
+v_subagent_share (the subagents' part of each role), v_cache_hit_rate (cache reads / all input tokens, per role)
+and v_cost_per_merged_branch (the agents' estimated cost, from the transcripts, and the reviews' and judges'
+cost, from the review files, per merged branch). These count a subagent toward its parent's role.
+Session roles: review, judge or suite for a session a review sidecar names; subagent for a subagent's file
+(sessions.role_eff rolls it up into its parent's role, and a subagent of the main session that worked in a
+worktree into agent); for an sdk-cli session in a worktree without a sidecar, the review's kind if it ended
+within 5 minutes after a review of its branch without a sidecar was written (the reviews from before the
+sidecars), else agent; main for a cli session in a checkout; other for anything else (cli in a worktree, a
+session in a temp dir). A subagent's repo and branch are those of the worktree it spent the most lines in.
 """
 import argparse
 import calendar
@@ -64,7 +71,11 @@ CREATE TABLE IF NOT EXISTS findings (
 CREATE TABLE IF NOT EXISTS ingest_state (path TEXT PRIMARY KEY, inode INTEGER, size INTEGER, offset INTEGER, mtime REAL);
 CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT PRIMARY KEY, role TEXT, repo TEXT, worktree TEXT, branch TEXT, cwd_hash TEXT, place TEXT,
-  entrypoint TEXT, start TEXT, end TEXT, msgs INTEGER, parent_session TEXT, review_id TEXT);
+  entrypoint TEXT, start TEXT, end TEXT, msgs INTEGER, parent_session TEXT, review_id TEXT, role_eff TEXT,
+  link TEXT);
+CREATE TABLE IF NOT EXISTS session_places (
+  session_id TEXT NOT NULL, cwd_hash TEXT NOT NULL, branch TEXT NOT NULL, worktree TEXT, place TEXT, lines INTEGER,
+  PRIMARY KEY (session_id, cwd_hash, branch));
 CREATE TABLE IF NOT EXISTS usage_msgs (
   msg_id TEXT PRIMARY KEY, session_id TEXT, model TEXT, day TEXT,
   tokens_in INTEGER, tokens_out INTEGER, cache_w INTEGER, cache_w_1h INTEGER, cache_r INTEGER);
@@ -87,6 +98,7 @@ DROP VIEW IF EXISTS v_failures_by_reason;
 DROP VIEW IF EXISTS v_tokens_by_role;
 DROP VIEW IF EXISTS v_cache_hit_rate;
 DROP VIEW IF EXISTS v_cost_per_merged_branch;
+DROP VIEW IF EXISTS v_subagent_share;
 CREATE VIEW v_rounds_per_branch AS
   SELECT repo, branch, round AS rounds, ended AS merged_at, job_id FROM jobs WHERE outcome = 'merged';
 -- The queue's reviewers' findings: not the judge's rulings, nor the suite audits (not part of the queue).
@@ -109,23 +121,41 @@ CREATE VIEW v_judge_rulings AS
          (SELECT ROUND(1.0 * SUM(ruling = 'confirmed') / COUNT(*), 4) FROM findings WHERE ruling IS NOT NULL)
            AS reviewer_precision
   FROM findings WHERE ruling IS NOT NULL GROUP BY ruling;
--- Tokens per session role and repo, from the transcripts. cost_usd_est is what the tokens would cost at API
+-- Tokens per role and repo, from the transcripts, with each subagent counted toward its parent's role
+-- (sessions.role_eff); subagent_* is the subagents' part. cost_usd_est is what the tokens would cost at API
 -- prices (an estimate: a subscription bills otherwise); unpriced_msgs counts the messages of models without a
 -- price, left out of it. The reviews' own cost (review files, sidecars) is in v_cost_by_kind_level.
 CREATE VIEW v_tokens_by_role AS
-  SELECT s.role AS role, s.repo AS repo, COUNT(DISTINCT s.session_id) AS sessions, SUM(u.msgs) AS msgs,
-         SUM(u.tokens_in) AS tokens_in, SUM(u.tokens_out) AS tokens_out, SUM(u.cache_w) AS tokens_cache_w,
-         SUM(u.cache_r) AS tokens_cache_r, ROUND(SUM(u.cost_usd_est), 4) AS cost_usd_est,
+  SELECT s.role_eff AS role, s.repo AS repo, COUNT(DISTINCT s.session_id) AS sessions,
+         COUNT(DISTINCT CASE WHEN s.parent_session IS NOT NULL THEN s.session_id END) AS subagent_sessions,
+         SUM(u.msgs) AS msgs, SUM(u.tokens_in) AS tokens_in, SUM(u.tokens_out) AS tokens_out,
+         SUM(u.cache_w) AS tokens_cache_w, SUM(u.cache_r) AS tokens_cache_r,
+         ROUND(SUM(u.cost_usd_est), 4) AS cost_usd_est,
+         ROUND(SUM(CASE WHEN s.parent_session IS NOT NULL THEN u.cost_usd_est END), 4) AS subagent_cost_usd_est,
          SUM(CASE WHEN u.cost_usd_est IS NULL THEN u.msgs ELSE 0 END) AS unpriced_msgs
-  FROM sessions s JOIN usage_daily u ON u.session_id = s.session_id GROUP BY s.role, s.repo;
--- The share of the input tokens that came from the prompt cache.
+  FROM sessions s JOIN usage_daily u ON u.session_id = s.session_id GROUP BY s.role_eff, s.repo;
+-- The subagents' share of each rolled-up role's tokens (all four kinds) and estimated cost.
+CREATE VIEW v_subagent_share AS
+  SELECT s.role_eff AS role, COUNT(DISTINCT s.session_id) AS sessions,
+         COUNT(DISTINCT CASE WHEN s.parent_session IS NOT NULL THEN s.session_id END) AS subagent_sessions,
+         SUM(u.tokens_in + u.tokens_out + u.cache_w + u.cache_r) AS tokens,
+         SUM(CASE WHEN s.parent_session IS NOT NULL THEN u.tokens_in + u.tokens_out + u.cache_w + u.cache_r ELSE 0 END)
+           AS subagent_tokens,
+         ROUND(1.0 * SUM(CASE WHEN s.parent_session IS NOT NULL THEN u.tokens_in + u.tokens_out + u.cache_w + u.cache_r
+           ELSE 0 END) / NULLIF(SUM(u.tokens_in + u.tokens_out + u.cache_w + u.cache_r), 0), 4) AS subagent_token_share,
+         ROUND(SUM(u.cost_usd_est), 4) AS cost_usd_est,
+         ROUND(SUM(CASE WHEN s.parent_session IS NOT NULL THEN u.cost_usd_est END), 4) AS subagent_cost_usd_est,
+         ROUND(SUM(CASE WHEN s.parent_session IS NOT NULL THEN u.cost_usd_est ELSE 0 END)
+           / NULLIF(SUM(u.cost_usd_est), 0), 4) AS subagent_cost_share
+  FROM sessions s JOIN usage_daily u ON u.session_id = s.session_id GROUP BY s.role_eff;
+-- The share of the input tokens that came from the prompt cache, per rolled-up role.
 CREATE VIEW v_cache_hit_rate AS
-  SELECT s.role AS role, SUM(u.cache_r) AS tokens_cache_r, SUM(u.tokens_in + u.cache_r + u.cache_w) AS tokens_input,
+  SELECT s.role_eff AS role, SUM(u.cache_r) AS tokens_cache_r, SUM(u.tokens_in + u.cache_r + u.cache_w) AS tokens_input,
          ROUND(1.0 * SUM(u.cache_r) / NULLIF(SUM(u.tokens_in + u.cache_r + u.cache_w), 0), 4) AS cache_hit_rate
-  FROM sessions s JOIN usage_daily u ON u.session_id = s.session_id GROUP BY s.role;
--- Per merged branch, since its previous merge: the agents' estimated cost (their sessions and the subagents
--- they started, linked by the transcripts' repo and branch) and the reviews' and judges' cost from the review
--- files, which is authoritative.
+  FROM sessions s JOIN usage_daily u ON u.session_id = s.session_id GROUP BY s.role_eff;
+-- Per merged branch, since its previous merge: the agents' estimated cost (agent sessions, their subagents, and
+-- the main session's subagents that worked in the branch's worktree; linked by the transcripts' repo and branch)
+-- and the reviews' and judges' cost from the review files, which is authoritative.
 CREATE VIEW v_cost_per_merged_branch AS
   WITH m AS (
     SELECT j.repo, j.branch, j.job_id, j.ended AS merged_at,
@@ -133,11 +163,9 @@ CREATE VIEW v_cost_per_merged_branch AS
               AND p.ended < j.ended) AS since
     FROM jobs j WHERE j.outcome = 'merged' AND j.repo IS NOT NULL AND j.branch IS NOT NULL),
   a AS (
-    SELECT s.session_id, COALESCE(p.repo, s.repo) AS repo, COALESCE(p.branch, s.branch) AS branch, s.start,
-           SUM(u.cost_usd_est) AS cost
-    FROM sessions s LEFT JOIN sessions p ON p.session_id = s.parent_session
-    JOIN usage_daily u ON u.session_id = s.session_id
-    WHERE s.role = 'agent' OR (s.role = 'subagent' AND p.role = 'agent') GROUP BY s.session_id)
+    SELECT s.session_id, s.repo, s.branch, s.start, SUM(u.cost_usd_est) AS cost
+    FROM sessions s JOIN usage_daily u ON u.session_id = s.session_id
+    WHERE s.role_eff = 'agent' GROUP BY s.session_id)
   SELECT m.repo AS repo, m.branch AS branch, m.merged_at AS merged_at, m.job_id AS job_id,
          (SELECT COUNT(*) FROM a WHERE a.repo = m.repo AND a.branch = m.branch AND a.start <= m.merged_at
             AND (m.since IS NULL OR a.start > m.since)) AS agent_sessions,
@@ -383,11 +411,11 @@ def save_state(db, path, st, offset):
                (path, st.st_ino, st.st_size, offset, st.st_mtime))
 
 
-def tail_jsonl(db, path, handle, key=None):
+def tail_jsonl(db, path, handle, key=None, restart=None):
     """Calls handle(text, obj) for each new complete line of a JSON-lines file that holds an object, from where
     the last run stopped (from the start if the file is another inode or shorter), and saves where it stopped,
     in ingest_state under key (default: the path). A last line without its newline is left for the next run.
-    Returns False if the file is missing."""
+    restart() is called first when the file is read from its start again. Returns False if the file is missing."""
     key = key or path
     try:
         st = os.stat(path)
@@ -397,6 +425,8 @@ def tail_jsonl(db, path, handle, key=None):
     offset = 0
     if row and row[0] == st.st_ino and row[1] <= st.st_size:
         offset = row[1]
+    if row and offset == 0 and restart:
+        restart()
     with open(path, "rb") as fh:
         fh.seek(offset)
         for raw in fh:
@@ -552,8 +582,10 @@ def ingest_transcripts(db, projects):
     first cwd and branch, and first and last time. Reads only the allowlisted fields. Returns (files, new msgs)."""
     files = new = 0
     for path, sid, parent in transcript_files(projects):
-        facts = {"entrypoint": None, "cwd": None, "branch": None, "start": None, "end": None, "lines": 0}
+        facts = {"entrypoint": None, "cwd": None, "branch": None, "start": None, "end": None, "lines": 0,
+                 "restart": False}
         msgs = []
+        places = {}  # (cwd, branch) -> lines: where the session's lines were, also after it cd's elsewhere
 
         def take(text, d):
             facts["lines"] += 1
@@ -564,6 +596,9 @@ def ingest_transcripts(db, projects):
             for k, f in (("entrypoint", "entrypoint"), ("cwd", "cwd"), ("branch", "gitBranch")):
                 if facts[k] is None and isinstance(d.get(f), str) and d[f]:
                     facts[k] = d[f]
+            if isinstance(d.get("cwd"), str) and d["cwd"]:
+                pk = (d["cwd"], d["gitBranch"] if isinstance(d.get("gitBranch"), str) else "")
+                places[pk] = places.get(pk, 0) + 1
             m = d.get("message")
             if not isinstance(m, dict) or not isinstance(m.get("usage"), dict) or not isinstance(m.get("id"), str):
                 return
@@ -575,11 +610,17 @@ def ingest_transcripts(db, projects):
                          num_tok(u.get("cache_creation_input_tokens")), num_tok(cc.get("ephemeral_1h_input_tokens")),
                          num_tok(u.get("cache_read_input_tokens"))))
 
-        if not tail_jsonl(db, path, take, transcript_key(path)):
+        if not tail_jsonl(db, path, take, transcript_key(path), lambda: facts.update(restart=True)):
             continue
         files += 1
+        if facts["restart"]:  # read again from the start: its places are counted again
+            db.execute("DELETE FROM session_places WHERE session_id = ?", (sid,))
         if not facts["lines"]:
             continue
+        for (cwd, branch), n in places.items():
+            h, name, place = cwd_facts(cwd)
+            db.execute("INSERT INTO session_places VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (session_id, cwd_hash, branch) "
+                       "DO UPDATE SET lines = session_places.lines + excluded.lines", (sid, h, branch, name, place, n))
         for row in msgs:
             new += db.execute("INSERT OR IGNORE INTO usage_msgs (msg_id, session_id, model, day, tokens_in, tokens_out, "
                               "cache_w, cache_w_1h, cache_r) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", row).rowcount
@@ -609,11 +650,23 @@ def repo_of_name(name, known):
     return next((k for k in known if name == k or name.startswith(k + "-")), name)
 
 
+def where(name, place, known):
+    """(repo, in a worktree?) of a session's folder name and place."""
+    repo = repo_of_name(name, known) if place in ("repos", "dir") else None
+    if place == "repos":
+        return repo, name not in known
+    return repo, place == "dir" and repo != name
+
+
 def classify_sessions(db, state):
-    """Every session's repo, role and message count, again: a session a review sidecar names gets that review's
-    kind; a subagent's file, subagent; an sdk-cli session in a worktree that has no sidecar but ran on the branch
-    of a review without one and ended as it was written, that review's kind; else an sdk-cli session in a
-    worktree, agent; a cli session in a checkout, main; anything else, other."""
+    """Every session's repo, role, rolled-up role and message count, again. Roles: a session a review sidecar
+    names gets that review's kind; a subagent's file, subagent; an sdk-cli session in a worktree that has no
+    sidecar but ran on the branch of a review without one and ended as it was written (within 5 minutes), that
+    review's kind; else an sdk-cli session in a worktree, agent; a cli session in a checkout, main; anything else
+    (cli in a worktree, a temp dir), other.
+    A subagent's repo and branch are those of the worktree it spent the most lines in (link = worktree: an agent
+    the main session started cd's into its worktree), else of its first cwd (link = cwd). Its rolled-up role
+    (role_eff) is its parent's, except that a subagent of a main session that worked in a worktree is an agent."""
     known = sorted((os.path.basename(p) for p in glob.glob(os.path.join(glob.escape(state), "repos", "*"))
                     if os.path.isdir(p)), key=len, reverse=True)
     by_session = {}
@@ -629,12 +682,20 @@ def classify_sessions(db, state):
     updates = []
     rows = db.execute("SELECT session_id, worktree, place, branch, entrypoint, start, end, parent_session "
                       "FROM sessions ORDER BY end, session_id").fetchall()
+    best = {}  # subagent -> (worktree, branch, repo) of the worktree it has the most lines in, any subfolder
+    for sid, name, place, branch, n in db.execute(
+            "SELECT p.session_id, p.worktree, p.place, p.branch, SUM(p.lines) AS n FROM session_places p "
+            "JOIN sessions s ON s.session_id = p.session_id WHERE s.parent_session IS NOT NULL "
+            "GROUP BY p.session_id, p.worktree, p.place, p.branch ORDER BY p.session_id, n DESC, p.worktree, p.branch"):
+        repo, wt = where(name, place, known)
+        if wt and sid not in best:
+            best[sid] = (name, branch or None, repo)
     for sid, name, place, branch, entry, start, end, parent in rows:
-        repo = repo_of_name(name, known) if place in ("repos", "dir") else None
-        if place == "repos":
-            in_worktree = name not in known
-        else:
-            in_worktree = place == "dir" and repo != name
+        repo, in_worktree = where(name, place, known)
+        link = "cwd"
+        if sid in best:
+            name, branch, repo = best[sid]
+            link = "worktree"
         review_id = role = None
         if sid in by_session:
             review_id, kind = by_session[sid]
@@ -655,8 +716,14 @@ def classify_sessions(db, state):
             role = "main"
         else:
             role = "other"
-        updates.append((role, repo, msgs.get(sid, 0), review_id, sid))
-    db.executemany("UPDATE sessions SET role = ?, repo = ?, msgs = ?, review_id = ? WHERE session_id = ?", updates)
+        updates.append((role, repo, name, branch, link, msgs.get(sid, 0), review_id, sid))
+    db.executemany("UPDATE sessions SET role = ?, repo = ?, worktree = ?, branch = ?, link = ?, msgs = ?, review_id = ? "
+                   "WHERE session_id = ?", updates)
+    # Rolled up: a subagent counts toward its parent's role (subagent if its parent has no transcript).
+    db.execute("UPDATE sessions SET role_eff = role")
+    db.execute("UPDATE sessions SET role_eff = COALESCE((SELECT CASE WHEN p.role = 'main' AND sessions.link = 'worktree' "
+               "THEN 'agent' ELSE p.role END FROM sessions p WHERE p.session_id = sessions.parent_session), 'subagent') "
+               "WHERE parent_session IS NOT NULL")
 
 
 def rebuild_usage(db):
@@ -696,7 +763,8 @@ REASONS = [  # results.log's failure text -> the events' job_failed reason; the 
     (r"git push failed", "push"),
     (r"create-pr\.sh failed|gh pr create failed|no PR found", "pr"),
     (r"as its head", "head"),
-    (r"checks failed on|no checks reported", "checks_failed"),
+    (r"checks failed on", "checks_failed"),
+    (r"no checks reported", "checks_timeout"),  # as pr-queue.sh's job_failed reason
     (r"checks still pending", "checks_timeout"),
     (r"merging #\d+ failed", "merge"),
 ]

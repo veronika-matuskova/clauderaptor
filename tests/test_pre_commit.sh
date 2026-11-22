@@ -20,6 +20,8 @@ assert_contains "failing tests: message" "$out" "commit aborted"
 assert "failing tests: only 1 commit" test "$(git -C "$R" rev-list --count HEAD)" = 1
 
 # The hook exports GIT_INDEX_FILE; tests/lib.sh must drop it, or git in a test repo writes this repo's index.
+# (lib.sh doesn't re-run here under capped.sh, which this copy lacks: TESTS_CAPPED, inherited from this test
+# file, says it runs in a cap already.)
 cp "$ROOT/tests/lib.sh" "$R/tests/"
 cat > "$R/tests/run.sh" <<'EOF'
 #!/usr/bin/env bash

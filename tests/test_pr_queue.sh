@@ -485,6 +485,7 @@ flock "$RQ/run.lock" sleep 3 & sleep 0.3
 out="$(PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 Q run)"; touch "$TQ/e2e_fail"
 wait
 assert_contains "repos: the busy repo is skipped" "$out" "repo: a runner is already working on the queue"
+assert_contains "repos: and named at the end" "$out" "jobs left in the queue of: repo (see above)"
 assert_contains "repos: the other repo's job ran" "$out" "fix/two"
 assert "repos: its result in its own log"    grep -q "fix/two" "$RQ2/results.log"
 assert "repos: not in the other repo's log"  test -z "$(grep "fix/two" "$RQ/results.log")"
@@ -518,6 +519,39 @@ assert_contains "repo's runner: refuses to start runners" "$out" "a repo's runne
 assert "repo's runner: exits with an error"  test "$rc" = 1
 assert "repo's runner: the job stays queued" test -n "$(find "$RQ/queue" -name '*child.job')"
 rm -f "$RQ"/queue/*
+# A job queued in another repo while the runner works is run too.
+reset_pr; touch "$TQ/e2e_fail"; mkwt early; mkwt2 late
+printf 'PATH=%q bash %q add %q fix Late >/dev/null\n' "$TQ/bin:$PATH" "$ROOT/scripts/pr-queue.sh" "$TMP/wt2-late" > "$TQ/on_e2e"
+Q add "$TMP/wt-early" fix "Early" >/dev/null
+out="$(PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 Q run)"
+assert_contains "late job: the first job ran" "$out" "FAILED fix/early"
+assert_contains "late job: the one queued meanwhile ran too" "$out" "FAILED fix/late"
+assert "late job: no job left queued"        test -z "$(find "$RQ/queue" "$RQ2/queue" -name '*.job')"
+assert_contains "late job: then the queues are empty" "$out" "pr-queue: the queues are empty"
+# A job queued in a third repo while two repos' runners work is run too, in a round after theirs.
+R3="$TMP/repo3"; git clone -q "$TMP/origin.git" "$R3" 2>/dev/null; RQ3="$PR_QUEUE_DIR/repos/repo3"
+git -C "$R3" worktree add -q "$TMP/wt3-later" -b fix/later origin/main 2>/dev/null
+echo later > "$TMP/wt3-later/later.txt"; git -C "$TMP/wt3-later" add -A; git -C "$TMP/wt3-later" commit -q -m later
+reset_pr; touch "$TQ/e2e_fail"; mkwt both1; mkwt2 both2
+printf 'PATH=%q bash %q add %q fix Later >/dev/null\n' "$TQ/bin:$PATH" "$ROOT/scripts/pr-queue.sh" "$TMP/wt3-later" > "$TQ/on_e2e"
+Q add "$TMP/wt-both1" fix "Both 1" >/dev/null; Q add "$TMP/wt2-both2" fix "Both 2" >/dev/null
+out="$(PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 Q run)"
+assert_contains "late job after two repos: one ran" "$out" "FAILED fix/both1"
+assert_contains "late job after two repos: the other ran" "$out" "FAILED fix/both2"
+assert_contains "late job after two repos: the third repo's ran too" "$out" "FAILED fix/later"
+assert "late job after two repos: no job left queued" test -z "$(find "$RQ3/queue" -name '*.job')"
+rm -rf "$RQ3"
+# A repo whose runner fails is left out of the next rounds, so the runner ends, and the end says so.
+reset_pr; touch "$TQ/e2e_fail"; mkwt live; mkwt2 orphaned
+Q add "$TMP/wt-live" fix "Live" >/dev/null; Q add "$TMP/wt2-orphaned" fix "Orphaned" >/dev/null
+echo "$TMP/no-such-checkout" > "$RQ2/checkout"
+out="$(PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 PATH="$TQ/bin:$PATH" timeout 120 bash "$ROOT/scripts/pr-queue.sh" run </dev/null 2>&1)"; rc=$?
+assert "given up: the runner ends"           test "$rc" != 124
+assert_contains "given up: the other repo's job ran" "$out" "FAILED fix/live"
+assert_contains "given up: says why"         "$out" "$TMP/no-such-checkout is not a git checkout"
+assert_contains "given up: says which queue has jobs left" "$out" "jobs left in the queue of: repo2 (see above)"
+assert "given up: its job still queued"      test -n "$(find "$RQ2/queue" -name '*orphaned.job')"
+echo "$R2" > "$RQ2/checkout"; rm -f "$RQ2"/queue/*
 # A repo whose folder has the same name as another repo's gets a queue of its own.
 mkdir -p "$TMP/elsewhere"; git clone -q "$TMP/origin.git" "$TMP/elsewhere/repo" 2>/dev/null
 git -C "$TMP/elsewhere/repo" worktree add -q "$TMP/wt3-same" -b fix/same origin/main 2>/dev/null
@@ -527,28 +561,29 @@ assert_contains "same name: a queue of its own" "$out" "in the queue of repo-"
 assert "same name: not in the first repo's"  test -z "$(find "$RQ/queue" -name '*same.job')"
 rm -rf "$PR_QUEUE_DIR"/repos/repo-*
 
-# A signal to the runner of several repos stops each repo's runner, its job and its review sessions.
-reset_pr; rm -rf "$TQ/hung" "$TQ/tmp"; mkdir -p "$TQ/tmp"; touch "$TQ/hang"; mkwt sigA; mkwt2 sigB
-Q add "$TMP/wt-sigA" fix "A" >/dev/null; Q add "$TMP/wt2-sigB" fix "B" >/dev/null
-PATH="$TQ/bin:$PATH" TMPDIR="$TQ/tmp" python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-  bash "$ROOT/scripts/pr-queue.sh" run </dev/null >/dev/null 2>&1 &
-rpid=$!
-for _ in $(seq 100); do [ "$(wc -l 2>/dev/null < "$TQ/hung")" = 4 ] && break; sleep 0.1; done
-assert "several repos: all four sessions started" test "$(wc -l < "$TQ/hung")" = 4
-t0=$SECONDS
-kill -TERM "$rpid"; { wait "$rpid"; } 2>/dev/null; rc=$?
-# As with one repo, each repo's job may still be stopping its reviews when the runners end.
-for _ in $(seq 100); do
-  alive=""; while read -r p; do gone "$p" || alive=1; done < "$TQ/hung"
-  if [ -z "$alive" ] && [ -z "$(ls -A "$TQ/tmp")" ] && flock -n "$RQ/run.lock" flock -n "$RQ2/run.lock" true; then break; fi
-  sleep 0.1
+# A signal to the runner of several repos stops each repo's runner, its job and its review sessions before it
+# ends itself: a Ctrl-C (INT to its process group), a kill (TERM) or a hangup (HUP) of its pid.
+for sig in INT TERM HUP; do
+  reset_pr; rm -rf "$TQ/hung" "$TQ/tmp"; mkdir -p "$TQ/tmp"; touch "$TQ/hang"; mkwt "sig$sig"; mkwt2 "sig2$sig"
+  Q add "$TMP/wt-sig$sig" fix "A" >/dev/null; Q add "$TMP/wt2-sig2$sig" fix "B" >/dev/null
+  PATH="$TQ/bin:$PATH" TMPDIR="$TQ/tmp" python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+    bash "$ROOT/scripts/pr-queue.sh" run </dev/null >/dev/null 2>&1 &
+  rpid=$!
+  for _ in $(seq 100); do [ "$(wc -l 2>/dev/null < "$TQ/hung")" = 4 ] && break; sleep 0.1; done
+  assert "several repos, $sig: all four sessions started" test "$(wc -l < "$TQ/hung")" = 4
+  t0=$SECONDS
+  if [ "$sig" = INT ]; then kill -INT -- "-$rpid"; else kill -"$sig" "$rpid"; fi
+  { wait "$rpid"; } 2>/dev/null; rc=$?
+  took=$((SECONDS - t0))
+  alive_at_exit=""; while read -r p; do gone "$p" || alive_at_exit=1; done < "$TQ/hung"
+  case "$sig" in INT) code=130 ;; TERM) code=143 ;; HUP) code=129 ;; esac
+  assert "several repos, $sig: ends by SIG$sig" test "$rc" = "$code"
+  assert "several repos, $sig: every session stopped before it ended" test -z "$alive_at_exit"
+  assert "several repos, $sig: at once, not after the sessions' 30 s" test "$took" -lt 10
+  assert "several repos, $sig: no temp files left" test -z "$(ls -A "$TQ/tmp")"
+  assert "several repos, $sig: both runners' locks free" flock -n "$RQ/run.lock" flock -n "$RQ2/run.lock" true
+  rm -f "$TQ/hang" "$RQ"/running/* "$RQ2"/running/*
 done
-assert "several repos: ends by SIGTERM"      test "$rc" = 143
-assert "several repos: every session stopped" test -z "$alive"
-assert "several repos: at once, not after the sessions' 30 s" test $((SECONDS - t0)) -lt 10
-assert "several repos: no temp files left"   test -z "$(ls -A "$TQ/tmp")"
-assert "several repos: both runners' locks free" flock -n "$RQ/run.lock" flock -n "$RQ2/run.lock" true
-rm -f "$TQ/hang" "$RQ"/running/* "$RQ2"/running/*
 
 # --- jobs of the old single queue move to their repos' queues ---
 reset_pr; mkwt old; old_branch_job() { printf 'worktree=%s\nbranch=%s\ntype=fix\ndescription=x\nreview=\ntests=\n' "$1" "$2"; }
@@ -569,6 +604,27 @@ assert "old queue: an unknown repo's job kept apart" test -f "$PR_QUEUE_DIR/lega
 assert "old queue: its folders removed"      test ! -e "$PR_QUEUE_DIR/queue" -a ! -e "$PR_QUEUE_DIR/running"
 assert_not_contains "old queue: no notice after" "$out" "old version"
 rm -f "$RQ"/queue/* "$RQ/failed/2-fix-old.job"
+# `add` and `run` move the old queue's jobs too: a re-queue keeps the --review of its job in the old failed/.
+reset_pr; mkwt oldflags; mkdir -p "$PR_QUEUE_DIR/failed"
+printf 'worktree=%s\nbranch=fix/oldflags\ntype=fix\ndescription=x\nreview=high\ntests=\n' "$TMP/wt-oldflags" \
+  > "$PR_QUEUE_DIR/failed/4-fix-oldflags.job"
+out="$(Q add "$TMP/wt-oldflags" fix "Old flags")"
+assert_contains "old queue: add moves it, so the re-queue keeps --review" "$out" "keeping --review high from the earlier job"
+assert "old queue: add moved it"             test ! -e "$PR_QUEUE_DIR/failed"
+rm -f "$RQ"/queue/* "$RQ"/failed/*oldflags*
+reset_pr; touch "$TQ/e2e_fail"; mkwt oldrun; mkdir -p "$PR_QUEUE_DIR/queue"
+old_branch_job "$TMP/wt-oldrun" fix/oldrun > "$PR_QUEUE_DIR/queue/5-fix-oldrun.job"
+out="$(PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 Q run)"
+assert_contains "old queue: run moves its jobs and runs them" "$out" "FAILED fix/oldrun"
+assert "old queue: run moved it"             test ! -e "$PR_QUEUE_DIR/queue"
+# While a runner of the old version holds the old lock, `run` refuses: it could run a second job of a repo.
+reset_pr; mkwt oldlock; Q add "$TMP/wt-oldlock" fix "Old lock" >/dev/null
+flock "$PR_QUEUE_DIR/run.lock" sleep 2 & sleep 0.3
+out="$(Q run)"; rc=$?
+assert_contains "old runner: run refuses"    "$out" "a runner of the old version (one queue for all repos) is still working"
+assert "old runner: exits with an error"     test "$rc" = 1
+assert "old runner: the job stays queued"    test -n "$(find "$RQ/queue" -name '*oldlock.job')"
+wait; rm -f "$RQ"/queue/*
 out="$(Q lock echo hi)";                     assert_contains "lock runs the command" "$out" "hi"
 out="$(Q bogus)";                            assert_contains "usage on a bad command" "$out" "pr-queue.sh add"
 

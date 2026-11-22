@@ -34,6 +34,8 @@
 # Exit 0 = ready, 1 = needs changes, 2 = the review didn't run (3 = escalate: a judge only, below).
 # An audit is saved as <repo>-suite-<sha>.md with every finding. It prints only its summary and the file,
 # and exits 0, or 2 if it didn't run.
+# Each review saved gets a sidecar <review>.json next to it, for stats: the session's ids, cost, time and tokens,
+# its verdict and exit code, never its text (a cached review gets none).
 # A judge gets the review files (the ones that need changes) and the branch's earlier judgements, decides for
 # each blocking finding whether it is real and worth fixing, and lists what the agent must fix. It is saved
 # as <branch>-<sha>-judge.md, with the paths of the reviews it judged; a commit already judged ready on the same
@@ -278,6 +280,44 @@ body=""
 if [[ "$review" == *$'\n'* ]]; then body="${review#*$'\n'}"; fi
 printf '# %s%s, %s at %s effort)\n\n%s\n' "$title" "${review%%$'\n'*}" "$model" "$effort" "$body" > "$out"
 if [ "$mode" = judge ]; then echo "$judged" >> "$out"; fi
+# The sidecar <review>.json, for stats: the session's numbers and ids, never its text or the prompts. Written
+# on the way out, with the exit code, atomically (a temp file, then a rename); a failure to write it is ignored.
+# An earlier one of the same review goes first, so that a failed write never leaves it next to the new review.
+# shellcheck disable=SC2329  # invoked from the EXIT trap below
+sidecar() {
+  rm -f -- "${out%.md}.json"
+  python3 -I -c '
+import datetime, json, os, sys, tempfile
+src, dst, kind, branch, sha, level, skipped, verdict, rc = sys.argv[1:]
+with open(src) as f: d = json.load(f)
+if not isinstance(d, dict): d = {}
+num = lambda v: v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+pick = lambda v, keys: {k: num(v.get(k)) for k in keys} if isinstance(v, dict) else None
+mu = d.get("modelUsage")
+s = {"v": 1, "kind": kind, "branch": branch or None, "sha": sha or None, "level": level or None,
+     "tests_skipped": {"true": True, "false": False}.get(skipped),
+     "file": os.path.basename(dst)[:-5] + ".md",
+     "session_id": d["session_id"] if isinstance(d.get("session_id"), str) else None,
+     "cost_usd": num(d.get("total_cost_usd")), "duration_ms": num(d.get("duration_ms")),
+     "duration_api_ms": num(d.get("duration_api_ms")), "num_turns": num(d.get("num_turns")),
+     "verdict": verdict or None, "exit": int(rc),
+     "usage": pick(d.get("usage"), ("input_tokens", "output_tokens", "cache_creation_input_tokens",
+                                    "cache_read_input_tokens")),
+     "model_usage": {str(m): pick(u, ("inputTokens", "outputTokens", "cacheReadInputTokens",
+                                      "cacheCreationInputTokens", "costUSD")) for m, u in mu.items()}
+                    if isinstance(mu, dict) else None,
+     "finished": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dst), prefix=".sidecar-", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w") as f: json.dump(s, f); f.write("\n")
+    os.replace(tmp, dst)
+except BaseException:
+    os.unlink(tmp); raise
+' "$json" "${out%.md}.json" "$mode" "$branch" "$(git -C "$wt" rev-parse -q --verify "$sha^{commit}")" \
+    "$([ "$mode" != code ] || echo "$level")" \
+    "$(if [ "$mode" = code ]; then if [ -n "$suffix" ]; then echo true; else echo false; fi; fi)" "$(verdict "$out")" "$1"
+}
+trap 'rc=$?; { sidecar "$rc"; } >/dev/null 2>&1; rm -rf ${json:+"$json"} ${sysprompt:+"$sysprompt"} ${scratch:+"$scratch"}' EXIT
 
 if [ "$mode" = suite ]; then
   # A label line, with markdown around the label (**Counts**:, **Counts:**) or as a list item (- Counts:, 1. Counts:)

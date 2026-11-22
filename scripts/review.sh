@@ -5,6 +5,7 @@
 #                                                  (default medium; use high for migrations, auth or RLS)
 #   review.sh --tests <worktree>                   the tests of the branch's change (scripts/review-tests.md)
 #   review.sh --suite <checkout>                   an audit of the checkout's whole test suite (same file)
+#   review.sh --judge <worktree> <review file>...  a judge of reviews that need changes (scripts/review-judge.md)
 # The session runs in the worktree, with --safe-mode: nothing of the branch's own config is loaded (its
 # CLAUDE.md files, .claude/ rules, settings and hooks, skills that could stand in for /code-review, MCP
 # servers), so the branch can't steer its own review; a change to them is part of the diff it reviews.
@@ -13,9 +14,9 @@
 # (origin/HEAD's, else main or master; an audit: at the audited commit). It has no Edit or Write tools and no stdin, and the review fails
 # if the worktree's files or either checkout's HEAD or branch changed meanwhile. (An audit reads only its
 # pinned commit, so it may run in a checkout someone works in: a moved HEAD or branch only adds a note.)
-# A test review or audit gets a scratch folder, removed afterwards: it runs the tests in a copy of the
-# commit there, with the code broken on purpose, and e2e tests only under `pr-queue.sh lock`.
-# It is stopped after $REVIEW_TIMEOUT seconds (1800 for the code, 3600 for the tests: e2e runs wait for the
+# A test review, audit or judge gets a scratch folder, removed afterwards: it runs the tests in a copy of the
+# commit there (a test review with the code broken on purpose), and e2e tests only under `pr-queue.sh lock`.
+# It is stopped after $REVIEW_TIMEOUT seconds (1800 for the code, 3600 for the rest: e2e runs wait for the
 # lock), and killed 30 s later if it is still running. It runs under capped.sh, so that a runaway in it can't
 # fill the machine, and runs each test command under a cap of its own (the cap command), so that a mutation
 # that runs away is stopped there and the session goes on to report it. A Ctrl-C, kill (TERM) or hangup of
@@ -27,15 +28,24 @@
 # A commit already reviewed as ready isn't reviewed again: for the code, at that level or a higher one, and
 # a review that left out the tests counts only for another one that does. Prints the findings and a last
 # line "Verdict: ready" or "Verdict: needs changes", then "(saved to <file>)".
-# Exit 0 = ready, 1 = needs changes, 2 = the review didn't run.
+# Exit 0 = ready, 1 = needs changes, 2 = the review didn't run (3 = escalate: a judge only, below).
 # An audit is saved as <repo>-suite-<sha>.md with every finding. It prints only its summary and the file,
 # and exits 0, or 2 if it didn't run.
+# A judge gets the review files (the ones that need changes) and the branch's earlier judgements, decides for
+# each blocking finding whether it is real and worth fixing, and lists what the agent must fix. It is saved
+# as <branch>-<sha>-judge.md, with the paths of the reviews it judged; a commit already judged ready on the same
+# reviews (the same kinds, at the same level) isn't judged again. Its last verdict line is "ready" (exit 0: nothing to fix), "needs changes" (exit
+# 1: the To fix list goes to the agent) or "escalate" (exit 3: it rejected a finding that would be critical if
+# real, and the user decides). "Needs changes" in a second judgement of the branch (the judgement of a commit
+# HEAD descends from needed changes too) also exits 3: after two judged rounds the user decides, not the queue
+# or its session.
 set -uo pipefail
 die() { echo "review: $*" >&2; exit 2; }
-# verdict <file>: "ready", "needs changes" or "failed", from the last verdict line (markdown and case ignored).
+# verdict <file>: "ready", "needs changes", "escalate" (a judge only) or "failed", from the last verdict line
+# (markdown and case ignored).
 verdict() {
-  grep -oiE 'verdict:[[:space:]*_`]*(ready|needs changes|failed)' "$1" 2>/dev/null | tail -1 \
-    | grep -oiE 'ready|needs changes|failed' | tr '[:upper:]' '[:lower:]'
+  grep -oiE 'verdict:[[:space:]*_`]*(ready|needs changes|escalate|failed)' "$1" 2>/dev/null | tail -1 \
+    | grep -oiE 'ready|needs changes|escalate|failed' | tr '[:upper:]' '[:lower:]'
 }
 # state: what must not change during a review: the worktree's HEAD and files, and where the main checkout is
 # (its files may change: someone may be working there). An audit may run in a checkout someone works in.
@@ -99,10 +109,18 @@ print("" if t.startswith("/") or r == ".." or r.startswith("../") else r)' "$p" 
   wait $! || return 1  # ls-tree's (a missing commit or tree object)
 }
 
-usage="usage: review.sh <worktree> [low|medium|high|xhigh] | --tests <worktree> | --suite <checkout>"
-mode=code; level=medium
+usage="usage: review.sh <worktree> [low|medium|high|xhigh] | --tests <worktree> | --suite <checkout> \
+| --judge <worktree> <review file>..."
+mode=code; level=medium; reviews=()
 case "${1:-}" in
   --tests|--suite) [ $# -eq 2 ] || die "$usage"; mode="${1#--}"; shift ;;
+  --judge)
+    [ $# -ge 3 ] || die "$usage"; mode=judge; shift; reviews=("${@:2}")
+    for i in "${!reviews[@]}"; do
+      [ -f "${reviews[$i]}" ] || die "no such review file: ${reviews[$i]}"
+      reviews[i]="$(readlink -f "${reviews[$i]}")"  # absolute: the session runs in the worktree
+    done
+    ;;
   *)
     if [ $# -lt 1 ] || [ $# -gt 2 ]; then die "$usage"; fi
     level="${2:-medium}"
@@ -163,6 +181,32 @@ in your system prompt, otherwise \"Verdict: ready\". If the skill is not availab
 - Repo: $wt, commit $sha. Audit exactly that commit."
     title="Test suite audit of $name at $sha ("
     ;;
+  judge)
+    out="$base-judge.md"
+    # The reviews it judges, by path (a review's path holds its commit, level and kind): a ready judgement
+    # counts only for the same ones. Not by content: a review run again always has new text (its cost and time).
+    judged="Judged reviews: $(printf '%s\n' "${reviews[@]}" | sort | paste -sd' ')"
+    if [ "$(verdict "$out")" = ready ] && grep -qxF "$judged" "$out"; then
+      cat "$out"; echo "already judged as ready"; echo "(saved to $out)"; exit 0
+    fi
+    change_base; rules_at="$mb"; rules_what="the base of the change, against $against"
+    # The branch's earlier judgements, oldest first: of other commits HEAD descends from, so not of another
+    # repo's branch of the same name, nor of an earlier branch of that name, merged (squashed) before.
+    prefix="$dir/${branch//\//-}-"; earlier=""
+    for f in "$prefix"*-judge.md; do
+      if [ ! -f "$f" ] || [ "$f" = "$out" ]; then continue; fi
+      rest="${f#"$prefix"}"; [[ "$rest" =~ ^([0-9a-f]{7,40})-judge\.md$ ]] || continue
+      git -C "$wt" merge-base --is-ancestor "${BASH_REMATCH[1]}" HEAD 2>/dev/null || continue
+      earlier+="$(stat -c %Y "$f") $f"$'\n'
+    done
+    earlier="$(sort -n <<<"$earlier" | cut -d' ' -f2- | sed '/^$/d')"
+    task="Judge the reviews of one change, following the instructions below.
+- Repo: $wt, branch $branch. The change: git diff ${mb:0:12} $sha (against $against). Judge exactly commit $sha.
+- Reviews to judge (read each with cat): ${reviews[*]}
+- Earlier rulings on this branch, oldest first (read each with cat): ${earlier//$'\n'/ }"
+    if [ -z "$earlier" ]; then task+="none"; fi
+    title="Judgement of $branch at $sha ("
+    ;;
 esac
 json=""; sysprompt=""; scratch=""
 trap 'rm -rf ${json:+"$json"} ${sysprompt:+"$sysprompt"} ${scratch:+"$scratch"}' EXIT
@@ -170,7 +214,9 @@ json="$(mktemp)" || die "can't create a temp file"
 sysprompt="$(mktemp)" || die "can't create a temp file"
 rules "$rules_at" "$rules_what" "$mode" >"$sysprompt" || die "can't read the rules at ${rules_at:0:12}"
 if [ "$mode" != code ]; then
-  [ -f "$HERE/review-tests.md" ] || die "missing $HERE/review-tests.md"
+  instructions="$HERE/review-tests.md"
+  if [ "$mode" = judge ]; then instructions="$HERE/review-judge.md"; fi
+  [ -f "$instructions" ] || die "missing $instructions"
   scratch="$(mktemp -d)" || die "can't create a scratch folder"
   prompt="$task
 - Repo rules: the ones under \"Rules for this review\" in your system prompt, from commit ${rules_at:0:12}. Read
@@ -179,7 +225,7 @@ if [ "$mode" != code ]; then
 - e2e lock command: $HERE/pr-queue.sh lock <command>
 - Cap command: $HERE/capped.sh <command>
 
-$(cat "$HERE/review-tests.md")"
+$(cat "$instructions")"
 fi
 
 before="$(state)"
@@ -214,6 +260,7 @@ print(d.get("result") or "")
 body=""
 if [[ "$review" == *$'\n'* ]]; then body="${review#*$'\n'}"; fi
 printf '# %s%s)\n\n%s\n' "$title" "${review%%$'\n'*}" "$body" > "$out"
+if [ "$mode" = judge ]; then echo "$judged" >> "$out"; fi
 
 if [ "$mode" = suite ]; then
   # A label line, with markdown around the label (**Counts**:, **Counts:**) or as a list item (- Counts:, 1. Counts:)
@@ -229,6 +276,15 @@ cat "$out"
 echo "(saved to $out)"
 case "$(verdict "$out")" in
   ready) exit 0 ;;
-  "needs changes") exit 1 ;;
+  "needs changes")
+    if [ "$mode" = judge ]; then
+      while read -r f; do
+        if [ -n "$f" ] && [ "$(verdict "$f")" = "needs changes" ]; then
+          echo "the judge found changes to make in two judged rounds (also in $f): the user decides"; exit 3
+        fi
+      done <<<"$earlier"
+    fi
+    exit 1 ;;
+  escalate) [ "$mode" = judge ] || { echo "review: no verdict in the review" >&2; exit 2; }; exit 3 ;;
   *) echo "review: no verdict in the review" >&2; exit 2 ;;
 esac

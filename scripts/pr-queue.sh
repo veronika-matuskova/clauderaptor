@@ -16,12 +16,20 @@
 #      - the tests (review.sh --tests: mutation check, missing, empty, duplicate and non-atomic tests).
 #        add --tests none skips it for that job. PR_QUEUE_TEST_REVIEW=0 skips it, except for jobs queued with
 #        --tests on.
-#      A re-queue of the branch keeps its --review and --tests. "Needs changes" from either review fails the
-#      job and names the saved reviews, in $REVIEW_DIR (default $PR_QUEUE_DIR/reviews). A commit already
-#      reviewed as ready (the code: at that level) isn't reviewed again. The job waits for both reviews, even
-#      when one fails early, so the branch's agent gets all the findings in one round. A Ctrl-C of the runner,
-#      a hangup, or a TERM to its whole process group (kill -- -<pgid>), stops both reviews and their sessions;
-#      a kill of the runner's pid alone leaves its job running;
+#      A re-queue of the branch keeps its --review and --tests. The job waits for both reviews, even when one
+#      fails early, so the branch's agent gets all the findings in one round. A review that didn't run fails
+#      the job. "Needs changes" from either one goes to a judge (review.sh --judge, a third fresh session),
+#      which keeps only the findings that are real and worth fixing:
+#      - ready: nothing to fix, the job goes on;
+#      - needs changes: fails the job with "the judge confirmed changes to make (judge: <file>)", the agent's
+#        To fix list;
+#      - escalate (it rejected a finding that would be critical if real), or a second judged round with changes
+#        to make: fails the job with "needs your decision", for the user, not the agent.
+#      PR_QUEUE_JUDGE=0 skips the judge: "needs changes" then fails the job as it is. The reviews and the
+#      judgements are saved in $REVIEW_DIR (default $PR_QUEUE_DIR/reviews), and the failure names them. A
+#      commit already reviewed (the code: at that level) or judged as ready isn't reviewed or judged again.
+#      A Ctrl-C of the runner, a hangup, or a TERM to its whole process group (kill -- -<pgid>), stops the
+#      reviews, the judge and their sessions; a kill of the runner's pid alone leaves its job running;
 #   3. if the repo has scripts/e2e-gate.mjs and the commit has no local pass: `npm run test:e2e:full`, under the lock;
 #   4. open the PR (scripts/create-pr.sh <type> "<description>" if the repo has it, else gh pr create), or push to
 #      the open one; the body is the body file (else the current one) with a "Local end-to-end run" section for
@@ -185,7 +193,7 @@ review_result() {
   out="$(cat "$2")"; printf '%s\n' "$out" >> "$LOG"
   if grep -qx 'already reviewed as ready' <<<"$out"; then echo "   $1: already reviewed as ready" | tee -a "$LOG"; fi
   file="$(sed -n 's/^(saved to \(.*\))$/\1/p' <<<"$out" | tail -1)"
-  if [ "$3" -eq 1 ] && [ -n "$file" ]; then problems+="; the $1 found changes to make ($1: $file)"
+  if [ "$3" -eq 1 ] && [ -n "$file" ]; then found+=("$file"); findings+="; the $1 found changes to make ($1: $file)"
   elif [ "$3" -ne 0 ]; then problems+="; the $1 didn't run: $(tail -1 <<<"$out")"; fi
 }
 # stop_reviews <signal>: a Ctrl-C, hangup or TERM to the process group during step 2 stops both reviews
@@ -196,7 +204,7 @@ stop_reviews() {
   local pid
   for pid in $(jobs -p); do kill "$pid" 2>/dev/null; done
   wait
-  rm -f "$code_out" "$tests_out"
+  rm -f "$code_out" "$tests_out" "$judge_out"
   trap - "$1"; kill -"$1" "$BASHPID"
 }
 
@@ -222,7 +230,7 @@ process() {
   fi
 
   # 2. Review the code and the tests, in fresh sessions at the same time, before the e2e run is spent on it.
-  local tests code_pid="" tests_pid="" code_out tests_out problems=""
+  local tests code_pid="" tests_pid="" code_out="" tests_out="" judge_out="" problems="" findings="" found=() judged
   level="$(field review "$1")"; tests="$(field tests "$1")"
   if [ "$level" = none ]; then
     echo "   not reviewed (queued with --review none)" | tee -a "$LOG"; level=""
@@ -252,9 +260,33 @@ process() {
     fi
     if [ -n "$code_pid" ]; then wait "$code_pid"; review_rc=$?; review_result review "$code_out" "$review_rc"; fi
     if [ -n "$tests_pid" ]; then wait "$tests_pid"; review_rc=$?; review_result "test review" "$tests_out" "$review_rc"; fi
-    trap - INT TERM HUP
     rm -f "$code_out" "$tests_out"
-    if [ -n "$problems" ]; then failjob "${problems#; }"; return; fi
+    if [ -n "$problems" ]; then trap - INT TERM HUP; failjob "${problems#; }$findings"; return; fi
+    if [ ${#found[@]} -gt 0 ] && [ "${PR_QUEUE_JUDGE:-1}" = 0 ]; then
+      trap - INT TERM HUP; failjob "${findings#; }"; return
+    fi
+    if [ ${#found[@]} -gt 0 ]; then
+      echo "   judging the findings (review.sh --judge)" | tee -a "$LOG"
+      judge_out="$(mktemp)"
+      REVIEW_DIR="$REVIEWS" "$HERE/review.sh" --judge "$wt" "${found[@]}" >"$judge_out" 2>&1 &
+      wait $!; review_rc=$?
+      trap - INT TERM HUP
+      judged="$(cat "$judge_out")"; rm -f "$judge_out"; printf '%s\n' "$judged" >> "$LOG"
+      local jfile; jfile="$(sed -n 's/^(saved to \(.*\))$/\1/p' <<<"$judged" | tail -1)"
+      case "$review_rc" in
+        0) echo "   the judge found nothing to fix (judge: $jfile)" | tee -a "$LOG" ;;
+        1) failjob "${findings#; }; the judge confirmed changes to make (judge: $jfile)"; return ;;
+        3)
+          if grep -q 'two judged rounds' <<<"$judged"; then
+            failjob "needs your decision: the branch still had changes to make after two judged rounds (judge: $jfile)"
+          else
+            failjob "needs your decision: the judge rejected a finding that would be critical if real (judge: $jfile)"
+          fi
+          return ;;
+        *) failjob "${findings#; }; the judge didn't run: $(tail -1 <<<"$judged")"; return ;;
+      esac
+    fi
+    trap - INT TERM HUP
   fi
 
   # 3. The full local suite, once, on this exact commit.
@@ -364,6 +396,10 @@ run() {
   case "${PR_QUEUE_TEST_REVIEW:-1}" in
     0|1) ;;
     *) die "PR_QUEUE_TEST_REVIEW must be 0 (no test reviews) or 1, not '$PR_QUEUE_TEST_REVIEW'" ;;
+  esac
+  case "${PR_QUEUE_JUDGE:-1}" in
+    0|1) ;;
+    *) die "PR_QUEUE_JUDGE must be 0 (no judge: a review that needs changes fails the job) or 1, not '$PR_QUEUE_JUDGE'" ;;
   esac
   POLL="${PR_QUEUE_POLL:-5}"
   [[ "$POLL" =~ ^[0-9]*\.?[0-9]+$ && "$POLL" =~ [1-9] ]] || die "PR_QUEUE_POLL must be a number of seconds above 0, not '$POLL'"

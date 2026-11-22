@@ -10,16 +10,16 @@ unset CAP_TASKS CAP_MEMORY CAP_TOTAL_TASKS CAP_TOTAL_MEMORY
 BIN="$TMP/bin"; mkdir -p "$BIN"
 export NO_SYSTEMD="$TMP/no_systemd" NO_SWAP_CAP="$TMP/no_swap_cap" SLICE_FAILS="$TMP/slice_fails"
 export EXPANDS="$TMP/expands"
-# $NO_SYSTEMD: every call fails; $NO_SWAP_CAP: a call that sets MemorySwapMax fails; $SLICE_FAILS: the
-# number of calls that set capped.slice's cap that fail, as a call that times out does. $EXPANDS: a newer
-# systemd-run, which has --expand-environment and, without --expand-environment=no, expands ${...} (to
-# nothing here) and $$ in the command's arguments.
+# $NO_SYSTEMD: every call fails; $NO_SWAP_CAP: a call that sets MemorySwapMax fails, with two lines of error;
+# $SLICE_FAILS: the number of calls that set capped.slice's cap that fail, as a call that times out does.
+# $EXPANDS: a newer systemd-run, which has --expand-environment and, without --expand-environment=no, expands
+# ${...} (to nothing here) and $$ in the command's arguments.
 cat > "$BIN/systemd-run" <<'EOF'
 #!/usr/bin/env bash
 if [ "$1" = --help ]; then [ -f "$EXPANDS" ] && echo "  --expand-environment=BOOL"; exit 0; fi
 echo "systemd-run $*" >> "$LOG"
 [ -f "$NO_SYSTEMD" ] && exit 1
-[ -f "$NO_SWAP_CAP" ] && [[ "$*" == *MemorySwapMax* ]] && { echo "Unknown assignment: MemorySwapMax=0" >&2; exit 1; }
+[ -f "$NO_SWAP_CAP" ] && [[ "$*" == *MemorySwapMax* ]] && { printf 'Setting MemorySwapMax\nUnknown assignment: MemorySwapMax=0\n' >&2; exit 1; }
 [ -f "$EXPANDS" ] && [[ " $* " != *" --expand-environment=no "* ]] && expand=1
 while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done
 shift
@@ -181,7 +181,8 @@ out="$(C bash -c 'echo cmd-ran' 2>&1)"; rc=$?
 rm -f "$NO_SWAP_CAP"
 assert "a cap it can't apply: exit 125"     test "$rc" = 125
 assert_not_contains "a cap it can't apply: the command doesn't run" "$out" "cmd-ran"
-assert_contains "a cap it can't apply: what systemd said" "$out" "(3 tries; last: Unknown assignment: MemorySwapMax=0)"
+assert_contains "a cap it can't apply: what systemd said last" "$out" "(3 tries; last: Unknown assignment: MemorySwapMax=0)"
+assert_not_contains "a cap it can't apply: only its last line" "$out" "Setting MemorySwapMax"
 # A check that fails, then passes: capped as usual.
 for n in 1 2; do
   newlog "flaky$n"; echo "$n" > "$SLICE_FAILS"

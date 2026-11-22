@@ -1,10 +1,10 @@
 # shellcheck shell=bash
-# Tests for scripts/stats/stats.py ingest: synthetic queue state (events, review files, sidecars, results.log) made in
+# Tests for apps/stats/stats.py ingest: synthetic queue state (events, review files, sidecars, results.log) made in
 # the temp dir, ingested into a db there.
 # shellcheck source=tests/lib.sh
 source "$(dirname "$0")/lib.sh"
 
-ST="$ROOT/scripts/stats/stats.py"
+ST="$ROOT/apps/stats/stats.py"
 export TZ=UTC PR_QUEUE_DIR="$TMP/state"
 unset REVIEW_DIR STATS_EVENTS_FILE CLAUDERAPTOR_STATS_DIR
 export XDG_STATE_HOME="$TMP/xdg" HOME="$TMP/home"

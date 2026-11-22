@@ -1,11 +1,11 @@
 # shellcheck shell=bash
-# Tests for scripts/stats/report.py: a db made by stats.py ingest in the temp dir, filled with known rows, rendered
+# Tests for apps/stats/report.py: a db made by stats.py ingest in the temp dir, filled with known rows, rendered
 # to HTML there; --open with msedge.exe and wslpath stubbed (the real Edge never starts).
 # shellcheck source=tests/lib.sh
 source "$(dirname "$0")/lib.sh"
 
-RP="$ROOT/scripts/stats/report.py"
-ST="$ROOT/scripts/stats/stats.py"
+RP="$ROOT/apps/stats/report.py"
+ST="$ROOT/apps/stats/stats.py"
 export TZ=UTC PR_QUEUE_DIR="$TMP/state" XDG_STATE_HOME="$TMP/xdg"
 unset REVIEW_DIR STATS_EVENTS_FILE CLAUDERAPTOR_STATS_DIR CLAUDERAPTOR_WINDOWS_USER
 # Never the real ~/.claude: stats.py ingest reads transcripts from $HOME/.claude/projects by default.
@@ -111,9 +111,9 @@ while read -r uri; do
   assert "an inlined image decodes to a PNG" test "$(printf '%s' "${uri#*,}" | base64 -d | head -c 4 | tail -c 3)" = PNG
 done < <(grep -oE "$png_re" "$OUT")
 assert_contains "the icon link inlines icon.png" "$H" \
-  "<link rel=\"icon\" type=\"image/png\" href=\"data:image/png;base64,$(base64 -w0 "$ROOT/scripts/stats/icon.png")\">"
+  "<link rel=\"icon\" type=\"image/png\" href=\"data:image/png;base64,$(base64 -w0 "$ROOT/apps/stats/icon.png")\">"
 assert_contains "the logo img inlines logo.png" "$H" \
-  "<img class=\"logo\" src=\"data:image/png;base64,$(base64 -w0 "$ROOT/scripts/stats/logo.png")\" alt=\"\">"
+  "<img class=\"logo\" src=\"data:image/png;base64,$(base64 -w0 "$ROOT/apps/stats/logo.png")\" alt=\"\">"
 B="$(sed -E "s#$png_re#PNG#g" "$OUT")"
 assert_contains "the icon is a data: PNG" "$B" '<link rel="icon" type="image/png" href="PNG">'
 assert_contains "the logo is a data: PNG" "$B" '<img class="logo" src="PNG" alt="">'
@@ -305,7 +305,7 @@ assert "a db without any table renders too" test "$rc" -eq 0
 assert_contains "and says no table yet" "$(text "$TMP/out/bare.html")" "jobs no table yet"
 out="$(report --db "$TMP/out/missing.db" --out "$TMP/out/missing.html")"; rc=$?
 assert "a missing db: exit 2" test "$rc" -eq 2
-assert_contains "says to ingest first" "$out" "run scripts/stats/stats.py ingest first"
+assert_contains "says to ingest first" "$out" "run apps/stats/stats.py ingest first"
 assert "and writes nothing" test ! -e "$TMP/out/missing.html"
 assert "nor makes a db" test ! -e "$TMP/out/missing.db"
 

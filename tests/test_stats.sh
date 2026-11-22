@@ -395,14 +395,17 @@ S3="$TMP/state3"; mkdir -p "$S3/reviews"; DB2="$TMP/out/replaced.db"
   ev2 2026-05-01T11:00:00.000Z job_queued r2 feat/rp
   ev2 2026-05-01T11:05:00.000Z job_failed r2 feat/rp '"step":"queue","reason":"replaced"'
   ev2 2026-05-01T11:06:00.000Z job_queued r3 feat/rp
-  ev2 2026-05-01T11:30:00.000Z merged r3 feat/rp '"pr":1'; } > "$S3/events.jsonl"
+  ev2 2026-05-01T11:30:00.000Z merged r3 feat/rp '"pr":1'
+  ev2 2026-05-01T12:00:00.000Z escalated e1 feat/esc '"reason":"judge rejected a critical finding"'
+  ev2 2026-05-01T12:00:01.000Z job_failed e1 feat/esc '"step":"judge","reason":"judge"'; } > "$S3/events.jsonl"
 PR_QUEUE_DIR="$S3" ingest "$DB2" >/dev/null
 P="SELECT ifnull(round,'none'), outcome FROM jobs WHERE job_id"
 assert_contains "the real rounds are 1 and 2: first" "$(q "$P = 'r1'")" "1|failed"
 assert_contains "the replaced job keeps its row, with no round" "$(q "$P = 'r2'")" "none|replaced"
 assert_contains "the real rounds are 1 and 2: merged" "$(q "$P = 'r3'")" "2|merged"
 assert_contains "rounds to merge leave it out" "$(q "SELECT rounds FROM v_rounds_per_branch")" "2"
-assert "failure counts leave it out" test "$(q "SELECT group_concat(fail_reason || ':' || failures) FROM v_failures_by_reason")" = "review_code:1"
+F3="$(q "SELECT group_concat(fail_reason || ':' || failures) FROM (SELECT * FROM v_failures_by_reason ORDER BY fail_reason)")"
+assert "failure counts leave it out, and count an escalated job" test "$F3" = "judge:1,review_code:1"
 unset DB2
 
 echo "-- no bytecode in the checkout"

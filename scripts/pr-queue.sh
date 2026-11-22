@@ -3,8 +3,8 @@
 # without testing against a main that moves under them.
 #
 #   pr-queue.sh add [--review <level>] [--tests on|none] <worktree> <type> "<description>" [body-file]   queue a committed branch
-#   pr-queue.sh run                                                  work through the queue until it is empty
-#   pr-queue.sh status                                               show the queue and the last results
+#   pr-queue.sh run [<checkout>]                                     work through the queues until they are empty
+#   pr-queue.sh status                                               show the queues and their last results
 #   pr-queue.sh lock <command...>                                    run a command holding the e2e lock
 #
 # For each job, `run` does, in order:
@@ -33,12 +33,23 @@
 # Main only moves when the queue merges, so each branch is tested once, on the commit that gets merged.
 # PR_QUEUE_MERGE=0 stops after the checks pass and leaves the PR open.
 # PR_QUEUE_CHECKS_TIMEOUT (seconds, default 3600) fails the job when checks are still pending after that long.
-# State (jobs, logs, results, the locks) lives in $PR_QUEUE_DIR (default ${XDG_STATE_HOME:-~/.local/state}/pr-queue).
+# Each repo has its own queue, so one repo's jobs never wait for another's: `run` starts a runner for every
+# repo with jobs, side by side, and while any works, one for each repo that gets jobs (it looks every
+# PR_QUEUE_POLL seconds, default 5) until no repo has any. `run <checkout>` works only on that checkout's
+# repo. Neither starts while a runner of the old version holds its lock. A repo is its main checkout; it is
+# named after that folder. Only the e2e lock (`lock`, step 3) is shared by all repos: it
+# guards the machine's one local test stack.
+# State lives in $PR_QUEUE_DIR (default ${XDG_STATE_HOME:-~/.local/state}/pr-queue): repos/<repo>/ holds a
+# repo's jobs (queue, running, done, failed), logs, results.log and run.lock; e2e.lock and reviews/ are shared.
+# Jobs of the old single queue ($PR_QUEUE_DIR/queue, ...) move to their repo's queue once no runner of the
+# old version holds $PR_QUEUE_DIR/run.lock.
 set -uo pipefail
 
 STATE="${PR_QUEUE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/pr-queue}"
-QUEUE="$STATE/queue"; RUNNING="$STATE/running"; LOGS="$STATE/logs"; RESULTS="$STATE/results.log"
-mkdir -p "$QUEUE" "$RUNNING" "$LOGS" "$STATE/done" "$STATE/failed"
+mkdir -p "$STATE/repos"
+# Set for the runner `run` starts per repo, which must never start runners itself: one that did would start
+# runners without end. Unset at once, so that its jobs (their reviews and tests) don't inherit it.
+CHILD="${PR_QUEUE_CHILD:-}"; unset PR_QUEUE_CHILD
 PASS_HEADING='## Local end-to-end run'
 CHECKS_WAIT="${PR_QUEUE_CHECKS_WAIT:-30}"
 REVIEWS="${REVIEW_DIR:-$STATE/reviews}"
@@ -49,6 +60,50 @@ die() { echo "pr-queue: $*" >&2; exit 1; }
 usage() { sed -n 's/^#   \(pr-queue\.sh .*\)/  \1/p' "$0"; exit 1; }
 
 field() { sed -n "s/^$1=//p" "$2" | head -1; }
+# set_repo <repo folder>: work on that repo's queue.
+RQ=""; REPO=""; QUEUE=""; RUNNING=""; LOGS=""; RESULTS=""
+set_repo() {
+  RQ="$1"; REPO="$(basename "$1")"
+  QUEUE="$RQ/queue"; RUNNING="$RQ/running"; LOGS="$RQ/logs"; RESULTS="$RQ/results.log"
+  mkdir -p "$QUEUE" "$RUNNING" "$LOGS" "$RQ/done" "$RQ/failed"
+}
+# use_repo <dir>: work on the queue of the repo that dir is a checkout of (a worktree counts as its main
+# checkout). Two repos whose folders have the same name get different queues.
+use_repo() {
+  local main name
+  main="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  main="$(dirname "$main")"; name="$(basename "$main")"
+  if [ -f "$STATE/repos/$name/checkout" ] && [ "$(cat "$STATE/repos/$name/checkout")" != "$main" ]; then
+    name="$name-$(printf '%s' "$main" | cksum | cut -d' ' -f1)"
+  fi
+  set_repo "$STATE/repos/$name"
+  echo "$main" > "$RQ/checkout"
+}
+# migrate: moves the jobs of the old single queue to their repos' queues (a job of a runner that died to
+# failed/), unless a runner of the old version still holds its lock. A job whose worktree is gone, so its repo
+# is unknown, goes to $STATE/legacy/.
+migrate() {
+  local d job dest
+  [ -d "$STATE/queue" ] || [ -d "$STATE/running" ] || [ -d "$STATE/failed" ] || [ -d "$STATE/done" ] || return 0
+  if ! flock -n -s "$STATE/run.lock" true; then
+    echo "pr-queue: a runner of the old version still works on $STATE/queue; its jobs move to their repos' queues when it is done"
+    return 0
+  fi
+  for d in queue running failed "done"; do
+    for job in "$STATE/$d"/*.job; do
+      [ -f "$job" ] || continue
+      if ( use_repo "$(field worktree "$job")" ); then
+        use_repo "$(field worktree "$job")"; dest="$RQ/$d"
+        if [ "$d" = running ]; then dest="$RQ/failed"; fi
+      else
+        dest="$STATE/legacy/$d"; mkdir -p "$dest"
+      fi
+      mv "${job%.job}".* "$dest/"
+    done
+    rmdir "$STATE/$d" 2>/dev/null
+  done
+  RQ=""; REPO=""
+}
 # jobs_for <dir> <branch>: the job files in dir for exactly that branch.
 jobs_for() {
   local job
@@ -74,6 +129,7 @@ add() {
   local wt type="$2" desc="$3" body="${4:-}" branch job file
   [ -d "$1" ] || die "no such directory: $1"
   wt="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" || die "$1 is not a git checkout"
+  migrate; use_repo "$wt" || die "$1 is not a git checkout"
   branch="$(git -C "$wt" branch --show-current)"
   [ -n "$branch" ] || die "$wt is not on a branch"
   [ "$branch" != main ] || die "$wt is on main; queue a feature branch"
@@ -83,7 +139,7 @@ add() {
   if [ -n "$body" ]; then [ -f "$body" ] || die "no such body file: $body"; fi
   # Without --review or --tests, keep what the branch's latest earlier job asked for (a fix after a failed review).
   local d old_review="" old_tests=""
-  for d in "$STATE/failed" "$RUNNING" "$QUEUE"; do
+  for d in "$RQ/failed" "$RUNNING" "$QUEUE"; do
     while read -r job; do
       [ -n "$job" ] || continue
       if [ -n "$(field review "$job")" ]; then old_review="$(field review "$job")"; fi
@@ -104,7 +160,7 @@ add() {
   file="$QUEUE/$(date +%s%N)-${branch//\//-}"
   if [ -n "$body" ]; then cp "$body" "$file.body"; fi
   printf 'worktree=%s\nbranch=%s\ntype=%s\ndescription=%s\nreview=%s\ntests=%s\n' "$wt" "$branch" "$type" "$desc" "$review" "$tests" > "$file.job"
-  echo "pr-queue: queued $branch ($(find "$QUEUE" -name '*.job' | wc -l) in the queue)"
+  echo "pr-queue: queued $branch ($(find "$QUEUE" -name '*.job' | wc -l) in the queue of $REPO)"
 }
 
 # with_line <body-file> <line>: the body without its old "Local end-to-end run" section, plus one for the line.
@@ -118,11 +174,11 @@ with_line() {
 JOB=""; LOG=""; BRANCH=""
 failjob() {
   echo "$(date '+%F %T') FAILED $BRANCH: $1 (log: $LOG)" | tee -a "$RESULTS"
-  mv "$JOB.job" "$STATE/failed/" 2>/dev/null
-  if [ -f "$JOB.body" ]; then mv "$JOB.body" "$STATE/failed/"; fi
+  mv "$JOB.job" "$RQ/failed/" 2>/dev/null
+  if [ -f "$JOB.body" ]; then mv "$JOB.body" "$RQ/failed/"; fi
   return 1
 }
-finishjob() { mv "$JOB.job" "$STATE/done/"; rm -f "$JOB.body"; }
+finishjob() { mv "$JOB.job" "$RQ/done/"; rm -f "$JOB.body"; }
 # review_result <name> <output file> <exit code>: logs a review.sh run, and adds to $problems why it failed.
 review_result() {
   local out file
@@ -309,14 +365,72 @@ run() {
     0|1) ;;
     *) die "PR_QUEUE_TEST_REVIEW must be 0 (no test reviews) or 1, not '$PR_QUEUE_TEST_REVIEW'" ;;
   esac
-  exec 9>"$STATE/run.lock"
-  flock -n 9 || { echo "pr-queue: a runner is already working on the queue"; exit 0; }
+  POLL="${PR_QUEUE_POLL:-5}"
+  [[ "$POLL" =~ ^[0-9]*\.?[0-9]+$ && "$POLL" =~ [1-9] ]] || die "PR_QUEUE_POLL must be a number of seconds above 0, not '$POLL'"
+  migrate
+  # A runner of the old version works on all repos' jobs under the old lock; a new one beside it could run a
+  # second job of the same repo. A shared lock to check: it fails only beside the old runner's exclusive one,
+  # not beside another new runner checking at the same time.
+  if ! flock -n -s "$STATE/run.lock" true; then
+    die "a runner of the old version (one queue for all repos) is still working; run again when it is done"
+  fi
+  if [ $# -ge 1 ]; then
+    use_repo "$1" || die "$1 is not a git checkout"; run_repo; return
+  fi
+  [ -z "$CHILD" ] || die "a repo's runner must not start runners for every repo"
+  # A runner of its own for every repo with jobs, side by side, each in a process group of its own (so that a
+  # TERM to it reaches its job and the job's reviews too). While any works, every $PR_QUEUE_POLL seconds, it
+  # notes the ones that ended and starts one for each repo that has jobs by then (a job left in running/ too:
+  # run_repo moves it to failed/), so a job queued to a repo never waits for another repo's queue. A repo whose
+  # queue another runner has, or whose runner failed (it said why), is left out, so this ends.
+  local d p sig given_up=" " active=" "
+  local -A repo_of=()  # pid of each repo's runner -> its repo folder
+  # A Ctrl-C or kill of this runner stops them with a TERM to each one's process group, waits until each group
+  # is gone (its job stopping its reviews too; at most 70 s: a review session gets 30 s to stop, then 30 s
+  # more), then ends this one by the same signal.
+  for sig in INT TERM HUP; do
+    # shellcheck disable=SC2064,SC2154  # $sig now; the pids (and p) are expanded when the trap runs
+    trap "for p in \"\${!repo_of[@]}\"; do kill -TERM -- -\$p 2>/dev/null; done
+      for p in \"\${!repo_of[@]}\"; do for _ in \$(seq 700); do kill -0 -- -\$p 2>/dev/null || break; sleep 0.1; done; done
+      trap - $sig; kill -$sig \$\$" "$sig"
+  done
+  while :; do
+    for d in "$STATE"/repos/*/; do
+      d="${d%/}"
+      if [[ "$given_up$active" == *" $d "* ]] || [ -z "$(find "$d/queue" "$d/running" -name '*.job' 2>/dev/null | head -1)" ]; then
+        continue
+      fi
+      if ! flock -n "$d/run.lock" true; then
+        echo "pr-queue: $(basename "$d"): a runner is already working on the queue"; given_up+="$d "; continue
+      fi
+      PR_QUEUE_CHILD=1 setsid bash "$0" run "$(cat "$d/checkout")" &
+      repo_of[$!]="$d"; active+="$d "
+    done
+    [ ${#repo_of[@]} -gt 0 ] || break
+    # In the background, so that a signal is handled at once, not when the sleep ends.
+    sleep "$POLL" & wait $!
+    # An ended runner: bash has reaped it (kill -0 fails), and wait gives its exit status.
+    for p in "${!repo_of[@]}"; do
+      kill -0 "$p" 2>/dev/null && continue
+      wait "$p" || given_up+="${repo_of[$p]} "
+      active="${active/" ${repo_of[$p]} "/ }"; unset "repo_of[$p]"
+    done
+  done
+  trap - INT TERM HUP
+  if [ "$given_up" = " " ]; then echo "pr-queue: the queues are empty"; return; fi
+  echo "pr-queue: jobs left in the queue of:$(for d in $given_up; do printf " %s" "$(basename "$d")"; done) (see above)"
+}
+
+# run_repo: works through the queue of the current repo until it is empty.
+run_repo() {
+  exec 9>"$RQ/run.lock"
+  flock -n 9 || { echo "pr-queue: $REPO: a runner is already working on the queue"; return 0; }
   local job name
   # Jobs left in running/ belong to a runner that died (we hold the lock).
   for job in "$RUNNING"/*.job; do
     [ -f "$job" ] || continue
-    echo "pr-queue: $(field branch "$job") was left unfinished by an earlier runner; moved to failed/"
-    mv "${job%.job}".* "$STATE/failed/"
+    echo "pr-queue: $REPO: $(field branch "$job") was left unfinished by an earlier runner; moved to failed/"
+    mv "${job%.job}".* "$RQ/failed/"
   done
   while job="$(find "$QUEUE" -name '*.job' | sort | head -1)"; [ -n "$job" ]; do
     name="$(basename "${job%.job}")"
@@ -324,22 +438,30 @@ run() {
     ( process "$RUNNING/$name.job" ) || true
     # A job that left its file behind (a crash) must not loop forever.
     if [ -f "$RUNNING/$name.job" ]; then
-      echo "pr-queue: $name did not finish; moved to failed/"; mv "$RUNNING/$name".* "$STATE/failed/"
+      echo "pr-queue: $REPO: $name did not finish; moved to failed/"; mv "$RUNNING/$name".* "$RQ/failed/"
     fi
   done
-  echo "pr-queue: the queue is empty"
+  exec 9>&-
+  echo "pr-queue: $REPO: the queue is empty"
 }
 
 status() {
-  local job
-  echo "Running:"; for job in "$RUNNING"/*.job; do [ -f "$job" ] && echo "  $(field branch "$job")"; done
-  echo "Queued:"; find "$QUEUE" -name '*.job' | sort | while read -r job; do echo "  $(field branch "$job")"; done
-  echo "Last results:"; tail -n "${1:-10}" "$RESULTS" 2>/dev/null | sed 's/^/  /'
+  local d job any=""
+  migrate
+  for d in "$STATE"/repos/*/; do
+    [ -d "$d" ] || continue
+    set_repo "${d%/}"; any=1
+    echo "$REPO ($(cat "$RQ/checkout" 2>/dev/null)):"
+    echo "  Running:"; for job in "$RUNNING"/*.job; do [ -f "$job" ] && echo "    $(field branch "$job")"; done
+    echo "  Queued:"; find "$QUEUE" -name '*.job' | sort | while read -r job; do echo "    $(field branch "$job")"; done
+    echo "  Last results:"; tail -n "${1:-10}" "$RESULTS" 2>/dev/null | sed 's/^/    /'
+  done
+  [ -n "$any" ] || echo "No jobs queued yet."
 }
 
 case "${1:-}" in
   add) shift; add "$@" ;;
-  run) run ;;
+  run) shift; run "$@" ;;
   status) shift; status "$@" ;;
   lock) shift; [ $# -ge 1 ] || usage; exec flock "$STATE/e2e.lock" "$@" ;;
   *) usage ;;

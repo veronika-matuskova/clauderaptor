@@ -21,6 +21,8 @@
 # that runs away is stopped there and the session goes on to report it. A Ctrl-C, kill (TERM) or hangup of
 # review.sh stops the session too, and waits for it to end. (Started by pr-queue.sh, review.sh ignores SIGINT as
 # a background job: the queue sends it TERM.)
+# The model and effort of each kind of review are set in review.conf, next to this script ($REVIEW_CONFIG to
+# read another file); REVIEW_MODEL and REVIEW_EFFORT override them for one run.
 # REVIEW_SKIP_TESTS=1 tells /code-review to leave the quality of tests to the test review.
 # Reviews are saved to $REVIEW_DIR (default $PR_QUEUE_DIR/reviews, the folder pr-queue.sh uses) as
 # <branch>-<sha>-<level>.md (<level>-notests.md with REVIEW_SKIP_TESTS=1) or <branch>-<sha>-tests.md.
@@ -164,6 +166,19 @@ in your system prompt, otherwise \"Verdict: ready\". If the skill is not availab
     title="Test suite audit of $name at $sha ("
     ;;
 esac
+conf="${REVIEW_CONFIG:-$HERE/review.conf}"
+# <kind>_model and <kind>_effort (the code: code_effort_<level>); a suite audit uses the test review's.
+kind="$mode"; if [ "$mode" = suite ]; then kind=tests; fi
+mvar="${kind}_model"; evar="${kind}_effort"; if [ "$mode" = code ]; then evar="code_effort_$level"; fi
+unset "$mvar" "$evar"   # only the file's values count, not ones from the environment
+[ -f "$conf" ] || die "missing $conf"
+# shellcheck source=/dev/null  # a config file, checked by the tests instead
+. "$conf" || die "can't read $conf"
+model="${!mvar:-}"; effort="${!evar:-}"; from="$evar in $conf"
+if [ -n "${REVIEW_EFFORT:-}" ]; then effort="$REVIEW_EFFORT"; from="REVIEW_EFFORT"; fi
+model="${REVIEW_MODEL:-$model}"
+[ -n "$model" ] || die "no $mvar in $conf"
+case "$effort" in low|medium|high|xhigh|max) ;; *) die "$from must be low, medium, high, xhigh or max, not '$effort'" ;; esac
 json=""; sysprompt=""; scratch=""
 trap 'rm -rf ${json:+"$json"} ${sysprompt:+"$sysprompt"} ${scratch:+"$scratch"}' EXIT
 json="$(mktemp)" || die "can't create a temp file"
@@ -192,7 +207,7 @@ cd "$wt" || die "can't enter $wt"
 session=""
 trap '[ -z "$session" ] || { kill "$session" 2>/dev/null; wait "$session"; }; die "stopped, and so was the claude -p session"' INT TERM HUP
 timeout -k 30 "$limit" "$HERE/capped.sh" claude -p "$prompt" --output-format json --permission-mode auto \
-  --safe-mode --append-system-prompt-file "$sysprompt" \
+  --model "$model" --effort "$effort" --safe-mode --append-system-prompt-file "$sysprompt" \
   --disallowed-tools "Edit,Write,NotebookEdit" </dev/null >"$json" &
 session=$!
 wait "$session"; rc=$?; session=""
@@ -213,7 +228,7 @@ print(d.get("result") or "")
 ' <"$json")" || die "couldn't read claude's output"
 body=""
 if [[ "$review" == *$'\n'* ]]; then body="${review#*$'\n'}"; fi
-printf '# %s%s)\n\n%s\n' "$title" "${review%%$'\n'*}" "$body" > "$out"
+printf '# %s%s, %s at %s effort)\n\n%s\n' "$title" "${review%%$'\n'*}" "$model" "$effort" "$body" > "$out"
 
 if [ "$mode" = suite ]; then
   # A label line, with markdown around the label (**Counts**:, **Counts:**) or as a list item (- Counts:, 1. Counts:)

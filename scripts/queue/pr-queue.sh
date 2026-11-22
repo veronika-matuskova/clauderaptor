@@ -531,7 +531,8 @@ run() {
   done
   trap - INT TERM HUP
   for d in $busy; do
-    [ -z "$(find "$d/queue" "$d/running" -name '*.job' 2>/dev/null | head -1)" ] || given_up+="$d "
+    [[ "$given_up" == *" $d "* ]] || [ -z "$(find "$d/queue" "$d/running" -name '*.job' 2>/dev/null | head -1)" ] ||
+      given_up+="$d "
   done
   if [ "$given_up" = " " ]; then echo "pr-queue: the queues are empty"; return; fi
   echo "pr-queue: jobs left in the queue of:$(for d in $given_up; do printf " %s" "$(basename "$d")"; done) (see above)"

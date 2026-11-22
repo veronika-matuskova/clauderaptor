@@ -881,6 +881,17 @@ assert "busy repo: said once"                test "$(grep -c "repo2: a runner is
 assert "busy repo: its job ran once the lock was free" grep -q "fix/held" "$RQ2/results.log"
 assert_not_contains "busy repo: not left out at the end" "$out" "jobs left in the queue of"
 assert "busy repo: no job left queued"       test -z "$(find "$RQ/queue" "$RQ2/queue" -name '*.job')"
+# A busy repo whose runner empties its queue while this one works on another repo isn't named at the end.
+reset_pr; touch "$TQ/e2e_fail"; mkwt work2; mkwt2 emptied
+echo 'sleep 2' > "$TQ/on_e2e"
+Q add "$TMP/wt-work2" fix "Work2" >/dev/null; Q add "$TMP/wt2-emptied" fix "Emptied" >/dev/null
+# shellcheck disable=SC2016  # $1 expands in the inner bash
+flock "$RQ2/run.lock" bash -c 'sleep 1; rm -f "$1"/queue/*' _ "$RQ2" & lpid=$!; sleep 0.3
+out="$(PR_QUEUE_POLL=0.2 PR_QUEUE_REVIEW=0 PR_QUEUE_TEST_REVIEW=0 Q run)"
+wait "$lpid"; rm -f "$TQ/on_e2e"
+assert_contains "busy repo, emptied: said it was busy" "$out" "repo2: a runner is already working on the queue"
+assert_contains "busy repo, emptied: the queues are empty" "$out" "pr-queue: the queues are empty"
+assert_not_contains "busy repo, emptied: not named at the end" "$out" "jobs left in the queue of"
 # A job queued in another repo while the runner works is run too.
 reset_pr; touch "$TQ/e2e_fail"; mkwt early; mkwt2 late
 printf 'PATH=%q bash %q add %q fix Late >/dev/null\n' "$TQ/bin:$PATH" "$ROOT/scripts/queue/pr-queue.sh" "$TMP/wt2-late" > "$TQ/on_e2e"

@@ -188,24 +188,48 @@ out="$(hint_case nocost "INSERT INTO reviews (id, kind, verdict, cost_usd) VALUE
 assert "a ready review with no cost: the report is written" test -f "$TMP/out/nocost.html"
 assert_contains "its cost per ready is a dash" "$(text "$TMP/out/nocost.html")" "judge – 1 – – not enough data (n=1) –"
 
-echo "-- the transcript tables (stats.py's next version)"
+echo "-- the transcript views (stats.py's sessions and usage_daily)"
 TK="$TMP/out/tokens.db"; cp "$FX" "$TK"
+# The views' final columns, as literal rows.
 sql "$TK" "
 CREATE TABLE sessions (session_id TEXT); INSERT INTO sessions VALUES ('a'), ('b');
 CREATE TABLE usage_daily (day TEXT);
-CREATE VIEW v_tokens_by_role AS SELECT 'agent' AS role, 1500000 AS tokens_in, 12.5 AS cost_usd
-  UNION ALL SELECT '<b>reviewer</b>', 20000, 3.25;
-CREATE VIEW v_cache_hit_rate AS SELECT 'agent' AS role, 0.91 AS cache_hit_rate;"
+CREATE VIEW v_tokens_by_role (role, repo, sessions, subagent_sessions, msgs, tokens_in, tokens_out, tokens_cache_w,
+  tokens_cache_r, cost_usd_est, subagent_cost_usd_est, unpriced_msgs) AS
+  SELECT 'agent', 'app', 3, 1, 100, 1000, 2000, 3000, 500000, 12.5, 2.5, 0
+  UNION ALL SELECT 'agent', 'tool', 2, 0, 50, 500, 1000, 1000, 250000, 7.5, NULL, 0
+  UNION ALL SELECT 'review', 'app', 4, 0, 40, 100, 200, 300, 40000, 1.25, NULL, 3
+  UNION ALL SELECT '<b>main</b>', NULL, 1, 2, 10, 10, 20, 30, 4000, 0.5, 0.25, 0;
+CREATE VIEW v_cache_hit_rate (role, tokens_cache_r, tokens_input, cache_hit_rate) AS
+  SELECT 'agent', 750000, 1000000, 0.75 UNION ALL SELECT 'review', 0, 0, NULL;
+CREATE VIEW v_subagent_share (role, sessions, subagent_sessions, tokens, subagent_tokens, subagent_token_share,
+  cost_usd_est, subagent_cost_usd_est, subagent_cost_share) AS
+  SELECT 'agent', 5, 1, 757500, 250000, 0.33, 20.0, 2.5, 0.125 UNION ALL SELECT 'judge', 2, 0, 0, 0, NULL, 0, NULL, NULL;
+CREATE VIEW v_cost_per_merged_branch (repo, branch, merged_at, job_id, agent_sessions, agent_cost_usd_est,
+  review_cost_usd, judge_cost_usd) AS
+  SELECT 'app', 'feat/one', '2026-10-05T10:00:00.000Z', 'm1', 2, 4.0, 1.0, 0.3
+  UNION ALL SELECT 'app', '<i>feat/two</i>', '2026-10-12T10:00:00.000Z', 'm2', 0, NULL, 0.5, NULL
+  UNION ALL SELECT 'app', 'feat/four', '2026-10-26T10:00:00.000Z', 'm4', 1, 6.0, NULL, NULL
+  UNION ALL SELECT 'tool', 'feat/old', '2026-09-01T10:00:00.000Z', 'm0', 0, NULL, NULL, NULL;"
 report --db "$TK" --out "$TMP/out/tokens.html" >/dev/null
 T4="$(text "$TMP/out/tokens.html")"
-assert_contains "tokens by role: a table, agent \$ labelled estimate" "$T4" "role tokens_in cost_usd (estimate) agent 1.5M 12.50"
-assert_contains "tokens by role: a bar per role" "$T4" "agent 1.5M <b>reviewer</b>"
-assert_contains "cache hit rate" "$T4" "Cache hit rate role cache_hit_rate agent 0.91"
-assert_contains "a view not there yet: no data yet" "$T4" "Cost per merged branch no data yet"
+assert_contains "est. \$ by role: summed over repos, ranked, each labelled estimate" "$T4" \
+  "Estimated \$ by role (estimate) agent \$20.00 est. review \$1.25 est. <b>main</b> \$0.50 est."
+assert_contains "unpriced messages noted" "$T4" "3 messages had no known price and are not in the estimate."
+assert_contains "the role table, agent \$ labelled estimate" "$T4" \
+  "Est. \$ (estimate) Subagent est. \$ (estimate) Unpriced messages <b>main</b> – 1 2 10 10 20 30 4,000 \$0.50 \$0.25 0 agent app 3 1 100 1,000 2,000 3,000 500K \$12.50 \$2.50 0"
+assert_contains "cache hit rate by role" "$T4" "Cache hit rate by role Cache reads over all input tokens (fresh, cache writes and cache reads). agent 75% review 0%"
+assert_contains "cache hit rate table: no rate is a dash" "$T4" "agent 750K 1M 75% review 0 0 –"
+assert_contains "subagent share" "$T4" "Subagent share Role Sessions Subagent sessions Share of tokens Share of est. \$ (estimate) agent 5 1 33% of 757.5K 12% of \$20.00 judge 2 0 – –"
+assert_contains "cost per merged branch: how many have agent cost" "$T4" "Agent cost found for 2 of 4 merged branches: many agent sessions can't be linked to a branch yet. Per branch (4)"
+assert_contains "cost per merged branch: newest first, agent est. + review + judge" "$T4" \
+  "app feat/four 2026-10-26 1 \$6.00 – – \$6.00 app <i>feat/two</i> 2026-10-12 0 – \$0.50 – \$0.50 app feat/one 2026-10-05 2 \$4.00 \$1.00 \$0.30 \$5.30 tool feat/old 2026-09-01 0 – – – –"
 assert_contains "row counts of the new tables" "$T4" "sessions 2 usage_daily 0"
-assert_contains "a role name is escaped" "$(cat "$TMP/out/tokens.html")" "&lt;b&gt;reviewer&lt;/b&gt;"
-assert_contains "without them: no data yet, three times" "$(grep -o 'Cost and tokens.*Timeline' <<<"$T")" \
-  "Tokens and cost by role no data yet Cache hit rate no data yet Cost per merged branch no data yet"
+H4="$(cat "$TMP/out/tokens.html")"
+assert_contains "a role name is escaped" "$H4" "&lt;b&gt;main&lt;/b&gt;"
+assert_contains "a branch name is escaped" "$H4" "&lt;i&gt;feat/two&lt;/i&gt;"
+assert_contains "without the views: no data yet, four times" "$(grep -o 'Cost and tokens.*Timeline' <<<"$T")" \
+  "Estimated \$ by role (estimate) no data yet Cache hit rate by role no data yet Subagent share no data yet Cost per merged branch no data yet"
 
 echo "-- an empty db"
 out="$(report --db "$EMPTY" --out "$TMP/out/empty.html")"; rc=$?
@@ -328,6 +352,10 @@ exec(sys.argv[2])' "$RP" "$1" 2>&1; }
 assert_contains "a UNC path: host, escaped parts" "$(py 'print(r.file_url("\\\\wsl.localhost\\Ubuntu-24.04\\home\\a b\\x#1%.html"))')" \
   "file://wsl.localhost/Ubuntu-24.04/home/a%20b/x%231%25.html"
 assert_contains "a drive path" "$(py 'print(r.file_url("C:\\Users\\a b\\r.html"))')" "file:///C:/Users/a%20b/r.html"
+
+echo "-- compact numbers"
+assert_contains "in full under 10,000, compact from it" "$(py 'print(" ".join(r.compact(v) for v in (9999, 10000, 12345, 999949, 999950, 1000000, 2500000000, 1.5)))')" \
+  "9,999 10K 12.3K 999.9K 1M 1M 2.5B 1.50"
 
 echo "-- no bytecode in the checkout"
 assert "no __pycache__ in scripts/" test -z "$(find "$ROOT/scripts" -name __pycache__)"

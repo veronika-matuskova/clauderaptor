@@ -13,8 +13,8 @@ Windows user's %LOCALAPPDATA%\\clauderaptor-stats\\edge-profile). The Windows us
 /mnt/c/Users with an Edge folder; with several, name yours (--windows-user or $CLAUDERAPTOR_WINDOWS_USER).
 Outside WSL it prints the report's path instead. $STATS_EDGE overrides msedge.exe's path and
 $STATS_WINDOWS_USERS_DIR /mnt/c/Users (for tests).
-The sections of stats.py's transcript tables (sessions, usage_daily and their views) say "no data yet" until a
-stats.py that has them has ingested.
+The cost-and-tokens section reads stats.py's transcript views (v_tokens_by_role, v_cache_hit_rate,
+v_subagent_share, v_cost_per_merged_branch) and says "no data yet" while a db doesn't have them.
 """
 import argparse
 import datetime
@@ -86,9 +86,6 @@ class Db:
         rows = self.q(sql, args)
         return rows[0] if rows else None
 
-    def columns(self, name):
-        return [r[1] for r in self.c.execute("PRAGMA table_info(%s)" % name)] if self.has(name) else []
-
 
 # --- formatting -----------------------------------------------------------------------------------------------
 
@@ -104,8 +101,9 @@ def compact(v):
     if isinstance(v, float) and not v.is_integer():
         return format(v, ",.2f")
     v = int(v)
-    for div, suf in ((1e9, "B"), (1e6, "M"), (1e4, "K")):
-        if abs(v) >= div:
+    for div, suf in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        # in full under 10,000; 999,950 is 1M, not 1000K
+        if abs(v) >= max(div, 1e4) or (div > 1e3 and abs(v) >= div * 0.99995):
             return ("%.1f" % (v / div)).rstrip("0").rstrip(".") + suf
     return format(v, ",")
 
@@ -408,33 +406,73 @@ def s_review_value(db, m):
     return section("Review value", "".join(body), "review-value")
 
 
-TOKEN_VIEWS = (("v_tokens_by_role", "Tokens and cost by role"), ("v_cache_hit_rate", "Cache hit rate"),
-               ("v_cost_per_merged_branch", "Cost per merged branch"))
-
-
-def estimate_head(col):
-    return col + (" (estimate)" if re.search(r"cost|usd|\$", col, re.I) else "")
+def pct(v):
+    return "%.0f%%" % (100.0 * v)
 
 
 def s_tokens(db):
-    body = ['<p class="sub">From the agents\' session transcripts (numbers only). Agent $ is an estimate from '
-            'token counts and list prices, not a bill.</p>']
-    for view, title in TOKEN_VIEWS:
-        body.append("<h3>%s</h3>" % e(title))
-        cols = db.columns(view)
-        rows = db.q("SELECT * FROM %s" % view) if cols else []
-        if not rows:
-            body.append('<p class="empty">no data yet</p>')
-            continue
-        if view == "v_tokens_by_role":
-            num = next((i for i, c in enumerate(cols) if re.search(r"token", c, re.I)
-                        and all(isinstance(r[i], (int, float)) or r[i] is None for r in rows)), None)
-            if num is not None:
-                body.append(hbars([(r[0], r[num] or 0, "%s: %s %s" % (r[0], compact(r[num] or 0), cols[num]))
-                                   for r in sorted(rows, key=lambda r: -(r[num] or 0))], aria=title))
-        fmt_rows = [[compact(v) if isinstance(v, (int, float)) else v for v in r] for r in rows]
-        body.append(table([estimate_head(c) for c in cols], fmt_rows,
-                          {i for i, v in enumerate(rows[0]) if isinstance(v, (int, float))}))
+    """stats.py's transcript views: est. $ by role, cache hit rate, subagent share, cost per merged branch."""
+    body = ['<p class="sub">From the session transcripts (numbers only). Agent $ is an estimate: tokens at list '
+            'prices, not a bill. Roles: main, agent, review, judge, other; subagents count toward their parent.</p>']
+    roles = db.q("SELECT role, repo, sessions, subagent_sessions, msgs, tokens_in, tokens_out, tokens_cache_w, "
+                 "tokens_cache_r, cost_usd_est, subagent_cost_usd_est, unpriced_msgs FROM v_tokens_by_role "
+                 "ORDER BY role, repo")
+    body.append("<h3>Estimated $ by role (estimate)</h3>")
+    if roles:
+        by = {}
+        for r in roles:
+            b = by.setdefault(r[0], [0.0, 0, 0])
+            b[0] += r[9] or 0
+            b[1] += r[2] or 0
+            b[2] += sum(x or 0 for x in r[5:9])
+        body.append(hbars([(k, v[0], "%s: %s estimate, %d sessions, %s tokens" % (k, money(v[0]), v[1], compact(v[2])))
+                           for k, v in sorted(by.items(), key=lambda kv: -kv[1][0])],
+                          fmt=lambda v: money(v) + " est.", aria="estimated cost by role"))
+        unpriced = sum(r[11] or 0 for r in roles)
+        if unpriced:
+            body.append('<p class="sub">%d messages had no known price and are not in the estimate.</p>' % unpriced)
+        body.append(details(table(
+            ["Role", "Repo", "Sessions", "Subagent sessions", "Messages", "Tokens in", "Tokens out", "Cache writes",
+             "Cache reads", "Est. $ (estimate)", "Subagent est. $ (estimate)", "Unpriced messages"],
+            [(r[0], r[1] or "–", r[2], r[3], compact(r[4]), compact(r[5]), compact(r[6]), compact(r[7]),
+              compact(r[8]), money(r[9]), money(r[10]), r[11]) for r in roles], set(range(2, 12)))))
+    else:
+        body.append('<p class="empty">no data yet</p>')
+    cache = db.q("SELECT role, tokens_cache_r, tokens_input, cache_hit_rate FROM v_cache_hit_rate ORDER BY role")
+    body.append("<h3>Cache hit rate by role</h3>")
+    if cache:
+        body.append('<p class="sub">Cache reads over all input tokens (fresh, cache writes and cache reads).</p>')
+        body.append(hbars([(r[0], 100.0 * (r[3] or 0), "%s: %s of %s input tokens" % (
+            r[0], pct(r[3] or 0), compact(r[2]))) for r in cache], fmt=lambda v: "%.0f%%" % v, aria="cache hit rate"))
+        body.append(details(table(["Role", "Cache reads", "Input tokens", "Hit rate"],
+                                  [(r[0], compact(r[1]), compact(r[2]), "–" if r[3] is None else pct(r[3]))
+                                   for r in cache], (1, 2, 3))))
+    else:
+        body.append('<p class="empty">no data yet</p>')
+    sub = db.q("SELECT role, sessions, subagent_sessions, tokens, subagent_token_share, cost_usd_est, "
+               "subagent_cost_usd_est, subagent_cost_share FROM v_subagent_share ORDER BY role")
+    body.append("<h3>Subagent share</h3>")
+    if sub:
+        body.append(table(["Role", "Sessions", "Subagent sessions", "Share of tokens", "Share of est. $ (estimate)"],
+                          [(r[0], r[1], r[2], "–" if r[4] is None else "%s of %s" % (pct(r[4]), compact(r[3])),
+                            "–" if r[7] is None else "%s of %s" % (pct(r[7]), money(r[5]))) for r in sub], (1, 2, 3, 4)))
+    else:
+        body.append('<p class="empty">no data yet</p>')
+    per = db.q("SELECT repo, branch, merged_at, agent_sessions, agent_cost_usd_est, review_cost_usd, judge_cost_usd "
+               "FROM v_cost_per_merged_branch ORDER BY merged_at DESC")
+    body.append("<h3>Cost per merged branch</h3>")
+    if per:
+        with_agent = sum(1 for r in per if r[3])
+        body.append('<p class="sub">Agent cost found for %d of %d merged branches: many agent sessions can\'t be '
+                    'linked to a branch yet.</p>' % (with_agent, len(per)))
+        body.append(details(table(["Repo", "Branch", "Merged", "Agent sessions", "Agent est. $ (estimate)",
+                                   "Review $", "Judge $", "Total"],
+                          [(r[0], r[1], (r[2] or "")[:10], r[3] or 0,
+                            money(r[4]), money(r[5]), money(r[6]),
+                            "–" if all(x is None for x in r[4:7]) else money(sum(x or 0 for x in r[4:7])))
+                           for r in per], (3, 4, 5, 6, 7)), "Per branch (%d)" % len(per)))
+    else:
+        body.append('<p class="empty">no data yet</p>')
     return section("Cost and tokens", "".join(body), "tokens")
 
 
@@ -537,7 +575,7 @@ i.s1{background:var(--series-1)}i.s2{background:var(--series-2)}i.s3{background:
 .pair{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media (max-width:640px){.pair{grid-template-columns:1fr}}
 table{border-collapse:collapse;width:100%;margin:6px 0;font-size:13px}
 th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--grid);overflow-wrap:anywhere}
-th{color:var(--text-secondary);font-weight:600}td.num{text-align:right;font-variant-numeric:tabular-nums}
+th{color:var(--text-secondary);font-weight:600}td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;overflow-wrap:normal}
 details{margin:6px 0}summary{cursor:pointer;color:var(--text-secondary);font-size:12px}
 .hints li{margin:6px 0}
 @media (forced-colors:active){.s1,.s2,.s3{fill:CanvasText}}

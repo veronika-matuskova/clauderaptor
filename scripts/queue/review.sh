@@ -283,6 +283,7 @@ if [ "$mode" = judge ]; then echo "$judged" >> "$out"; fi
 # The sidecar <review>.json, for stats: the session's numbers and ids, never its text or the prompts. Written
 # on the way out, with the exit code, atomically (a temp file, then a rename); a failure to write it is ignored.
 # An earlier one of the same review goes first, so that a failed write never leaves it next to the new review.
+# shellcheck disable=SC2329  # invoked from the EXIT trap below
 sidecar() {
   rm -f -- "${out%.md}.json"
   python3 -I -c '

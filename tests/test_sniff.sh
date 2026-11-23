@@ -520,4 +520,278 @@ before="$(state)"; sn "$TEXT"; after="$(state)"
 assert "A14: the run had flags" test "$rc" = 2
 assert "A14: HEAD, branch, status and refs unchanged" test "$before" = "$after"
 
+
+echo "-- too good to be true: a ready review, against sniff.conf"
+# RV: main has a base commit; each fixture commit adds a file of <n> lines on top of it, off main.
+RV="$TMP/rvrepo"; git init -q -b main "$RV"; echo base > "$RV/base.txt"; git -C "$RV" add -A; git -C "$RV" commit -q -m base
+# cm <lines>: a commit off main whose diff has that many added lines; prints its sha
+cm() { git -C "$RV" checkout -q -B "b$1" main; seq "$1" > "$RV/f$1.txt"; git -C "$RV" add -A; git -C "$RV" commit -q -m "f$1"; git -C "$RV" rev-parse HEAD; git -C "$RV" checkout -q main; }
+C900="$(cm 900)"; C300="$(cm 300)"; C301="$(cm 301)"
+mkdir -p "$TMP/rv"
+printf 'max_diff_lines=300\ncode_min_seconds=30\ncode_min_cost=0.20\ncode_min_turns=5\ntests_min_seconds=30\ntests_min_cost=0.20\ntests_min_turns=5\n' > "$TMP/th.conf"
+export SNIFF_CONFIG="$TMP/th.conf"
+# review <sha> <ms> <cost> <turns> [verdict] [kind] [name]: a review file and its sidecar; prints the review's path
+review() {
+  local f="$TMP/rv/${7:-feat-x-${1:0:12}-high}.md"
+  printf '# Review of feat/x\n\nNo findings.\n\nVerdict: %s\n' "${5:-ready}" > "$f"
+  python3 -I -c 'import json, sys
+sha, ms, cost, turns, verdict, kind = sys.argv[1:7]
+n = lambda v, t: None if v == "null" else t(v)
+print(json.dumps({"v": 1, "kind": kind, "sha": sha, "duration_ms": n(ms, int), "cost_usd": n(cost, float),
+                  "num_turns": n(turns, int), "verdict": verdict}))' "$1" "$2" "$3" "$4" "${5:-ready}" "${6:-code}" > "${f%.md}.json"
+  echo "$f"
+}
+# sf <file> [args...]: sniffs a file at RV; out and rc
+sf() { local f="$1"; shift; out="$(bash "$S" "$f" --repo "$RV" "$@" 2>&1)"; rc=$?; }
+sf "$(review "$C900" 4000 0.05 3)"
+assert_contains "A12: a too-good review is flagged, with its numbers and the thresholds" "$out" \
+  "soft too good to be true (line 5): Verdict: ready — no findings on a 900-line diff in 4 s, \$0.05, 3 turns; thresholds: 300 lines, 30 s, \$0.20, 5 turns (code review)"
+assert "A12: exactly one too-good flag" test "$(grep -c 'too good to be true' <<<"$out")" = 1
+assert_contains "A12: soft only" "$out" "Flags: 0 hard, 1 soft"
+assert "A12: exit 1" test "$rc" = 1
+assert "A12: no session" test ! -e "$TMP/claude-calls"
+assert "A9: a review without --session: claude never called" test ! -e "$TMP/claude-calls"
+sf "$(review "$C300" 30000 0.20 5)"
+assert_contains "A13: 300 lines, 30000 ms, \$0.20, 5 turns: not flagged" "$out" "Flags: 0 hard, 0 soft"
+assert "A13: not flagged: exit 0" test "$rc" = 0
+sf "$(review "$C301" 30000 0.20 5)"
+assert_contains "A13: 301 lines: flagged" "$out" "no findings on a 301-line diff in 30 s, \$0.20, 5 turns"
+sf "$(review "$C300" 29999 0.20 5)"
+assert_contains "A13: 29999 ms: flagged" "$out" "no findings on a 300-line diff in 29.999 s"
+sf "$(review "$C300" 30000 0.19 5)"
+assert_contains "A13: \$0.19: flagged" "$out" "in 30 s, \$0.19, 5 turns"
+sf "$(review "$C300" 30000 0.20 4)"
+assert_contains "A13: 4 turns: flagged" "$out" "\$0.20, 4 turns; thresholds"
+sf "$(review "$C900" 4000 0.05 3 "needs changes")"
+assert_contains "A13: a needs-changes review on 900 lines: not flagged" "$out" "Flags: 0 hard, 0 soft"
+sf "$(review "$C300" 30000 0.123 1)"
+assert_contains "a cost with more digits, and 1 turn" "$out" "in 30 s, \$0.123, 1 turn;"
+sf "$(review "$C900" null null null)"
+assert_contains "a sidecar without numbers: only the diff, the rest unknown" "$out" "no findings on a 900-line diff in ? s, \$?, ? turns"
+sf "$(review "$C300" null null null)"
+assert_contains "a sidecar without numbers on a small diff: not flagged" "$out" "Flags: 0 hard, 0 soft"
+printf 'max_diff_lines=300\ncode_min_seconds=1\ncode_min_cost=0.01\ncode_min_turns=1\ntests_min_seconds=30\ntests_min_cost=0.20\ntests_min_turns=5\n' > "$TMP/th2.conf"
+SNIFF_CONFIG="$TMP/th2.conf" sf "$(review "$C300" 4000 0.05 3)"
+assert_contains "the code review's floors apply to a code review" "$out" "Flags: 0 hard, 0 soft"
+SNIFF_CONFIG="$TMP/th2.conf" sf "$(review "$C300" 4000 0.05 3 ready tests "feat-x-${C300:0:12}-tests")"
+assert_contains "the test review's floors apply to a test review" "$out" "thresholds: 300 lines, 30 s, \$0.20, 5 turns (tests review)"
+sf "$(review "$C900" 4000 0.05 3 ready code notes)"
+assert_contains "a file not named like a review: not checked" "$out" "Flags: 0 hard, 0 soft"
+sf "$(review "$C900" 4000 0.05 3 ready judge "feat-x-${C900:0:12}-judge")"
+assert_contains "a judge's file: not checked" "$out" "Flags: 0 hard, 0 soft"
+f="$(review "$C900" 4000 0.05 3 ready code "feat-x-${C900:0:12}-low-notests")"
+sf "$f"; assert_contains "a -notests review is checked" "$out" "900-line diff"
+echo '[1, 2]' > "${f%.md}.json"; sf "$f"
+assert_contains "a sidecar that isn't an object: not checked" "$out" "Flags: 0 hard, 0 soft"
+echo 'not json' > "${f%.md}.json"; sf "$f"
+assert_contains "a sidecar that isn't JSON: not checked" "$out" "Flags: 0 hard, 0 soft"
+rm "${f%.md}.json"; sf "$f"
+assert_contains "no sidecar: not checked" "$out" "Flags: 0 hard, 0 soft"
+f="$(review "$C900" 4000 0.05 3)"; printf 'No findings.\n' > "$f"; sf "$f"
+assert_contains "no verdict line: the flag is on line 1" "$out" "soft too good to be true (line 1): No findings."
+
+# A14: the thresholds' error paths
+f="$(review "$C900" 4000 0.05 3)"
+SNIFF_CONFIG="$TMP/none.conf" sf "$f"
+assert_contains "A14: a missing SNIFF_CONFIG is named" "$out" "sniff: no thresholds file: $TMP/none.conf"
+assert "A14: a missing SNIFF_CONFIG: exit 4" test "$rc" = 4
+grep -v '^tests_min_turns=' "$TMP/th.conf" > "$TMP/th-lack.conf"
+SNIFF_CONFIG="$TMP/th-lack.conf" sf "$f"
+assert_contains "A14: a missing value is named" "$out" "sniff: no tests_min_turns in $TMP/th-lack.conf"
+assert "A14: a missing value: exit 4" test "$rc" = 4
+tests_min_turns=1 SNIFF_CONFIG="$TMP/th-lack.conf" sf "$f"
+assert_contains "a value from the environment doesn't count" "$out" "sniff: no tests_min_turns in"
+sed 's/^code_min_cost=.*/code_min_cost=cheap/' "$TMP/th.conf" > "$TMP/th-nan.conf"
+SNIFF_CONFIG="$TMP/th-nan.conf" sf "$f"
+assert_contains "a value that isn't a number is named" "$out" "sniff: code_min_cost in $TMP/th-nan.conf must be a number, not 'cheap'"
+assert "a value that isn't a number: exit 4" test "$rc" = 4
+echo 'max_diff_lines=(' > "$TMP/th-bad.conf"; SNIFF_CONFIG="$TMP/th-bad.conf" sf "$f"
+assert_contains "a config that bash can't read" "$out" "sniff: can't read $TMP/th-bad.conf"
+assert "a config that bash can't read: exit 4" test "$rc" = 4
+GONE="0123456789abcdef0123456789abcdef01234567"
+sf "$(review "$GONE" 4000 0.05 3 ready code "feat-x-${GONE:0:12}-high")"
+assert_contains "A14: a sidecar sha that isn't in the repo is named" "$out" "sniff: the review's commit isn't in $RV: $GONE"
+assert "A14: a sidecar sha that isn't in the repo: exit 4" test "$rc" = 4
+f="$(review "$C900" 4000 0.05 3)"; python3 -I -c 'import json, sys; d = json.load(open(sys.argv[1])); del d["sha"]; json.dump(d, open(sys.argv[1], "w"))' "${f%.md}.json"; sf "$f"
+assert_contains "a sidecar with no sha" "$out" "sniff: the review's sidecar ${f%.md}.json has no sha"
+assert "a sidecar with no sha: exit 4" test "$rc" = 4
+SNIFF_CONFIG="$TMP/none.conf" sn 'Plain text.'
+assert "A14: plain text with a missing SNIFF_CONFIG sniffs as before" test "$out" = "Flags: 0 hard, 0 soft"
+assert "A14: plain text: exit 0" test "$rc" = 0
+# the default branch: master when there is no main, and none at all
+RM="$TMP/rvmaster"; git init -q -b master "$RM"; echo b > "$RM/b"; git -C "$RM" add -A; git -C "$RM" commit -q -m b
+git -C "$RM" checkout -q -b feat; seq 400 > "$RM/f"; git -C "$RM" add -A; git -C "$RM" commit -q -m f; CM="$(git -C "$RM" rev-parse HEAD)"
+f="$(review "$CM" 40000 0.5 9)"; out="$(bash "$S" "$f" --repo "$RM" 2>&1)"
+assert_contains "the default branch: master, if there is no main" "$out" "no findings on a 400-line diff"
+git -C "$RM" branch -q -m master old; out="$(bash "$S" "$f" --repo "$RM" 2>&1)"; rc=$?
+assert_contains "no default branch: says so" "$out" "sniff: no default branch (origin/HEAD, main or master) in $RM"
+assert "no default branch: exit 4" test "$rc" = 4
+git -C "$RM" checkout -q --orphan main; git -C "$RM" rm -rfq .; echo o > "$RM/o"; git -C "$RM" add -A; git -C "$RM" commit -q -m orphan
+out="$(bash "$S" "$f" --repo "$RM" 2>&1)"; rc=$?
+assert_contains "no common history with the default branch" "$out" "sniff: the review's commit ${CM:0:12} has no common history with main"
+assert "no common history: exit 4" test "$rc" = 4
+git -C "$RM" update-ref refs/remotes/origin/main "$(git -C "$RM" rev-parse old)"
+git -C "$RM" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+out="$(bash "$S" "$f" --repo "$RM" 2>&1)"
+assert_contains "the default branch: origin/HEAD's first" "$out" "no findings on a 400-line diff"
+unset SNIFF_CONFIG
+
+echo "-- the committed sniff.conf"
+conf_vals="$(bash -c '. "$1"; for k in max_diff_lines code_min_seconds code_min_cost code_min_turns tests_min_seconds tests_min_cost tests_min_turns; do printf "%s=%s\n" "$k" "${!k-}"; done' _ "$ROOT/scripts/queue/sniff.conf")"
+for k in max_diff_lines code_min_seconds code_min_cost code_min_turns tests_min_seconds tests_min_cost tests_min_turns; do
+  assert "A15: sniff.conf sets $k to a number" grep -qE "^$k=[0-9]+(\.[0-9]+)?\$" <<<"$conf_vals"
+done
+assert_contains "A15: sniff.conf names its query" "$(grep -n 'SELECT' "$ROOT/scripts/queue/sniff.conf")" "FROM reviews WHERE kind = ? AND verdict = 'ready'"
+
+echo "-- the session (--session): one review.sh --sniff, through a stub claude"
+# A stub claude for the session: counts its calls ($TMP/session-calls), keeps its -p prompt, returns
+# $TMP/session-result, or exits 1 with $TMP/session-fail. The rules come from a stand-in for ~/.claude.
+mkdir -p "$TMP/sbin" "$TMP/cc" "$TMP/tmpd"
+cat > "$TMP/sbin/claude" <<EOF
+#!/usr/bin/env bash
+echo called >> "$TMP/session-calls"
+prev=""; for a in "\$@"; do [ "\$prev" = -p ] && printf '%s' "\$a" > "$TMP/session-prompt"; prev="\$a"; done
+[ -f "$TMP/session-fail" ] && exit 1
+python3 -I -c 'import json, sys; print(json.dumps({"result": open(sys.argv[1]).read(), "session_id": "s1"}))' "$TMP/session-result"
+EOF
+chmod +x "$TMP/sbin/claude"
+unset REVIEW_CONFIG REVIEW_MODEL REVIEW_EFFORT REVIEW_TIMEOUT
+export CLAUDE_CONFIG_DIR="$TMP/cc" REVIEW_DIR="$TMP/reviews" BRIEF_DIR="$TMP/briefs"
+# ss <text> [args...]: sniffs the text at R with the session stub; out, rc, err (stderr alone)
+ss() {
+  local t="$1"; shift; rm -f "$TMP/session-calls" "$TMP/session-prompt"; printf '%s\n' "$t" > "$TMP/in.md"
+  out="$(TMPDIR="$TMP/tmpd" PATH="$TMP/sbin:$PATH" bash "$S" "$TMP/in.md" --repo "$R" "$@" 2>"$TMP/err")"; rc=$?; err="$(cat "$TMP/err")"
+}
+calls() { if [ -f "$TMP/session-calls" ]; then wc -l < "$TMP/session-calls"; else echo 0; fi; }
+printf '%s\n' 'Claim (line 2): Made it 10x faster. | evidence named: none | found: no | too good to be true: no measurement' \
+  'Claim (line 1): See a.js:500. | evidence named: a.js:500 | found: no | too good to be true: no' \
+  'Request to reviewer: Made it 10x faster. | missing: a measurement before and after | answer with: a measurement' > "$TMP/session-result"
+TG=$'See a.js:500.\nMade it 10x faster.'
+ss "$TG" --session --author reviewer --commit HEAD~1
+assert "A8: exactly one session" test "$(calls)" = 1
+assert_contains "A8: the session gets the checkout and the resolved commit" "$(cat "$TMP/session-prompt")" "Repo: $R, commit $OLD."
+assert_contains "A8: the mechanical flags stay" "$out" "hard missing reference (line 1): a.js:500"
+assert_contains "A8: a too-good claim is a soft flag" "$out" "soft too good to be true (line 2): Made it 10x faster. — no measurement"
+assert_not_contains "A8: a claim marked 'no' isn't flagged" "$out" "too good to be true (line 1)"
+assert_contains "A8: the request, numbered, to its author" "$out" "Request 1 to reviewer: Made it 10x faster. | missing: a measurement before and after | answer with: a measurement"
+assert "A8: the request comes before the Flags line" test "$(tail -2 <<<"$out")" = "Request 1 to reviewer: Made it 10x faster. | missing: a measurement before and after | answer with: a measurement
+Flags: 1 hard, 1 soft"
+assert "A8: the exit code follows the flags (a hard one: 2)" test "$rc" = 2
+assert_contains "the bundle has the author" "$(cat "$TMP/session-prompt")" "Author: reviewer"
+assert_contains "the bundle has the text with line numbers" "$(cat "$TMP/session-prompt")" "2: Made it 10x faster."
+assert_contains "the bundle has the mechanical flags" "$(cat "$TMP/session-prompt")" "## The mechanical flags (sniff.sh)
+
+hard missing reference (line 1): a.js:500"
+assert_contains "the bundle has the thresholds" "$(cat "$TMP/session-prompt")" "max_diff_lines=1039"
+assert_contains "the bundle's mode" "$(cat "$TMP/session-prompt")" "Mode: claims"
+assert "the bundle's temp folder and the session's scratch are removed" test -z "$(ls -A "$TMP/tmpd")"
+SNIFF_CONFIG="$TMP/none.conf" ss "$TG" --session --author reviewer
+assert_contains "no thresholds file: the bundle says so, and the session runs" "$(cat "$TMP/session-prompt")" "Thresholds ($TMP/none.conf): none ($TMP/none.conf not read)"
+printf '%s\n' 'Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: No.' 'Request to reviewer: Plain. | missing: x | answer with: a file:line' 'Request to reviewer: Two. | missing: y | answer with: a command and its output' > "$TMP/session-result"
+ss 'Plain.' --session --author reviewer
+assert "A8: requests don't change the exit code (no flags: 0)" test "$rc" = 0
+assert_contains "A8: requests are numbered in order" "$out" "Request 2 to reviewer: Two. | missing: y"
+assert_contains "'No.' is no too-good flag" "$out" "Flags: 0 hard, 0 soft"
+printf '%s\n' '- **Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: "100 %" with nothing counted**' 'Claim (line 1): Plain. | evidence named: none' > "$TMP/session-result"
+ss 'Plain.' --session --author reviewer
+assert_contains "a Claim line in Markdown is read" "$out" "soft too good to be true (line 1): Plain. — \"100 %\" with nothing counted"
+assert_contains "a Claim line without the too-good field: no flag" "$out" "Flags: 0 hard, 1 soft"
+assert "soft only: exit 1" test "$rc" = 1
+ss "$TG"
+assert "A9: without --session no session" test "$(calls)" = 0
+assert "A9: and the never-called stub wasn't called" test ! -e "$TMP/claude-calls"
+
+echo "-- the author"
+printf 'Claim (line 1): x | evidence named: none | found: no | too good to be true: no\n' > "$TMP/session-result"
+ss 'Plain.' --session --author developer
+assert_contains "A10: --author developer reaches the session's prompt" "$(cat "$TMP/session-prompt")" "Author: developer"
+mkdir -p "$TMP/au"; echo 'Plain.' > "$TMP/au/r.md"
+sa() { rm -f "$TMP/session-prompt"; out="$(PATH="$TMP/sbin:$PATH" bash "$S" "$@" --repo "$R" 2>&1)"; rc=$?; }
+echo '{"kind": "tests"}' > "$TMP/au/r.json"; sa "$TMP/au/r.md" --session
+assert_contains "A10: a sidecar of kind tests gives reviewer" "$(cat "$TMP/session-prompt")" "Author: reviewer"
+echo '{"kind": "code"}' > "$TMP/au/r.json"; sa "$TMP/au/r.md" --session
+assert_contains "a sidecar of kind code gives reviewer" "$(cat "$TMP/session-prompt")" "Author: reviewer"
+echo '{"kind": "plan"}' > "$TMP/au/r.json"; sa "$TMP/au/r.md" --session
+assert_contains "A10: a sidecar of kind plan gives planner" "$(cat "$TMP/session-prompt")" "Author: planner"
+sa "$TMP/au/r.md" --session --author developer
+assert_contains "--author wins over the sidecar" "$(cat "$TMP/session-prompt")" "Author: developer"
+echo '{"kind": "judge"}' > "$TMP/au/r.json"; sa "$TMP/au/r.md" --session
+assert_contains "A10: a sidecar of another kind: no author, and --author named" "$out" "sniff: no author for the session: give --author planner, developer or reviewer (no sidecar $TMP/au/r.json of kind code, tests or plan)"
+assert "A10: no author: exit 4" test "$rc" = 4
+assert "A10: no author: no session" test ! -e "$TMP/session-prompt"
+rm "$TMP/au/r.json"; sa "$TMP/au/r.md" --session
+assert_contains "A10: no author and no sidecar: --author named" "$out" "give --author planner, developer or reviewer"
+assert "A10: no author and no sidecar: exit 4" test "$rc" = 4
+echo 'x' > "$TMP/au/plain"; echo '{"kind": "plan"}' > "$TMP/au/plain.json"; sa "$TMP/au/plain" --session
+assert_contains "a sidecar next to a file without .md: <file>.json" "$(cat "$TMP/session-prompt")" "Author: planner"
+out="$(echo x | PATH="$TMP/sbin:$PATH" bash "$S" - --session --repo "$R" 2>&1)"; rc=$?
+assert_contains "stdin: no author" "$out" "give --author planner, developer or reviewer (the text is from stdin)"
+assert "stdin: exit 4" test "$rc" = 4
+sn 'Plain.' --session --author boss
+assert_contains "A10: --author boss is named" "$out" "sniff: unknown author 'boss': --author takes planner, developer or reviewer"
+assert "A10: --author boss: exit 4" test "$rc" = 4
+sn 'Plain.' --author
+assert_contains "--author with no value" "$out" "sniff: --author needs planner, developer or reviewer"
+assert "--author with no value: exit 4" test "$rc" = 4
+sn 'Plain.' --author planner
+assert "--author without --session: no session, as before" test "$out" = "Flags: 0 hard, 0 soft"
+
+echo "-- a failed session"
+touch "$TMP/session-fail"; ss 'Plain.' --session --author reviewer; rm "$TMP/session-fail"
+assert_contains "A11: a failed session: the reason on stderr" "$err" "sniff: the session didn't run: claude -p failed (exit 1)"
+assert "A11: a failed session: exit 4" test "$rc" = 4
+assert "A11: a failed session: nothing on stdout" test -z "$out"
+assert "a failed session: no temp folder left" test -z "$(ls -A "$TMP/tmpd")"
+REVIEW_CONFIG="$TMP/none.conf" ss 'Plain.' --session --author reviewer
+assert_contains "a session that doesn't start: review.sh's reason" "$err" "sniff: the session didn't run: missing $TMP/none.conf"
+assert "a session that doesn't start: exit 4" test "$rc" = 4
+
+echo "-- one answer round (--answer)"
+printf '%s\n' 'soft too good to be true (line 2): Made it 10x faster. — no measurement' \
+  'Request 1 to reviewer: Made it 10x faster. | missing: a measurement before and after | answer with: a file:line' 'Flags: 0 hard, 1 soft' > "$TMP/earlier.txt"
+printf 'Answered 1: yes — a.js:100 has the measurement\n' > "$TMP/session-result"
+ss $'Answer 1: the measurement is at a.js:100.' --answer "$TMP/earlier.txt"
+assert "A16: an answer with evidence the session confirms: no flag" test "$out" = "Flags: 0 hard, 0 soft"
+assert "A16: answered: exit 0" test "$rc" = 0
+assert "A16: one session" test "$(calls)" = 1
+assert_contains "the answer's bundle: mode answer" "$(cat "$TMP/session-prompt")" "Mode: answer"
+assert_contains "the answer's bundle: the earlier requests" "$(cat "$TMP/session-prompt")" "Request 1 to reviewer: Made it 10x faster."
+assert_contains "the answer's author defaults to the requests' author" "$(cat "$TMP/session-prompt")" "Author: reviewer"
+ss $'Intro.\nAnswer 1: the measurement is at a.js:500.' --answer "$TMP/earlier.txt"
+assert_contains "A16: an answer citing a line past the end: hard, naming the claim" "$out" "hard unsupported after one round (line 2): Made it 10x faster. — Answer 1 has a hard flag (line 2)"
+assert "A16: past the end: exit 2" test "$rc" = 2
+ss 'No answers here.' --answer "$TMP/earlier.txt"
+assert_contains "A16: no Answer 1: hard, naming the claim" "$out" "hard unsupported after one round (line 1): Made it 10x faster. — Request 1 has no Answer 1: block"
+assert "A16: no Answer 1: exit 2" test "$rc" = 2
+printf 'Answered 1: no — it argues, with no measurement\n' > "$TMP/session-result"
+ss 'Answer 1: trust me.' --answer "$TMP/earlier.txt"
+assert_contains "the session says no: hard, with its reason" "$out" "hard unsupported after one round (line 1): Made it 10x faster. — the session found the evidence missing in Answer 1: it argues, with no measurement"
+assert "the session says no: exit 2" test "$rc" = 2
+printf 'Nothing about it.\n' > "$TMP/session-result"
+ss 'Answer 1: a.js:100.' --answer "$TMP/earlier.txt"
+assert_contains "the session doesn't answer for it: hard" "$out" "the session found the evidence missing in Answer 1: the session didn't answer for it"
+printf '**Answered 1: yes**\n' > "$TMP/session-result"
+ss 'Answer 1: a.js:100.' --answer "$TMP/earlier.txt"
+assert "an Answered line in Markdown is read" test "$out" = "Flags: 0 hard, 0 soft"
+printf '%s\n' 'Request 1 to reviewer: A. | missing: a | answer with: a file:line' 'Request 2 to reviewer: B. | missing: b | answer with: a file:line' > "$TMP/earlier2.txt"
+printf 'Answered 1: yes — ok\nAnswered 2: yes — ok\n' > "$TMP/session-result"
+ss $'Answer 1: a.js:100.\nAnswer 2: a.js:500.' --answer "$TMP/earlier2.txt"
+assert_not_contains "a block ends at the next one: Answer 1 is clear" "$out" "(line 1): A."
+assert_contains "and Answer 2 has its own hard flag" "$out" "hard unsupported after one round (line 2): B. — Answer 2 has a hard flag (line 2)"
+printf 'Answered 1: yes — ok\nRequest to reviewer: More? | missing: m | answer with: a file:line\n' > "$TMP/session-result"
+ss 'Answer 1: a.js:100.' --answer "$TMP/earlier.txt" --author developer
+assert_not_contains "A17: an answer run prints no Request line" "$out" "Request"
+assert "A17: an answer run: one session" test "$(calls)" = 1
+assert_contains "--author wins in an answer run" "$(cat "$TMP/session-prompt")" "Author: developer"
+printf 'Flags: 0 hard, 0 soft\n' > "$TMP/norequests.txt"
+ss 'Answer 1: a.js:100.' --answer "$TMP/norequests.txt"
+assert_contains "A17: an earlier output with no Request lines" "$err" "sniff: no Request lines in $TMP/norequests.txt"
+assert "A17: no Request lines: exit 4" test "$rc" = 4
+assert "A17: no Request lines: no session" test "$(calls)" = 0
+sn 'Plain.' --answer "$TMP/nope.txt"
+assert_contains "--answer: a missing earlier output is named" "$out" "sniff: no such file: $TMP/nope.txt"
+assert "--answer: a missing file: exit 4" test "$rc" = 4
+sn 'Plain.' --answer
+assert_contains "--answer with no value" "$out" "sniff: --answer needs the earlier sniff output"
+
 finish

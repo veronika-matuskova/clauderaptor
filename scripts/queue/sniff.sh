@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Sniffs a text (a PR body, an agent's report, a review, a brief) for claims that have no evidence at a commit:
-#   sniff.sh <file or -> [--brief] [--repo <checkout>] [--commit <rev>]
+#   sniff.sh <file or -> [--brief] [--repo <checkout>] [--commit <rev>] [--session] [--author planner|developer|reviewer]
+#   sniff.sh <answer file> --answer <earlier sniff output> [--brief] [--repo <checkout>] [--commit <rev>] [--author ...]
 # It reads the text from the file, or from stdin for -. --repo defaults to the checkout of the current folder,
-# --commit to that checkout's HEAD (any rev that resolves to a commit). Mechanical only: it starts no claude
-# session and reads only three things: the text, the repo's git objects at that commit (git ls-tree, cat-file,
-# grep <sha>; never the working tree), and the queue's events file ($STATS_EVENTS_FILE, else
-# ${PR_QUEUE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/pr-queue}/events.jsonl, as pr-queue.sh writes it). It
-# changes nothing: no checkout, no writes to the repo, no files left behind.
+# --commit to that checkout's HEAD (any rev that resolves to a commit). Without --session or --answer it is
+# mechanical only: it starts no claude session and reads only the text, the repo's git objects at that commit
+# (git ls-tree, cat-file, grep <sha>; never the working tree), the queue's events file ($STATS_EVENTS_FILE, else
+# ${PR_QUEUE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/pr-queue}/events.jsonl, as pr-queue.sh writes it), and,
+# for a review, its sidecar and sniff.conf (below). It changes nothing: no checkout, no writes to the repo, no
+# files left behind.
 #
 # What it checks, each flag with a severity (hard or soft) and a category:
 # - missing reference (hard): a file reference that isn't in the commit's tree. That is a token with a slash
@@ -32,8 +34,32 @@
 #   that sha, not flagged on result=pass, else soft "no record".
 # - weasel words (soft): "should work", "probably", "seems to", "robust" or "comprehensive" in a line that
 #   claims something is done, fixed, passing or proven.
-# What it doesn't check: whether a claim is true beyond these (no session, no "too good to be true"), numbers,
-# whether proof was added by the branch, and runs outside the queue (no record, soft).
+# - too good to be true (soft), for a review: the input is a review file <branch>-<sha>-<low|medium|high|xhigh|
+#   tests>[-notests].md with its sidecar <review>.json next to it (as review.sh writes them), of kind code or
+#   tests, whose verdict is ready. It is flagged when its diff (added plus deleted lines of the sidecar's sha
+#   against its merge-base with the default branch: origin/HEAD's, else origin/main, main, origin/master or
+#   master) has more lines than max_diff_lines, or its session's duration_ms, cost_usd or num_turns is below that
+#   kind's floor (<kind>_min_seconds, _min_cost, _min_turns; a value the sidecar lacks isn't compared). The
+#   thresholds are in sniff.conf, next to this script ($SNIFF_CONFIG for another file), read only then: a missing
+#   file or value, or a sidecar sha that isn't in the repo, exits 4.
+# What it doesn't check mechanically: whether a claim is true beyond these, numbers, whether proof was added by
+# the branch, and runs outside the queue (no record, soft).
+#
+# The session (--session): after the mechanical checks, exactly one fresh claude session, review.sh --sniff (next
+# to this script; its model and effort are sniff_model and sniff_effort in review.conf), at the same repo and
+# commit. It gets a bundle (in a temp folder, removed afterwards): the author, the text with its line numbers, the
+# mechanical flags and the thresholds; its instructions are in sniff.md. It lists the claims, and each one it
+# finds too good to be true is a soft "too good to be true" flag; its evidence requests are printed as
+# "Request <n> to <author>: <claim> | missing: <...> | answer with: <...>" lines before the Flags line. Requests
+# don't change the exit code. The author is --author, else from the input's sidecar (<input without .md>.json):
+# kind code or tests is a reviewer, plan a planner. No author, or an unknown one, exits 4; so does a session that
+# didn't run ("sniff: the session didn't run: <reason>" on stderr).
+# One answer round (--answer <earlier output>): the input is the author's answer to the Request lines of an
+# earlier --session output (none there exits 4). It is sniffed mechanically, then one session checks it (the
+# author defaults as above, else to the one the requests name). Request <n> is cleared only if the answer has an
+# "Answer <n>:" block (up to the next one), no line of that block has a hard flag, and the session says
+# "Answered <n>: yes". Each one not cleared is a hard "unsupported after one round" flag naming its claim. It
+# prints no Request lines: there is never a second round. sniff.sh doesn't deliver requests or collect answers.
 # References it leaves alone (never flagged): absolute paths, ~/ paths, $VAR or ${...} paths, ../ paths, URLs;
 # tokens with a placeholder or glob (<...>, ..., *); git ranges (main..HEAD); options (-x); ~~struck-out~~ text;
 # and every reference on a line whose prose (not its code spans or paths) says it is new or to be added ("new",
@@ -68,16 +94,22 @@
 #
 # Output: one line per flag, "<hard|soft> <category> (line <n>): <the claim> — <why>", <n> the line in the
 # input, then "Flags: <h> hard, <s> soft". Exit 0 = no flags, 1 = soft flags only, 2 = a hard flag,
-# 4 = the sniff didn't run (bad arguments, a missing file, not a checkout, an unknown commit, or an error in the
-# sniff itself; the reason on stderr).
+# 4 = the sniff didn't run (bad arguments, a missing file, not a checkout, an unknown commit, no author or a
+# failed session, a missing threshold, or an error in the sniff itself; the reason on stderr).
 set -uo pipefail
 die() { echo "sniff: $*" >&2; exit 4; }
-usage="usage: sniff.sh <file or -> [--brief] [--repo <checkout>] [--commit <rev>]"
+usage="usage: sniff.sh <file or -> [--brief] [--repo <checkout>] [--commit <rev>] [--session] [--author planner|developer|reviewer] [--answer <earlier sniff output>]"
 
-input="" repo="" rev="" have_input="" brief=0
+input="" repo="" rev="" have_input="" brief=0 session=0 author="" answer=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --brief) brief=1; shift ;;
+    --session) session=1; shift ;;
+    --author)
+      [ $# -ge 2 ] || die "--author needs planner, developer or reviewer. $usage"
+      case "$2" in planner|developer|reviewer) author="$2" ;; *) die "unknown author '$2': --author takes planner, developer or reviewer" ;; esac
+      shift 2 ;;
+    --answer) [ $# -ge 2 ] || die "--answer needs the earlier sniff output. $usage"; answer="$2"; shift 2 ;;
     --repo) [ $# -ge 2 ] || die "--repo needs a checkout. $usage"; repo="$2"; shift 2 ;;
     --commit) [ $# -ge 2 ] || die "--commit needs a rev. $usage"; rev="$2"; shift 2 ;;
     -) [ -z "$have_input" ] || die "one input only. $usage"; input=-; have_input=1; shift ;;
@@ -87,12 +119,14 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$have_input" ] || die "$usage"
 if [ "$input" != - ] && { [ ! -f "$input" ] || [ ! -r "$input" ]; }; then die "no such file: $input"; fi
+if [ -n "$answer" ] && { [ ! -f "$answer" ] || [ ! -r "$answer" ]; }; then die "no such file: $answer"; fi
 top="$(git -C "${repo:-.}" rev-parse --show-toplevel 2>/dev/null)" || die "not a git checkout: ${repo:-$PWD}"
 sha="$(git -C "$top" rev-parse -q --verify "${rev:-HEAD}^{commit}" 2>/dev/null)" || die "no such commit in $top: ${rev:-HEAD}"
 events="${STATS_EVENTS_FILE:-${PR_QUEUE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/pr-queue}/events.jsonl}"
+HERE="$(dirname "$(readlink -f "$0")")"
 
 code="$(cat <<'PY'
-import json, os, re, shutil, subprocess, sys, traceback
+import json, os, re, shutil, subprocess, sys, tempfile, traceback
 
 # An error in the sniff must never pass for a result: Python exits 1 on an uncaught exception, which is
 # "soft flags only" here. Exit 5 instead, which the shell turns into 4 ("the sniff didn't run").
@@ -104,8 +138,49 @@ sys.excepthook = crashed
 
 top, sha, events_file, input_path = sys.argv[1:5]
 brief = sys.argv[5] == "1"
+answer_path, here, conf_path = sys.argv[8], sys.argv[9], sys.argv[10]
+session = sys.argv[6] == "1" or bool(answer_path)   # an answer round always runs one session
+author = sys.argv[7]
 short = sha[:12]
 env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+
+def stop(why):
+    """The sniff didn't run: the reason on stderr, and exit 6, which the shell turns into 4."""
+    print(f"sniff: {why}", file=sys.stderr)
+    sys.exit(6)
+
+# The input's sidecar (<input without .md>.json, as review.sh writes it), if there is one that is a JSON object.
+sidecar_path = "" if input_path == "-" else (input_path[:-3] if input_path.endswith(".md") else input_path) + ".json"
+sidecar = None
+if sidecar_path and os.path.isfile(sidecar_path):
+    try:
+        with open(sidecar_path, encoding="utf-8") as f:
+            sidecar = json.load(f)
+    except (OSError, ValueError):
+        sidecar = None
+    if not isinstance(sidecar, dict):
+        sidecar = None
+side_kind = sidecar.get("kind") if sidecar else None
+
+# The earlier round's requests, for --answer: (n, author, the text after "to <author>:").
+REQUEST_RE = re.compile(r"^Request (\d+) to (planner|developer|reviewer): (.*)$")
+requests = []
+if answer_path:
+    with open(answer_path, "rb") as f:
+        for raw in f.read().decode("utf-8", "replace").splitlines():
+            m = REQUEST_RE.match(raw.strip())
+            if m:
+                requests.append((int(m.group(1)), m.group(2), m.group(3)))
+    if not requests:
+        stop(f"no Request lines in {answer_path}: an answer round needs the output of a sniff.sh --session run")
+
+if session and not author:
+    author = {"code": "reviewer", "tests": "reviewer", "plan": "planner"}.get(side_kind, "")
+    if not author and requests:
+        author = requests[0][1]
+    if not author:
+        where = f"no sidecar {sidecar_path} of kind code, tests or plan" if sidecar_path else "the text is from stdin"
+        stop(f"no author for the session: give --author planner, developer or reviewer ({where})")
 
 def git(*args):
     return subprocess.run(["git", "-C", top, *args], capture_output=True, env=env)
@@ -704,17 +779,194 @@ if not_proven_none and not brief:
             flag("hard", "missing proof", start + 1, claim_of(block[0]),
                  f"Not proven: none (line {not_proven_none[0] + 1}), but A{crit} names no test, file:line or command")
 
+# --- too good to be true: a ready review, against sniff.conf's thresholds ---
+CONF_KEYS = ["max_diff_lines", "code_min_seconds", "code_min_cost", "code_min_turns",
+             "tests_min_seconds", "tests_min_cost", "tests_min_turns"]
+REVIEW_NAME_RE = re.compile(r"^.+-[0-9a-f]{7,40}-(?:low|medium|high|xhigh|tests)(?:-notests)?\.md$")
+VERDICT_RE = re.compile(r"verdict:[\s*_`]*(ready|needs changes|escalate|questions|failed)", re.I)
+
+def read_conf(strict):
+    """sniff.conf's values, sourced in bash (only the file's values count, not the environment's). Strict: a
+    missing file or value, or one that isn't a number, stops the sniff; else they are left out."""
+    if not os.path.isfile(conf_path):
+        if strict:
+            stop(f"no thresholds file: {conf_path} (sniff.conf, or $SNIFF_CONFIG)")
+        return {}
+    script = 'for k in "${@:2}"; do unset "$k"; done; . "$1" >/dev/null || exit 3; for k in "${@:2}"; do printf "%s=%s\\n" "$k" "${!k-}"; done'
+    r = subprocess.run(["bash", "-c", script, "_", conf_path, *CONF_KEYS], capture_output=True)
+    if r.returncode != 0:
+        if strict:
+            stop(f"can't read {conf_path}")
+        return {}
+    vals = {}
+    for line in r.stdout.decode("utf-8", "replace").splitlines():
+        k, _, v = line.partition("=")
+        try:
+            vals[k] = float(v)
+        except ValueError:
+            if strict:
+                stop(f"no {k} in {conf_path}" if not v else f"{k} in {conf_path} must be a number, not '{v}'")
+    return vals
+
+def num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+def plain(v):
+    """A number as written: 4, 29.999, 1039."""
+    return f"{v:g}"
+
+def money(v):
+    return f"${v:.2f}" if abs(v * 100 - round(v * 100)) < 1e-9 else f"${v:g}"
+
+def plural(n, word):
+    return f"{plain(n)} {word}{'' if n == 1 else 's'}"
+
+def review_check():
+    if (input_path == "-" or not REVIEW_NAME_RE.match(os.path.basename(input_path)) or not sidecar
+            or side_kind not in ("code", "tests") or sidecar.get("verdict") != "ready"):
+        return
+    conf = read_conf(True)
+    rsha = sidecar.get("sha")
+    if not isinstance(rsha, str) or not rsha:
+        stop(f"the review's sidecar {sidecar_path} has no sha")
+    full = git("rev-parse", "-q", "--verify", f"{rsha}^{{commit}}")
+    if full.returncode != 0:
+        stop(f"the review's commit isn't in {top}: {rsha} (from {sidecar_path})")
+    rsha = full.stdout.decode().strip()
+    against = ""
+    head = git("symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD").stdout.decode().strip()
+    for c in (head, "origin/main", "main", "origin/master", "master"):
+        if c and git("rev-parse", "-q", "--verify", f"{c}^{{commit}}").returncode == 0:
+            against = c
+            break
+    if not against:
+        stop(f"no default branch (origin/HEAD, main or master) in {top} to measure the review's diff against")
+    mb = git("merge-base", against, rsha)
+    if mb.returncode != 0:
+        stop(f"the review's commit {rsha[:12]} has no common history with {against}")
+    size = 0
+    for row in git("diff", "--numstat", mb.stdout.decode().strip(), rsha).stdout.decode("utf-8", "replace").splitlines():
+        added, deleted = row.split("\t")[:2]
+        if added != "-":   # a binary file has no lines
+            size += int(added) + int(deleted)
+    k = side_kind
+    secs = num(sidecar.get("duration_ms"))
+    secs = secs / 1000 if secs is not None else None
+    cost, turns = num(sidecar.get("cost_usd")), num(sidecar.get("num_turns"))
+    floor_s, floor_c, floor_t = conf[f"{k}_min_seconds"], conf[f"{k}_min_cost"], conf[f"{k}_min_turns"]
+    if not (size > conf["max_diff_lines"] or (secs is not None and secs < floor_s)
+            or (cost is not None and cost < floor_c) or (turns is not None and turns < floor_t)):
+        return
+    vn = [i for i, line in enumerate(lines) if VERDICT_RE.search(line)]
+    n = vn[-1] + 1 if vn else 1
+    claim = claim_of(lines[n - 1]) if lines else "(empty review)"
+    flag("soft", "too good to be true", n, claim,
+         f"no findings on a {size}-line diff in {plain(secs) if secs is not None else '?'} s, "
+         f"{money(cost) if cost is not None else '$?'}, {plural(turns, 'turn') if turns is not None else '? turns'}; "
+         f"thresholds: {plain(conf['max_diff_lines'])} lines, {plain(floor_s)} s, {money(floor_c)}, "
+         f"{plural(floor_t, 'turn')} ({k} review)")
+
+review_check()
+
+# --- the session (--session, --answer): one review.sh --sniff ---
+CLAIM_RE_S = re.compile(r"^[\s>*_`\-]*Claim \(line (\d+)\):\s*(.*)$")
+TOO_GOOD_RE = re.compile(r"\|\s*too good to be true:\s*(.*?)\s*[*_`]*$", re.I)
+REQ_OUT_RE = re.compile(r"^[\s>*_`\-]*Request to [\w-]+:\s*(.*?)\s*$")
+ANSWERED_RE = re.compile(r"^[\s>*_`\-]*Answered (\d+):[*_`\s]*(yes|no)\b[\s—–-]*(.*?)\s*$", re.I)
+ANSWER_RE = re.compile(r"^[\s>*_`\-]*Answer (\d+)\s*:")
+
+def run_session(bundle_text):
+    """The session's result text. The bundle goes in a temp folder, removed afterwards."""
+    tmp = tempfile.mkdtemp(prefix="sniff-")
+    try:
+        bundle = os.path.join(tmp, "bundle.md")
+        with open(bundle, "w", encoding="utf-8") as f:
+            f.write(bundle_text)
+        r = subprocess.run(["bash", os.path.join(here, "review.sh"), "--sniff", top, sha, bundle],
+                           stdin=subprocess.DEVNULL, capture_output=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if r.returncode != 0:
+        err = [l for l in r.stderr.decode("utf-8", "replace").splitlines() if l.strip()]
+        reason = err[-1].removeprefix("review: ") if err else f"review.sh --sniff exited {r.returncode}"
+        stop(f"the session didn't run: {reason}")
+    return r.stdout.decode("utf-8", "replace")
+
+def bundle_of(mode, text_lines, mech, extra=""):
+    conf = read_conf(False)
+    th = ", ".join(f"{k}={plain(conf[k])}" for k in CONF_KEYS if k in conf) or f"none ({conf_path} not read)"
+    numbered = "\n".join(f"{i}: {l}" for i, l in enumerate(text_lines, 1))
+    return (f"Mode: {mode}\nAuthor: {author}\nRepo: {top}, commit {sha}\n"
+            f"Input: {'stdin' if input_path == '-' else input_path}\nThresholds ({conf_path}): {th}\n{extra}\n"
+            f"## The text, with its line numbers\n\n{numbered}\n\n"
+            f"## The mechanical flags (sniff.sh)\n\n{mech or 'none'}\n")
+
+def flag_lines():
+    return "\n".join(f"{sev} {cat} (line {n}): {claim} — {why}" for sev, cat, n, claim, why in sorted(flags, key=lambda f: f[2]))
+
+out_requests = []
+if session and not answer_path:
+    result = run_session(bundle_of("claims", lines, flag_lines()))
+    for raw in result.splitlines():
+        m = CLAIM_RE_S.match(raw)
+        if m:
+            tg = TOO_GOOD_RE.search(m.group(2))
+            why = tg.group(1).strip() if tg else ""
+            if why and why.lower().rstrip(".") != "no":
+                claim = m.group(2).split("|")[0].strip()
+                flag("soft", "too good to be true", int(m.group(1)), claim_of(claim), why)
+            continue
+        m = REQ_OUT_RE.match(raw)
+        if m and m.group(1):
+            out_requests.append(m.group(1))
+elif answer_path:
+    reqs = "\n".join(f"Request {n} to {a}: {t}" for n, a, t in requests)
+    result = run_session(bundle_of("answer", lines, flag_lines(), f"\n## The requests of the earlier round ({answer_path})\n\n{reqs}\n"))
+    said = {}
+    for raw in result.splitlines():
+        m = ANSWERED_RE.match(raw)
+        if m:
+            said.setdefault(int(m.group(1)), (m.group(2).lower() == "yes", m.group(3)))
+    # Answer <n>: blocks, from their line up to the next one; the lines with a hard flag.
+    blocks, cur = {}, None
+    for i, line in enumerate(lines, 1):
+        m = ANSWER_RE.match(line)
+        if m:
+            cur = int(m.group(1))
+            blocks.setdefault(cur, [i, i])
+        if cur is not None:
+            blocks[cur][1] = i
+    hard_lines = {f[2] for f in flags if f[0] == "hard"}
+    for n, a, text in requests:
+        claim = claim_of(text.split(" | ")[0].strip())
+        if n not in blocks:
+            flag("hard", "unsupported after one round", 1, claim, f"Request {n} has no Answer {n}: block")
+            continue
+        start, end = blocks[n]
+        bad = sorted(h for h in hard_lines if start <= h <= end)
+        ok, why = said.get(n, (False, "the session didn't answer for it"))
+        if bad:
+            flag("hard", "unsupported after one round", start, claim,
+                 f"Answer {n} has a hard flag (line {', line '.join(map(str, bad))})")
+        elif not ok:
+            flag("hard", "unsupported after one round", start, claim,
+                 f"the session found the evidence missing in Answer {n}: {why or 'no reason given'}")
+
 flags.sort(key=lambda f: f[2])
 for sev, cat, n, claim, why in flags:
     print(f"{sev} {cat} (line {n}): {claim} — {why}")
 if more:
     print(f"({more} more left-out reference{' was' if more == 1 else 's were'} not listed)")
+for i, text in enumerate(out_requests, 1):
+    print(f"Request {i} to {author}: {text}")
 hard = sum(1 for f in flags if f[0] == "hard")
 soft = len(flags) - hard
 print(f"Flags: {hard} hard, {soft} soft")
 sys.exit(2 if hard else 1 if soft else 0)
 PY
 )"
-python3 -I -c "$code" "$top" "$sha" "$events" "$input" "$brief"
+python3 -I -c "$code" "$top" "$sha" "$events" "$input" "$brief" "$session" "$author" "$answer" "$HERE" \
+  "${SNIFF_CONFIG:-$HERE/sniff.conf}"
 rc=$?
-case "$rc" in 0|1|2) exit "$rc" ;; *) die "the sniff failed (python exit $rc)" ;; esac
+# 6: the sniff didn't run, and it said why on stderr
+case "$rc" in 0|1|2) exit "$rc" ;; 6) exit 4 ;; *) die "the sniff failed (python exit $rc)" ;; esac

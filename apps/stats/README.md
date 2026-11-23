@@ -35,6 +35,14 @@ a one-time link, not the token. The page's script runs under a CSP nonce and can
 page sends a heartbeat every minute; the server stops 10 minutes after its last request (`--idle`), so soon
 after the window closes. Opened as a plain file, the page has no script and the button stays hidden.
 
+## Queue now
+
+The report's first section shows what the PR queue is doing right now, per repo: the running branch, its step
+(merging main, code review, test review, judge, e2e, waiting for CI, merging) and for how long; the queued
+branches in order, with their wait; and the last failures that nobody has re-queued yet (5 per repo, "needs your
+decision" marked). It is read from the queue's files (`$PR_QUEUE_DIR`) each time the report is built, not from
+the db, so Refresh shows the current queue; "As of" says when that was.
+
 ## Data
 The db and the report stay on this machine, in `${XDG_STATE_HOME:-~/.local/state}/clauderaptor-stats/`, never in
 a git checkout: `report.py` and `serve.py` refuse one, and the repo's pre-commit hook refuses stats data. So do the

@@ -173,7 +173,12 @@ assert "the token as a ticket: 403" test "$(code "$PORT" GET "/?k=$TOKEN")" = 40
 
 echo "-- refresh picks up new data"
 assert_contains "no sessions yet" "$(body "$PORT" GET "/?t=$TOKEN")" '<tr><td>sessions</td><td class="num">0</td></tr>'
+assert_contains "the queue: nothing yet" "$(body "$PORT" GET "/?t=$TOKEN")" '<h3>app</h3><p class="empty">Nothing running or queued.</p>'
 event 2
+# a branch queued since: Queue now reads the queue's files at each rebuild
+mkdir -p "$PR_QUEUE_DIR/repos/app/queue"
+printf 'worktree=/w\nbranch=feat/now-queued\ntype=feat\ndescription=d\nreview=\ntests=\n' \
+  > "$PR_QUEUE_DIR/repos/app/queue/$(date +%s)000000000-feat-now-queued.job"
 # a transcript in --projects: the ingest reads it from there ($HOME/.claude/projects stays empty)
 printf '%s\n' '{"type":"assistant","timestamp":"2026-10-02T10:00:00.000Z","sessionId":"s1","cwd":"/x","message":{"id":"m1","model":"claude-opus-4-1","usage":{"input_tokens":5,"output_tokens":7}}}' \
   > "$TMP/projects/p/s1.jsonl"
@@ -182,6 +187,9 @@ assert "200" test "$(head -1 <<<"$R")" = 200
 assert_contains "ok" "$R" '{"ok": true, "message": "refreshed"}'
 assert_contains "the page has the new numbers" "$(body "$PORT" GET "/?t=$TOKEN")" 'Merged branches</div><div class="tv">2<'
 assert_contains "and so does the file" "$(cat "$OUT")" 'Merged branches</div><div class="tv">2<'
+assert_contains "the page shows the queue as it is now" "$(body "$PORT" GET "/?t=$TOKEN")" \
+  '<h4>Queued</h4><ol class="q"><li><span class="qb">feat/now-queued</span>, waiting '
+assert_not_contains "and no longer says it is empty" "$(body "$PORT" GET "/?t=$TOKEN")" "Nothing running or queued."
 assert_not_contains "which has no script" "$(cat "$OUT")" "<script"
 assert "and stays 0600" test "$(stat -c %a "$OUT")" = 600
 assert_contains "the ingest read --projects" "$(body "$PORT" GET "/?t=$TOKEN")" '<tr><td>sessions</td><td class="num">1</td></tr>'

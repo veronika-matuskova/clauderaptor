@@ -102,32 +102,38 @@ assert_contains "data note: row counts" "$T" "jobs 13 reviews 18 findings 24"
 assert_contains "data note: stays on this machine" "$T" "The data stays on this machine"
 assert_contains "transcript tables, no transcripts ingested: empty" "$T" "sessions 0 usage_daily 0"
 
+# no_network <html file>: the page links to nothing, loads nothing and has no script
+no_network() {
+  local h B tags png_re uri bad
+  h="$(cat "$1")"
+  # The icon and the logo are the only images, inlined as data: PNGs; with them blanked out, nothing may link out.
+  png_re='data:image/png;base64,[A-Za-z0-9+/]*=*'
+  assert "the icon and the logo are inlined" test "$(grep -oE "$png_re" "$1" | wc -l)" -eq 2
+  while read -r uri; do
+    assert "an inlined image decodes to a PNG" test "$(printf '%s' "${uri#*,}" | base64 -d | head -c 4 | tail -c 3)" = PNG
+  done < <(grep -oE "$png_re" "$1")
+  assert_contains "the icon link inlines icon.png" "$h" \
+    "<link rel=\"icon\" type=\"image/png\" href=\"data:image/png;base64,$(base64 -w0 "$ROOT/apps/stats/icon.png")\">"
+  assert_contains "the logo img inlines logo.png" "$h" \
+    "<img class=\"logo\" src=\"data:image/png;base64,$(base64 -w0 "$ROOT/apps/stats/logo.png")\" alt=\"\">"
+  B="$(sed -E "s#$png_re#PNG#g" "$1")"
+  assert_contains "the icon is a data: PNG" "$B" '<link rel="icon" type="image/png" href="PNG">'
+  assert_contains "the logo is a data: PNG" "$B" '<img class="logo" src="PNG" alt="">'
+  for bad in "//" "<script" "url(" "@import"; do
+    assert_not_contains "no $bad in the page" "$B" "$bad"
+  done
+  tags="$(printf '%s' "$B" | grep -o '<[a-zA-Z][^>]*>' | grep -vxF -e '<link rel="icon" type="image/png" href="PNG">' \
+    -e '<img class="logo" src="PNG" alt="">')"
+  assert_not_contains "no other link" "$tags" "<link"
+  assert_not_contains "no other img" "$tags" "<img"
+  assert_not_contains "no other tag with a src" "$tags" "src="
+  assert_not_contains "no other tag with an href" "$tags" "href="
+  assert_contains "a CSP that allows nothing but inline styles and data: images" "$h" \
+    "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'\">"
+}
 echo "-- no network, no script"
 H="$(cat "$OUT")"
-# The icon and the logo are the only images, inlined as data: PNGs; with them blanked out, nothing may link out.
-png_re='data:image/png;base64,[A-Za-z0-9+/]*=*'
-assert "the icon and the logo are inlined" test "$(grep -oE "$png_re" "$OUT" | wc -l)" -eq 2
-while read -r uri; do
-  assert "an inlined image decodes to a PNG" test "$(printf '%s' "${uri#*,}" | base64 -d | head -c 4 | tail -c 3)" = PNG
-done < <(grep -oE "$png_re" "$OUT")
-assert_contains "the icon link inlines icon.png" "$H" \
-  "<link rel=\"icon\" type=\"image/png\" href=\"data:image/png;base64,$(base64 -w0 "$ROOT/apps/stats/icon.png")\">"
-assert_contains "the logo img inlines logo.png" "$H" \
-  "<img class=\"logo\" src=\"data:image/png;base64,$(base64 -w0 "$ROOT/apps/stats/logo.png")\" alt=\"\">"
-B="$(sed -E "s#$png_re#PNG#g" "$OUT")"
-assert_contains "the icon is a data: PNG" "$B" '<link rel="icon" type="image/png" href="PNG">'
-assert_contains "the logo is a data: PNG" "$B" '<img class="logo" src="PNG" alt="">'
-for bad in "//" "<script" "url(" "@import"; do
-  assert_not_contains "no $bad in the page" "$B" "$bad"
-done
-tags="$(printf '%s' "$B" | grep -o '<[a-zA-Z][^>]*>' | grep -vxF -e '<link rel="icon" type="image/png" href="PNG">' \
-  -e '<img class="logo" src="PNG" alt="">')"
-assert_not_contains "no other link" "$tags" "<link"
-assert_not_contains "no other img" "$tags" "<img"
-assert_not_contains "no other tag with a src" "$tags" "src="
-assert_not_contains "no other tag with an href" "$tags" "href="
-assert_contains "a CSP that allows nothing but inline styles and data: images" "$H" \
-  "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'\">"
+no_network "$OUT"
 
 echo "-- the Refresh button, as a file"
 assert_contains "is hidden (no script shows it)" "$H" '<button id="refresh" type="button" hidden>Refresh</button>'
@@ -140,6 +146,100 @@ echo "-- escaping"
 assert_contains "a hostile branch name is escaped" "$H" "&lt;script&gt;alert(1)&lt;/script&gt;"
 assert_contains "a hostile branch's quote and tag are escaped" "$H" "&quot;&gt;&lt;img src=x onerror=alert(1)&gt;"
 assert_contains "the escaped name shows as text" "$T" "<script>alert(1)</script>\"><img src=x onerror=alert(1)>"
+
+echo "-- queue now: the live queue state, read from \$PR_QUEUE_DIR's files"
+# A fixture queue state: app runs feat/tests (in its test review) and has 3 queued and several failed branches;
+# lib runs a job that has only started, web one with no events; idle's failures all have newer results.
+Q="$TMP/q"; NOW="$(date +%s)"; XSS='<script>alert(1)</script>'; mkdir -p "$Q"
+# job <repo> <folder> <seconds ago> <branch>: a job file queued that long ago; prints its job_id
+job() { local id; id="$((NOW - $3))$(printf '%09d' "$RANDOM")-${4//[^A-Za-z0-9]/-}"
+  mkdir -p "$Q/repos/$1/$2"
+  printf 'worktree=/w/%s\nbranch=%s\ntype=feat\ndescription=d\nreview=\ntests=\n' "$4" "$4" > "$Q/repos/$1/$2/$id.job"
+  echo "$id"; }
+# ev <job_id> <seconds ago> <event> [kind]: an event in events.jsonl
+ev() { printf '{"v":1,"ts":"%s","event":"%s","repo":"app","branch":"%s","job_id":"%s","sha":null,"pid":1%s}\n' \
+  "$(date -u -d "@$((NOW - $2))" +%Y-%m-%dT%H:%M:%S.000Z)" "$3" "$XSS" "$1" "${4:+,\"kind\":\"$4\"}" >> "$Q/events.jsonl"; }
+# res <repo> <seconds ago> <line after the time>: a results.log line (local time, as pr-queue.sh writes it)
+res() { mkdir -p "$Q/repos/$1"; echo "$(date -d "@$((NOW - $2))" '+%F %T') $3" >> "$Q/repos/$1/results.log"; }
+J="$(job app running 900 feat/tests)"
+ev "$J" 900 job_queued; ev "$J" 800 job_started; ev "$J" 700 main_merged; ev "$J" 400 review_started code
+ev "$J" 125 review_started tests; ev "$J" 60 review_finished code
+ev "$J-again" 30 e2e_started  # another job's later event (its id starts with this one's): not this one's step
+ev "$J" 50 not-json-follows; echo '{"job_id":"'"$J"'", broken' >> "$Q/events.jsonl"
+# queued in this order (names sort by time), not in branch order
+job app queue 3000 feat/zeta >/dev/null; job app queue 2000 feat/alpha >/dev/null
+job app queue 1000 "$XSS" >/dev/null
+# failed, oldest first
+for i in 1 2 3; do res app $((9000 - i)) "FAILED feat/old$i: the review found changes to make (log: /s/l$i.log)"; done
+res app 8000 "FAILED feat/alpha: the full e2e suite failed (log: /s/alpha.log)"  # queued again since: hidden
+res app 7000 "FAILED feat/merged: a conflict (log: /s/m.log)"; res app 6900 "MERGED feat/merged: #9 as abc1234"
+res app 6000 "FAILED feat/done-newer: checks failed on #3: test (log: /s/dn.log)"
+job app "done" 5900 feat/done-newer >/dev/null  # re-queued after the failure and done: hidden
+job app "done" 5500 feat/done-older >/dev/null
+res app 5000 "FAILED feat/done-older: checks failed on #4: test (log: /s/do.log)"  # failed after its done job: shown
+res app 4000 "FAILED feat/twice: first reason (log: /s/t.log)"
+res app 3500 "FAILED feat/decide: needs your decision: the branch still had changes to make after two judged rounds (judge: /s/reviews/d-judge.md) (log: /s/d.log)"
+res app 3400 "FAILED feat/twice: second reason (log: /s/t.log)"
+res app 3300 "FAILED ${XSS/1/2}: <img src=x onerror=alert(1)> (log: /s/x.log)"
+J2="$(job lib running 3700 feat/lib-start)"; ev "$J2" 3690 job_started
+job web running 10 "${XSS/1/3}" >/dev/null
+res idle 500 "FAILED feat/idle: a conflict (log: /s/i.log)"; res idle 400 "MERGED feat/idle: #7 as 1234abc"
+mkdir -p "$Q/repos/idle/queue" "$Q/repos/idle/running"
+QOUT="$TMP/out/queue.html"
+PR_QUEUE_DIR="$Q" report --db "$FX" --out "$QOUT" >/dev/null
+QH="$(cat "$QOUT")"; QT="$(text "$QOUT")"
+# qrepo <repo>: the text of one repo's part of Queue now (no space before a ":" or "," that follows a tag)
+qrepo() { sed -E "s/.*Queue now (.*) Headline .*/\1/; s/.* $1 (Running|Queued|Needs attention|Nothing)/\1/
+  s/ (app|idle|lib|web) (Running|Queued|Needs attention|Nothing) .*//; s/ ([:,]) /\1 /g" <<<"$QT"; }
+QA="$(qrepo app)"
+assert_contains "A1: the step from the job's last step event, and for how long" "$QA" "Running feat/tests: test review, for 2 min Queued"
+assert_contains "A1: only job_started: merging main, with the time" "$(qrepo lib)" "Running feat/lib-start: merging main, for 1 h 01 min"
+assert_contains "A1: no events: running, with no time" "$(qrepo web)" "Running ${XSS/1/3}: running"
+assert_not_contains "A1: no time without an event" "$(qrepo web)" "for "
+assert_contains "A2: queued in file-name order, with their wait" "$QA" \
+  "Queued feat/zeta, waiting 50 min feat/alpha, waiting 33 min $XSS, waiting 16 min Needs attention"
+assert_contains "A3: failed branches with no newer job, newest first, 5 at most" "$QA" \
+  "Needs attention $(date -d "@$((NOW - 3300))" '+%F %T') ${XSS/1/2}: <img src=x onerror=alert(1)> (log: /s/x.log) $(date -d "@$((NOW - 3400))" '+%F %T') feat/twice: second reason (log: /s/t.log) needs your decision $(date -d "@$((NOW - 3500))" '+%F %T') feat/decide: needs your decision: the branch still had changes to make after two judged rounds (judge: /s/reviews/d-judge.md) (log: /s/d.log) $(date -d "@$((NOW - 5000))" '+%F %T') feat/done-older: checks failed on #4: test (log: /s/do.log) $(date -d "@$((NOW - 8997))" '+%F %T') feat/old3: the review found changes to make (log: /s/l3.log)"
+for b in feat/alpha: feat/merged feat/done-newer "first reason" feat/old2 feat/old1; do
+  assert_not_contains "A3: not shown: $b" "$QA" "$b"
+done
+assert_contains "A3: a needs your decision line is marked" "$QH" '<strong class="decide">needs your decision</strong>'
+assert "A3: marked once (the other lines aren't)" test "$(grep -o 'class="decide"' "$QOUT" | wc -l)" -eq 1
+assert_contains "A4: a repo with nothing running, queued or failed" "$(qrepo idle)" "Nothing running or queued."
+assert "A4: said once (the busy repos don't)" test "$(grep -o 'Nothing running or queued' "$QOUT" | wc -l)" -eq 1
+assert_not_contains "A6: escaped in the page" "$QH" "<script>alert"
+assert_not_contains "A6: an <img> from results.log escaped" "$QH" "<img src=x"
+assert_contains "A6: the job file's branch as text" "$QH" "&lt;script&gt;alert(1)&lt;/script&gt;</span>, waiting"
+assert_contains "A6: a running job's branch as text" "$QH" "&lt;script&gt;alert(3)&lt;/script&gt;</span>: running"
+assert_contains "A6: results.log's text as text" "$QH" "&lt;script&gt;alert(2)&lt;/script&gt;</span>: &lt;img src=x onerror=alert(1)&gt;"
+assert_not_contains "A6: paths are text, not links" "$QH" "href=\"/s"
+no_network "$QOUT"
+assert "A7: Queue now is the first section" test "$(grep -o '<section id="[a-z-]*"' "$QOUT" | head -1)" = '<section id="queue-now"'
+assert "A7: the As of time is HH:MM:SS" grep -qE '<h2>Queue now</h2><p class="sub">As of [0-2][0-9]:[0-5][0-9]:[0-5][0-9]\.</p>' "$QOUT"
+assert_contains "A7: the repos in order" "$(grep -o '<h3>[a-z]*</h3>' "$QOUT" | tr -d '\n')" "<h3>app</h3><h3>idle</h3><h3>lib</h3><h3>web</h3>"
+qtext() { text "$1" | sed -E 's/ ([:,]) /\1 /g'; }
+QE="$TMP/q-events.jsonl"; cp "$Q/events.jsonl" "$QE"; ev "$J" 5 e2e_started
+STATS_EVENTS_FILE="$QE" PR_QUEUE_DIR="$Q" report --db "$FX" --out "$TMP/out/queue-ev.html" >/dev/null
+assert_contains "\$STATS_EVENTS_FILE is read instead of events.jsonl" "$(qtext "$TMP/out/queue-ev.html")" "feat/tests: test review, for 2 min"
+PR_QUEUE_DIR="$Q" report --db "$FX" --out "$TMP/out/queue-ev.html" >/dev/null
+assert_contains "and events.jsonl's newer event: e2e" "$(qtext "$TMP/out/queue-ev.html")" "feat/tests: e2e, for "
+# the other steps, one event each ("review_started code" is an event and its kind: split on purpose)
+for s in "main_merged:reviewing" "review_started code:code review" "review_started judge:judge" "e2e_waiting:waiting for the e2e lock" \
+  "pr_opened:waiting for CI" "checks_finished:merging" "job_queued:merging main"; do
+  # shellcheck disable=SC2086
+  ev "$J" 1 ${s%%:*}
+  PR_QUEUE_DIR="$Q" report --db "$FX" --out "$TMP/out/queue-ev.html" >/dev/null
+  assert_contains "step of ${s%%:*}: ${s#*:}" "$(qtext "$TMP/out/queue-ev.html")" "feat/tests: ${s#*:}, for "
+done
+PR_QUEUE_DIR="$TMP/no-such-dir" report --db "$FX" --out "$TMP/out/noq.html" >/dev/null; rc=$?
+assert "A5: no queue state: still exits 0" test "$rc" -eq 0
+NT="$(text "$TMP/out/noq.html")"
+assert_contains "A5: says no queue state at the path" "$NT" "Queue now As of "
+assert_contains "A5: the path" "$NT" "no queue state at $TMP/no-such-dir Headline"
+assert_contains "A5: and the rest of the report renders" "$NT" "Merged branches 5 from 17 review runs"
+assert_contains "A5: to the end" "$NT" "The data stays on this machine"
+assert_contains "no repos yet" "$(text "$OUT")" "Queue now As of "
+assert_contains "no repos yet: said so" "$(text "$OUT")" "No repos in the queue yet. Headline"
 
 echo "-- hints fire"
 assert_contains "all hints fire on the fixture" "$(hints "$OUT")" \
@@ -521,6 +621,11 @@ except ValueError as ex:
 echo "-- compact numbers"
 assert_contains "in full under 10,000, compact from it" "$(py 'print(" ".join(r.compact(v) for v in (9999, 10000, 12345, 999949, 999950, 1000000, 2500000000, 1.5)))')" \
   "9,999 10K 12.3K 999.9K 1M 1M 2.5B 1.50"
+
+echo "-- ago: how long, in the Queue now section"
+assert_contains "seconds, minutes, hours and days, at each boundary" \
+  "$(py 'print(" | ".join(r.ago(v) for v in (-3, 0, 5, 59, 60, 3599, 3600, 86399, 86400, 90000, 172799)))')" \
+  "0 s | 0 s | 5 s | 59 s | 1 min | 59 min | 1 h 00 min | 23 h 59 min | 1 d 0 h | 1 d 1 h | 1 d 23 h"
 
 echo "-- no bytecode in the checkout"
 assert "no __pycache__ in scripts/" test -z "$(find "$ROOT/scripts" -name __pycache__)"

@@ -8,6 +8,8 @@ ST="$ROOT/apps/stats/stats.py"
 export TZ=UTC PR_QUEUE_DIR="$TMP/state"
 unset REVIEW_DIR STATS_EVENTS_FILE CLAUDERAPTOR_STATS_DIR
 export XDG_STATE_HOME="$TMP/xdg" HOME="$TMP/home"
+# Never the committed milestones.json, which gets entries over time: no milestones unless a test gives a file.
+export STATS_MILESTONES_FILE="$TMP/no-milestones.json"
 unset CLAUDE_CONFIG_DIR
 R="$PR_QUEUE_DIR/reviews"; EV="$PR_QUEUE_DIR/events.jsonl"
 mkdir -p "$R" "$PR_QUEUE_DIR/repos/app" "$PR_QUEUE_DIR/repos/tool/failed" "$TMP/out"
@@ -918,7 +920,7 @@ assert_not_contains "A4: a missing file: no warning" "$out" "milestones"
 assert "A4: a missing file: no milestones (the old ones are gone)" test "$(Q9 "SELECT COUNT(*) FROM milestones")" -eq 0
 assert "A4: a missing file: the other tables filled" test "$(Q9 "SELECT COUNT(*) FROM main_commits")" -eq 9
 assert "the committed milestones.json is a list" python3 -I -c 'import json, sys; sys.exit(not isinstance(json.load(open(sys.argv[1])), list))' "$ROOT/apps/stats/milestones.json"
-out="$(PR_QUEUE_DIR="$S9" ingest "$DB9")"
+out="$(STATS_MILESTONES_FILE="" PR_QUEUE_DIR="$S9" ingest "$DB9")"
 assert_not_contains "the committed file: no warning" "$out" "milestones"
 # git that fails only on the rules log: the repo keeps its rows, and the ingest goes on.
 mkdir -p "$TMP/gitstub"

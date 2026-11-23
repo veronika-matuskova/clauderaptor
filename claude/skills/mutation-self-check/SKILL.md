@@ -22,14 +22,17 @@ commit or stop: `git restore` below would also wipe uncommitted work.
   - a fallback (remove the `|| default`);
   - a guard (drop the check, so the code below it always runs);
   - an early return (remove it, so the code goes on).
-- Budget: one mutation per place, at least 11 and at most 29 per branch. With fewer than 11 places, try every
-  one of them. With more than 29, try the 29 riskiest; the rest go under "Not checked" as over the budget.
+- Budget: one mutation per place, up to 29 per branch, so at least 11 whenever there are 11 or more places.
+  With fewer than 11 places, try every one of them, and don't make up mutations that change no behaviour to
+  reach 11. With more than 29, try the 29 riskiest; the rest go under "Not checked" as over the budget.
 - Try them riskiest first.
-- Time limit: 20 minutes of the self-check's own run time, from the start of this step to the end of step 7.
-  Time spent waiting for `selfcheck.lock` doesn't count. Note the time (`date +%s`) when you start and check it
-  before each mutation; to see a run's wait, put `--verbose` after `flock` in step 4's command, and it prints
-  `getting lock took <n> seconds`. When the 20 minutes are up, finish the mutation you're on and stop: the
-  mutations left go under "Not checked: over the time limit".
+- Time limit: 20 minutes of the self-check's own run time. It wins over the budget: when it's up, stop trying
+  new mutations, even if you tried fewer than 11.
+  - Own run time is the time since the start of this step (note `date +%s` then) minus your waits for
+    `selfcheck.lock`. Step 4's command prints each wait (`flock: getting lock took <n> seconds`): add them up
+    and subtract them. Check the time before each mutation.
+  - When the time is up, finish the mutation you're on, with step 6 if no test caught it, then go on to steps 7
+    and 8 as usual. The mutations left go under "Not checked: over the time limit".
 - Skip test files, and skip mutations that don't change behaviour (e.g. reworded comments, renamed locals).
 - This is not the full check: the queue's test review still does that.
 
@@ -47,7 +50,9 @@ Create the folder of `selfcheck.lock` first, because it may not exist yet: `mkdi
 
 Run every test run like this, with a timeout in seconds that fits the tests (e.g. 300):
 
-    flock ~/.local/state/pr-queue/selfcheck.lock ~/code/clauderaptor/scripts/capped.sh timeout <s> <test command>
+    flock --verbose ~/.local/state/pr-queue/selfcheck.lock ~/code/clauderaptor/scripts/capped.sh timeout <s> <test command>
+
+`--verbose` prints how long the run waited for the lock (for the time limit in step 2).
 
 300 is the upper example: use a smaller timeout for one fast test file.
 

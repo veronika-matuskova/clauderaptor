@@ -618,18 +618,29 @@ print(html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", s))).strip())' "
 subs() { python3 -I -B -c 'import re, sys
 s = re.search(r"<section id=\"milestones\".*?</section>", open(sys.argv[1]).read(), flags=re.S).group(0)
 print(s.count("<p class=\"sub\">"))' "$1"; }
+# heads <html file>: the Before and after section's table headings (a repo's name, or All repos), in order
+heads() { python3 -I -B -c 'import html, re, sys
+s = re.search(r"<section id=\"milestones\".*?</section>", open(sys.argv[1]).read(), flags=re.S).group(0)
+print(" | ".join(html.unescape(h) for h in re.findall(r"<h4>(.*?)</h4>", s)))' "$1"; }
 out="$(report --db "$MS" --out "$TMP/out/ms.html")"; rc=$?
 assert "milestones: exits 0" test "$rc" -eq 0
 MT="$(msec "$TMP/out/ms.html")"; MH="$(cat "$TMP/out/ms.html")"
-assert_contains "A7: the milestone, its repo, short commit and time; note A7: its note after them, before the table" "$MT" \
-  "<script>alert(9)</script> app abcdef1, 2026-11-10 12:00 what <i>x</i> changed Before After"
-assert_contains "A7: mutation share, before (17 of 22 categorised) and after (n=3)" "$MT" \
-  "Mutation share of the test reviews' categorised findings 77% (n=22) not enough data (n=3)"
-assert_contains "A7: mutation findings per test review (17 in 6; 1 after)" "$MT" "Mutation findings per test review 2.8 (n=6) not enough data (n=1)"
-assert_contains "A7: the judge confirms test-review findings" "$MT" "Judge confirms: test-review findings 50% (n=6) not enough data (n=2)"
-assert_contains "A7: the judge confirms code-review findings" "$MT" "Judge confirms: code-review findings 20% (n=5) not enough data (n=1)"
-# A5, A6: before b1, b3 (by its round 1), b4 (queued), b5 (ended), b6, b7; after b2 only.
-assert_contains "A5, A6, A7: first-pass yield, 4 of 6 before, 1 after" "$MT" "First-pass yield 67% (n=6) not enough data (n=1)"
+assert_contains "fair A15: the intro says per repo, All repos and what first-pass yield counts" "$MT" \
+  "Before and after A milestone (apps/stats/milestones.json) is a commit on a repo's main. A branch counts by when its first round started, a review by its branch's first round (or its own time, without a job). Each repo with data on either side has its own table (a review's repo, else its branch's); All repos sums them, with the reviews that have no repo. First-pass yield: of the branches whose first round has finished, the share whose first round merged (or ended ready), so a failed first round is not first-pass even when a later round merges. Before: from the previous milestone (or the start); after: to the next one (or now)."
+assert_contains "A7: the milestone, its repo, short commit and time; note A7: its note after them, before the tables" "$MT" \
+  "<script>alert(9)</script> app abcdef1, 2026-11-10 12:00 what <i>x</i> changed app Before After"
+assert "fair A5, A8: a table per repo, by name, then All repos; none for trA, which has no repo" \
+  test "$(heads "$TMP/out/ms.html")" = "app | tool | All repos"
+# app: before b1, b3 and b7 (by their failed round 1) and tr6 (b3's cycle); after b2 and j2 (of b2).
+assert_contains "fair A5: app's own table" "$MT" \
+  "app Before After Mutation findings per test review not enough data (n=1) not enough data (n=0) Surviving mutations, of those the test review tried not enough data (n=0) not enough data (n=0) Judge confirms: test-review findings not enough data (n=0) not enough data (n=2) Judge confirms: code-review findings not enough data (n=0) not enough data (n=1) First-pass yield not enough data (n=3) not enough data (n=1) Mutation share of finding kinds (test reviews) not enough data (n=2) not enough data (n=0) tool Before After"
+# tool: b4, b5, b6 and b6's reviews (tr1-tr5, j1; reviews.repo is empty: their job's repo), all before.
+assert_contains "fair A5: tool's own table, a review's repo from its job" "$MT" \
+  "tool Before After Mutation findings per test review 3.0 (n=5) not enough data (n=0) Surviving mutations, of those the test review tried not enough data (n=0) not enough data (n=0) Judge confirms: test-review findings 50% (n=6) not enough data (n=0) Judge confirms: code-review findings 20% (n=5) not enough data (n=0) First-pass yield not enough data (n=3) not enough data (n=0) Mutation share of finding kinds (test reviews) 75% (n=20) not enough data (n=0) All repos Before After"
+# All repos: before 17 mutation of 22 categorised findings in 6 test reviews, first-pass b1, b4, b5, b6 of 6
+# (b3, b7 not); after trA (no repo: only here, 2 mutation of 3) and b2.
+assert_contains "fair A7, A8, A12: All repos, its six rows in order, the mutation share last; trA only here" "$MT" \
+  "All repos Before After Mutation findings per test review 2.8 (n=6) not enough data (n=1) Surviving mutations, of those the test review tried not enough data (n=0) not enough data (n=0) Judge confirms: test-review findings 50% (n=6) not enough data (n=2) Judge confirms: code-review findings 20% (n=5) not enough data (n=1) First-pass yield 67% (n=6) not enough data (n=1) Mutation share of finding kinds (test reviews) 77% (n=22) not enough data (n=3) later"
 assert_contains "A9: a milestone not on main yet; note A9: with its note" "$MT" "later app 1234567 not merged yet not on main yet"
 assert_contains "the section comes after Review value" "$(grep -o '<section id="[a-z-]*"' "$TMP/out/ms.html" | tr '\n' ' ')" \
   '<section id="review-value" <section id="milestones" <section id="tokens"'
@@ -647,11 +658,31 @@ print(sqlite3.connect(sys.argv[1]).execute("SELECT COUNT(*) FROM pragma_table_in
 out="$(report --db "$MN" --out "$TMP/out/msnonote.html")"; rc=$?
 assert "note A11: no note column: exits 0" test "$rc" -eq 0
 MNT="$(msec "$TMP/out/msnonote.html")"
-assert_contains "note A11: the milestone, without a note" "$MNT" "<script>alert(9)</script> app abcdef1, 2026-11-10 12:00 Before After"
+assert_contains "note A11: the milestone, without a note" "$MNT" "<script>alert(9)</script> app abcdef1, 2026-11-10 12:00 app Before After"
 assert_contains "note A11: the one not on main yet, without a note" "$MNT" "later app 1234567 not on main yet"
 assert "note A11: no note element" test "$(subs "$TMP/out/msnonote.html")" -eq 1
-# fp <db>: the first-pass yield row of its first milestone
-fp() { report --db "$1" --out "$TMP/out/fp.html" >/dev/null; msec "$TMP/out/fp.html" | grep -o 'First-pass yield [^A-Z]*' | head -1; }
+# fp <db>: the first-pass yield row of its first milestone's All repos table
+fp() { report --db "$1" --out "$TMP/out/fp.html" >/dev/null
+  msec "$TMP/out/fp.html" | grep -o 'All repos Before After .*' | grep -o 'First-pass yield [^A-Z]*' | head -1; }
+assert_contains "fair A2: b3 and b7 (round 1 failed, round 2 merged) count once each, not first-pass: 4 of 6" \
+  "$(fp "$MS")" "First-pass yield 67% (n=6) not enough data (n=1)"
+# fp_one <outcome as SQL> <started>: fp of the fixture with one more round-1 job (app), and nothing else changed
+fp_one() { cp "$MS" "$TMP/out/fp1.db"; sql "$TMP/out/fp1.db" "INSERT INTO jobs (job_id, repo, branch, round, started, outcome)
+ VALUES ('n1', 'app', 'feat/n1', 1, '$2', $1);"; fp "$TMP/out/fp1.db"; }
+AFTER=2026-11-10T13:00:00.000Z BEFORE=2026-11-10T11:00:00.000Z
+assert_contains "fair A1, A3: a round 1 failed after the milestone, no later round: counted (n=2, not 1)" \
+  "$(fp_one "'failed'" "$AFTER")" "First-pass yield 67% (n=6) not enough data (n=2)"
+assert_contains "fair A3: the same job with no outcome yet (queued or running): not counted" \
+  "$(fp_one NULL "$AFTER")" "First-pass yield 67% (n=6) not enough data (n=1)"
+assert_contains "fair A1: a round 1 failed before: counted, not first-pass (4 of 7)" \
+  "$(fp_one "'failed'" "$BEFORE")" "First-pass yield 57% (n=7) not enough data (n=1)"
+assert_contains "fair A3: with no outcome, before: not counted (4 of 6)" "$(fp_one NULL "$BEFORE")" "First-pass yield 67% (n=6) not enough data (n=1)"
+assert_contains "fair A4: a round 1 that ended ready: counted, first-pass (5 of 7)" \
+  "$(fp_one "'ready'" "$BEFORE")" "First-pass yield 71% (n=7) not enough data (n=1)"
+assert_contains "fair: a round 1 escalated: counted, not first-pass (4 of 7)" \
+  "$(fp_one "'escalated'" "$BEFORE")" "First-pass yield 57% (n=7) not enough data (n=1)"
+assert_contains "fair: a round 1 merged: counted, first-pass (5 of 7)" \
+  "$(fp_one "'merged'" "$BEFORE")" "First-pass yield 71% (n=7) not enough data (n=1)"
 cp "$MS" "$TMP/out/ms5.db"; sql "$TMP/out/ms5.db" "UPDATE jobs SET started = '2026-11-10T12:00:00.001Z' WHERE job_id = 'b2';"
 assert_contains "A5: started 1 ms after: still after" "$(fp "$TMP/out/ms5.db")" "First-pass yield 67% (n=6) not enough data (n=1)"
 sql "$TMP/out/ms5.db" "UPDATE jobs SET started = '2026-11-10T11:59:59.999Z' WHERE job_id = 'b2';"
@@ -661,8 +692,10 @@ UPDATE jobs SET ended = '2026-11-10T12:20:00.000Z' WHERE job_id = 'b5';"
 assert_contains "A6: queued and ended after: both after" "$(fp "$TMP/out/ms6.db")" "First-pass yield not enough data (n=4) not enough data (n=3)"
 cp "$MS" "$TMP/out/ms6r.db"; sql "$TMP/out/ms6r.db" "UPDATE reviews SET finished = '2026-11-10T11:00:00.000Z' WHERE id = 'trA';"
 report --db "$TMP/out/ms6r.db" --out "$TMP/out/ms6r.html" >/dev/null
-assert_contains "A6: a review without a job written before: before" "$(msec "$TMP/out/ms6r.html")" \
-  "Mutation share of the test reviews' categorised findings 76% (n=25) not enough data (n=0) Mutation findings per test review 2.7 (n=7) not enough data (n=0)"
+MT6="$(msec "$TMP/out/ms6r.html")"
+assert_contains "A6: a review without a job written before: before" "$MT6" \
+  "All repos Before After Mutation findings per test review 2.7 (n=7) not enough data (n=0)"
+assert_contains "A6: its findings too" "$MT6" "Mutation share of finding kinds (test reviews) 76% (n=25) not enough data (n=0) later"
 cp "$MS" "$TMP/out/msq.db"; sql "$TMP/out/msq.db" "INSERT INTO jobs (job_id, repo, branch, round, queued, started, ended, outcome) VALUES
  ('q1', 'app', 'feat/q1', 1, '2026-11-10T11:00:00.000Z', '2026-11-10T12:00:00.000Z', '2026-11-10T12:50:00.000Z', 'merged');"
 assert_contains "A6: queued before the milestone, started at it: after (started comes before queued)" "$(fp "$TMP/out/msq.db")" \
@@ -678,14 +711,73 @@ M2="$TMP/out/ms2.db"; cp "$MS" "$M2"
 sql "$M2" "INSERT INTO jobs (job_id, repo, branch, round, started, ended, outcome) VALUES
  ('b8', 'app', 'feat/b8', 1, '2026-11-10T15:00:00.000Z', '2026-11-10T15:30:00.000Z', 'merged');"
 assert_contains "A8: one milestone: a branch started later is in its after" "$(fp "$M2")" "First-pass yield 67% (n=6) not enough data (n=2)"
-sql "$M2" "INSERT INTO milestones (name, repo, sha, ts) VALUES ('second', 'tool', 'fedcba9876', '2026-11-10T14:00:00.000Z');"
+# A second milestone, and a test review of a repo lib (its reviews.repo, no job) after it. tool's rows are all
+# before the first.
+sql "$M2" "INSERT INTO milestones (name, repo, sha, ts) VALUES ('second', 'tool', 'fedcba9876', '2026-11-10T14:00:00.000Z');
+INSERT INTO reviews (id, job_id, repo, kind, finished) VALUES ('trL', NULL, 'lib', 'tests', '2026-11-10T15:00:00.000Z');"
 report --db "$M2" --out "$TMP/out/ms2.html" >/dev/null
 M2T="$(msec "$TMP/out/ms2.html")"
 assert "note A10: a milestone without a note has no note element" test "$(subs "$TMP/out/ms2.html")" -eq 3
-assert_contains "A8: the first's after ends at the second" "$M2T" "First-pass yield 67% (n=6) not enough data (n=1) second"
-assert_contains "A8: the second's before starts at the first, its after has the later branch" "$M2T" \
-  "second tool fedcba9, 2026-11-10 14:00 Before After Mutation share of the test reviews' categorised findings not enough data (n=3) not enough data (n=0)"
-assert_contains "A8: the second's first-pass yield" "$M2T" "First-pass yield not enough data (n=1) not enough data (n=1) later"
+assert_contains "A8: the first's after ends at the second" "$M2T" \
+  "First-pass yield 67% (n=6) not enough data (n=1) Mutation share of finding kinds (test reviews) 77% (n=22) not enough data (n=3) second"
+assert "fair A6: tool, with rows only before the first, isn't under the second; lib, after the second, only there" \
+  test "$(heads "$TMP/out/ms2.html")" = "app | tool | All repos | app | lib | All repos"
+assert_contains "fair A6: lib, with data only after, shows n=0 before" "$M2T" \
+  "lib Before After Mutation findings per test review not enough data (n=0) not enough data (n=1) Surviving mutations, of those the test review tried not enough data (n=0) not enough data (n=0) Judge confirms: test-review findings not enough data (n=0) not enough data (n=0) Judge confirms: code-review findings not enough data (n=0) not enough data (n=0) First-pass yield not enough data (n=0) not enough data (n=0) Mutation share of finding kinds (test reviews) not enough data (n=0) not enough data (n=0) All repos"
+assert_contains "A8: the second's before starts at the first (b2, j2, trA), its after has the later branch b8" "$M2T" \
+  "second tool fedcba9, 2026-11-10 14:00 app Before After Mutation findings per test review not enough data (n=0) not enough data (n=0) Surviving mutations, of those the test review tried not enough data (n=0) not enough data (n=0) Judge confirms: test-review findings not enough data (n=2) not enough data (n=0) Judge confirms: code-review findings not enough data (n=1) not enough data (n=0) First-pass yield not enough data (n=1) not enough data (n=1) Mutation share of finding kinds (test reviews) not enough data (n=0) not enough data (n=0) lib"
+assert_contains "A8: the second's All repos" "$M2T" \
+  "All repos Before After Mutation findings per test review not enough data (n=1) not enough data (n=1) Surviving mutations, of those the test review tried not enough data (n=0) not enough data (n=0) Judge confirms: test-review findings not enough data (n=2) not enough data (n=0) Judge confirms: code-review findings not enough data (n=1) not enough data (n=0) First-pass yield not enough data (n=1) not enough data (n=1) Mutation share of finding kinds (test reviews) not enough data (n=3) not enough data (n=0) later"
+echo "-- before and after: surviving mutations, per repo"
+# One milestone at 2026-11-10 12:00. Before: 5 test reviews of app without a job that report counts, 12 of 60
+# mutants survived (m1-m4: 2 of 10, m5: 4 of 20); tn, which reports none, of tool's branch jt but with app as its
+# reviews.repo; jt's round 1 merged; a judge ruling with no repo (jn), and one of repo zz with no source. After: a
+# test review of a repo named <b>r</b>.
+MM="$TMP/out/mut.db"; cp "$EMPTY" "$MM"
+sql "$MM" "
+INSERT INTO jobs (job_id, repo, branch, round, started, ended, outcome) VALUES
+ ('jt', 'tool', 'feat/t', 1, '2026-11-09T10:00:00.000Z', '2026-11-09T11:00:00.000Z', 'merged');
+INSERT INTO reviews (id, job_id, repo, kind, mut_tried, mut_caught, mut_survived, finished) VALUES
+ ('m1', NULL, 'app', 'tests', 10, 8, 2, '2026-11-09T10:00:00.000Z'), ('m2', NULL, 'app', 'tests', 10, 8, 2, '2026-11-09T10:00:00.000Z'),
+ ('m3', NULL, 'app', 'tests', 10, 8, 2, '2026-11-09T10:00:00.000Z'), ('m4', NULL, 'app', 'tests', 10, 8, 2, '2026-11-09T10:00:00.000Z'),
+ ('m5', NULL, 'app', 'tests', 20, 16, 4, '2026-11-09T10:00:00.000Z'),
+ ('tn', 'jt', 'app', 'tests', NULL, NULL, NULL, '2026-11-09T11:00:00.000Z'),
+ ('jn', NULL, NULL, 'judge', NULL, NULL, NULL, '2026-11-09T11:00:00.000Z'),
+ ('jz', NULL, 'zz', 'judge', NULL, NULL, NULL, '2026-11-09T11:00:00.000Z'),
+ ('h1', NULL, '<b>r</b>', 'tests', NULL, NULL, NULL, '2026-11-10T13:00:00.000Z');
+INSERT INTO findings (review_id, n, sev_norm, ruling, source) VALUES ('jn', 1, 'blocker', 'confirmed', 'tests'),
+ ('jz', 1, 'blocker', 'confirmed', NULL);
+INSERT INTO milestones (name, repo, sha, ts) VALUES ('mut', 'app', 'aaaaaaa1', '2026-11-10T12:00:00.000Z');"
+out="$(report --db "$MM" --out "$TMP/out/mut.html")"; rc=$?
+assert "surviving mutations: exits 0" test "$rc" -eq 0
+MMT="$(msec "$TMP/out/mut.html")"; MMH="$(cat "$TMP/out/mut.html")"
+assert "fair A8, A13: the repos by name; none for jn (no repo) or zz (a ruling with no source counts nowhere)" \
+  test "$(heads "$TMP/out/mut.html")" = "<b>r</b> | app | tool | All repos"
+assert_contains "fair A9: 12 of 60 mutants survived, n: the 5 reviews with counts (tn, without, left out)" "$MMT" \
+  "app Before After Mutation findings per test review 0.0 (n=6) not enough data (n=0) Surviving mutations, of those the test review tried 20% (12 of 60 mutants, n=5) not enough data (n=0) Judge"
+assert_contains "fair: a review's repo is reviews.repo before its job's: tn under app, not tool; jt's round 1 under tool" "$MMT" \
+  "tool Before After Mutation findings per test review not enough data (n=0) not enough data (n=0) Surviving mutations, of those the test review tried not enough data (n=0) not enough data (n=0) Judge confirms: test-review findings not enough data (n=0) not enough data (n=0) Judge confirms: code-review findings not enough data (n=0) not enough data (n=0) First-pass yield not enough data (n=1) not enough data (n=0)"
+assert_contains "fair A8: jn's ruling (no repo) only in All repos" "$MMT" \
+  "All repos Before After Mutation findings per test review 0.0 (n=6) not enough data (n=1) Surviving mutations, of those the test review tried 20% (12 of 60 mutants, n=5) not enough data (n=0) Judge confirms: test-review findings not enough data (n=1) not enough data (n=0) Judge confirms: code-review findings not enough data (n=0) not enough data (n=0) First-pass yield not enough data (n=1) not enough data (n=0)"
+assert_not_contains "fair A13: the repo name's tag is escaped" "$MMH" "<b>r</b>"
+assert_contains "fair A13: as text" "$MMH" "<h4>&lt;b&gt;r&lt;/b&gt;</h4>"
+# surv <db>: the Surviving mutations row of its first milestone's All repos table
+surv() { report --db "$1" --out "$TMP/out/surv.html" >/dev/null
+  msec "$TMP/out/surv.html" | grep -o 'All repos Before After .*' | grep -o 'Surviving mutations, of those the test review tried [^A-Z]*' | head -1; }
+cp "$MM" "$TMP/out/mut4.db"; sql "$TMP/out/mut4.db" "DELETE FROM reviews WHERE id = 'm5';"
+assert_contains "fair A10: 4 reviews with counts: not enough data" "$(surv "$TMP/out/mut4.db")" \
+  "Surviving mutations, of those the test review tried not enough data (n=4) not enough data (n=0)"
+cp "$MM" "$TMP/out/mut0.db"; sql "$TMP/out/mut0.db" "UPDATE reviews SET mut_tried = 0, mut_caught = 0, mut_survived = 0 WHERE mut_tried IS NOT NULL;"
+out="$(report --db "$TMP/out/mut0.db" --out "$TMP/out/mut0.html")"; rc=$?
+assert "fair A11: 5 reviews with counts, 0 mutants tried: exits 0" test "$rc" -eq 0
+assert_contains "fair A11: and says no mutants tried, with the n" "$(surv "$TMP/out/mut0.db")" \
+  "Surviving mutations, of those the test review tried no mutants tried (n=5) not enough data (n=0)"
+sql "$TMP/out/mut0.db" "UPDATE reviews SET mut_tried = 1 WHERE id = 'm1';"
+assert_contains "fair A11: 1 mutant tried, none survived: a share" "$(surv "$TMP/out/mut0.db")" \
+  "Surviving mutations, of those the test review tried 0% (0 of 1 mutants, n=5) not enough data (n=0)"
+sql "$TMP/out/mut0.db" "UPDATE reviews SET mut_tried = 0 WHERE id = 'm1'; DELETE FROM reviews WHERE id = 'm5';"
+assert_contains "fair A10, A11: 4 reviews, none tried: not enough data comes first" "$(surv "$TMP/out/mut0.db")" \
+  "Surviving mutations, of those the test review tried not enough data (n=4) not enough data (n=0)"
 echo "-- before and after: no milestones, an old db"
 out="$(report --db "$EMPTY" --out "$TMP/out/nomil.html")"; rc=$?
 assert "A9: no milestones: exits 0" test "$rc" -eq 0

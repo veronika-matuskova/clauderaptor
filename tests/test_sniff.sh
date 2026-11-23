@@ -15,11 +15,13 @@ chmod +x "$TMP/bin/claude"
 export PATH="$TMP/bin:$PATH" STATS_EVENTS_FILE="$TMP/ev/none.jsonl"
 
 # The fixture: a.js (120 lines) defines load(); tests/test_x.sh has test_bar; .github/workflows/ci.yml,
-# pkg/__init__.py, _config.yml, README.md. The second commit adds later.sh and
+# pkg/__init__.py, _config.yml, README.md, lib/x.js and src/x.js. The second commit adds later.sh and
 # nonl.txt (3 lines, no final newline).
 R="$TMP/repo"; git init -q -b main "$R"; mkdir -p "$R/tests" "$R/scripts/queue" "$R/.github/workflows"
 echo 'on: push' > "$R/.github/workflows/ci.yml"
 mkdir -p "$R/pkg"; touch "$R/pkg/__init__.py" "$R/_config.yml"; echo '# readme' > "$R/README.md"
+# Two files named x.js: lib/x.js (10 lines) comes first in the tree, src/x.js has 60.
+mkdir -p "$R/lib" "$R/src"; seq 10 > "$R/lib/x.js"; seq 60 > "$R/src/x.js"
 { echo "function load() {}"; for i in $(seq 2 120); do echo "// line $i"; done; } > "$R/a.js"
 printf 'test_bar() { :; }\n' > "$R/tests/test_x.sh"
 echo 'echo x' > "$R/scripts/queue/kept.sh"
@@ -94,6 +96,12 @@ sn 'Compared HEAD~1, HEAD^, origin/main~2, v1.2.3, 24.11.0, python3.11, @scope/p
 assert_contains "revs, versions and npm scopes aren't paths: no flag" "$out" "Flags: 0 hard, 0 soft"
 sn 'Wrote C:\Users\x\gone.txt and C:/Users/x/gone.txt.'
 assert_contains "Windows paths aren't checked" "$out" "Flags: 0 hard, 0 soft"
+sn 'Covered by test_barba here, by test_ba, and `loa()`.'
+assert_contains "a test name that starts with a real one isn't found" "$out" "hard missing reference (line 1): test_barba — git grep doesn't find test_barba"
+assert_contains "a test name that a real one starts with isn't found (whole words)" "$out" "hard missing reference (line 1): test_ba — git grep doesn't find test_ba "
+assert_contains "a name() that a real one starts with isn't found (whole words)" "$out" "hard missing reference (line 1): loa() — git grep doesn't find loa"
+sn 'See x.js:50.'
+assert_contains "two files with the same name: the longest one counts" "$out" "Flags: 0 hard, 0 soft"
 sn 'Proof in test_nothere and test_bar.'
 assert_contains "test_<word> not found is flagged" "$out" "hard missing reference (line 1): test_nothere"
 assert_not_contains "test_<word> found isn't flagged" "$out" "test_bar —"

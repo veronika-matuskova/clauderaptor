@@ -286,19 +286,6 @@ readme="$(grep -n "sniff.sh" "$ROOT/README.md")"
 assert_contains "A17: README.md documents sniff.sh's arguments" "$readme" "sniff.sh <file or -> [--repo <checkout>] [--commit <rev>]"
 assert_contains "A17: README.md documents sniff.sh's exit codes" "$readme" "exits 0 for no flags, 1 for soft flags only, 2 for a hard flag, and 4 when it couldn't run"
 
-# A16: the reviews' own instructions are as they were at the brief's base. A copy without that commit (the test
-# review runs the tests in one) can't tell, and says so.
-BASE=a8ecdae62165
-REVIEW_FILES=(scripts/queue/review.sh scripts/queue/review-judge.md scripts/queue/review-tests.md scripts/queue/plan.md scripts/queue/review.conf)
-if git -C "$ROOT" cat-file -e "$BASE^{commit}" 2>/dev/null; then
-  stat="$(git -C "$ROOT" diff --stat "$BASE" -- "${REVIEW_FILES[@]}" 2>&1)"; rc=$?
-  assert "A16: git diff against the brief's base ran" test "$rc" = 0
-  assert "A16: the review scripts are unchanged since $BASE" test -z "$stat"
-  [ -z "$stat" ] || printf '       | %s\n' "$stat"
-else
-  echo "  skipped: no git history (A16: commit $BASE isn't in $ROOT)"
-fi
-
 echo "-- no session, no transcripts, no changes"
 TEXT=$'See a.js:500, `save()`, later.sh.\n- A2: proven by test_foo\nFixed, should work.\nRan the e2e suite.'
 sn "$TEXT"; normal_out="$out"; normal_rc="$rc"

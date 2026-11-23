@@ -19,6 +19,13 @@ The task above gives the repo, the commit to plan at and the file with the reque
    test to add or run (its file and what it asserts), a command and its expected output, or, only when nothing
    else can show it, a manual check. Include the repo rules the change must keep (its tests, its docs).
    No criterion like "works well" or "code is clean".
+   For each behaviour the change adds, the Check lines also name these tests to add, each with its test file
+   and what it asserts (the patterns of the test rule in `claude/rules/tests.md`):
+   - each boundary: a test on both sides of it;
+   - each error path, fallback, guard and early return: a test that runs it;
+   - each user-visible message, hint and failure reason: a test that asserts its text;
+   - each option the change passes on: a test that checks it arrives where it should.
+   List only the ones the change adds, not those in code it doesn't touch. They apply to every change.
 4. Keep the scope as small as the request allows. List what the agent must not change, and what you left out
    on purpose.
 5. Where the request leaves a choice open that changes the work (two ways to build it, a behaviour nobody

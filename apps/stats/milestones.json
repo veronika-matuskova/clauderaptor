@@ -8,7 +8,7 @@
   {
     "name": "self-check 11-29 (17g)",
     "repo": "clauderaptor",
-    "commit": "e60c57163d44c1f142abf131bcbfff7166558f6f",
-    "note": "The mutation self-check tries about as many mutations as the test review: every behaviour-changing place in the changed code (conditions, boundaries, error paths, fallbacks, guards, early returns), at least 11 and up to 29 per branch, riskiest first, within 20 minutes of its own run time (#52). Before, it was one per changed function, at most 5."
+    "commit": "8178c802f570eb5bd9b267c9c3c92e4b154475f7",
+    "note": "The mutation self-check tries about as many mutations as the test review: every behaviour-changing place in the changed code (conditions, boundaries, error paths, fallbacks, guards, early returns), up to 29 per branch and at least 11 when there are that many, riskiest first, within 20 minutes of its own run time, which wins over the budget (#52, #54). Before, it was one per changed function, at most 5."
   }
 ]

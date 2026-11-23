@@ -364,6 +364,10 @@ bs "$(brief '- Change `export()` in `a.js`, like before.' '- A1: ok. Check: `git
 assert_contains "\"like\" doesn't turn off the left-out check of its line" "$out" "hard left out (line 7): \`export()\` — \`export()\` is also called from \`b.js:12\`"
 bs "$(brief '- Nothing.' '- A1: in a fixture where `c.js` calls it. Check: `tests/test_a.sh`')"
 assert "a fixture marker before a criterion's Check: its names are known" test "$out" = "Flags: 0 hard, 0 soft"
+bs "$(brief '- Nothing.' '- A1: in a fixture where `c.js` calls it. Check: `tests/test_a.sh` runs on `c.js`')"
+assert "a fixture marker before a criterion's Check: its names are known in the Check too" test "$out" = "Flags: 0 hard, 0 soft"
+bs "$(brief '- Nothing.' '- A1: adds `tests/test_new2.sh`. Check: `tests/test_new2.sh`')"
+assert "a file a criterion adds before its Check is known, in the Check too" test "$out" = "Flags: 0 hard, 0 soft"
 bs "$(brief '- Nothing.' '- A1: it runs. Check: the fixture `tests/gone.sh`')"
 assert_contains "a fixture marker in the Check doesn't make the Check known" "$out" "hard no real check (line 10)"
 

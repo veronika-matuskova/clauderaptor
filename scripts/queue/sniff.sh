@@ -546,8 +546,8 @@ def brief_sniff():
         for loc, snip in quoted_pairs(check_text[i] if crit_line else text):
             lm = LOC_RE.match(loc)
             path, a, b = lm.group(1), int(lm.group(2)), int(lm.group(3) or lm.group(2))
-            if not file_like(path) or skipped(path):
-                continue  # a quote of a file the brief adds (not at the commit) is left alone below
+            if not file_like(path):
+                continue  # ($VAR, ~/ and ../ paths have no tracked file either: left alone below, as a file the brief adds)
             cands = tracked(path)
             if not cands or b > max(len(blob_lines(c)) for c in cands):
                 continue  # a missing reference, flagged above

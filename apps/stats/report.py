@@ -21,10 +21,16 @@ Windows user's %LOCALAPPDATA%\\clauderaptor-stats\\stats-profile). The Windows u
 Outside WSL it prints the report's path instead. $STATS_EDGE overrides msedge.exe's path and
 $STATS_WINDOWS_USERS_DIR /mnt/c/Users (for tests).
 "Before and after" (s_milestones) compares, for each milestone (stats.py's milestones table, from
-apps/stats/milestones.json), the period before it with the one after it: the share of the test reviews'
-categorised findings that are mutations (and per test review), the share of the judge's rulings it confirms for
-test-review and for code-review findings (findings.source), and first-pass yield, each with its n; all repos
-count together. A branch counts by its cycle's start (its jobs since its last merge: the round-1 job's started,
+apps/stats/milestones.json), the period before it with the one after it, each with its n: mutation findings per
+test review; surviving mutations, of the mutants the test reviews tried (over the test reviews that report counts,
+mut_tried not NULL; n is those reviews, and with none tried "no mutants tried"); the share of the judge's rulings
+it confirms for test-review and for code-review findings (findings.source); first-pass yield; and the mutation
+share of the test reviews' finding kinds (categorised findings). First-pass yield counts each cycle whose round-1
+job has finished (merged, ready, failed or escalated; one still queued or running isn't counted) and passes it
+when that job merged or ended ready, so a failed round 1 is not first-pass even when a later round merges. Each
+repo with a counted row on either side has its own table (a job's repo is jobs.repo, a review's or ruling's
+reviews.repo, else its job's), and a last table, All repos, sums them, with the reviews and rulings that have no
+repo. A branch counts by its cycle's start (its jobs since its last merge: the round-1 job's started,
 else queued, else ended), and so do its reviews; a review without a job counts by its finished time. A start at
 or after the milestone's time is after. Milestones are sorted by time: before runs from the previous milestone
 (or the beginning of the data), after to the next one (or now). A milestone not on main yet is listed without
@@ -498,44 +504,67 @@ def cycle_starts(db):
     return out
 
 
+# A cycle's round-1 job has finished its first round with one of these outcomes (none yet: queued or running), and
+# passed it with the first two (ready: the PR is left open).
+FINISHED = ("merged", "ready", "failed", "escalated")
+FIRST_PASS = ("merged", "ready")
+
+
 def milestone_numbers(db):
-    """The rows each period counts: (start time, ...) per merged branch, test review, and judge ruling."""
+    """The rows each period counts, each starting (start time, repo): per cycle with a finished round-1 job, test
+    review, and judge ruling on a test- or code-review finding. A job's repo is jobs.repo; a review's (and its
+    rulings') is reviews.repo, else its job's; None: no repo, counted only in all repos."""
     starts = cycle_starts(db)
-    merged = [(starts.get(jid), rnd == 1) for jid, rnd in
-              db.q("SELECT job_id, round FROM jobs WHERE outcome = 'merged' AND round IS NOT NULL")]
-    when = {rid: starts.get(jid) or finished
-            for rid, jid, finished in db.q("SELECT id, job_id, finished FROM reviews")}
-    tests = {}  # test review -> [categorised findings, mutation findings]
-    for rid, in db.q("SELECT id FROM reviews WHERE kind = 'tests'"):
-        tests[rid] = [0, 0]
+    firsts = [(starts.get(jid), repo, outcome in FIRST_PASS) for jid, repo, outcome in
+              db.q("SELECT job_id, repo, outcome FROM jobs WHERE round = 1") if outcome in FINISHED]
+    job_repo = dict(db.q("SELECT job_id, repo FROM jobs"))
+    when, where = {}, {}
+    for rid, jid, repo, finished in db.q("SELECT id, job_id, repo, finished FROM reviews"):
+        when[rid], where[rid] = starts.get(jid) or finished, repo or job_repo.get(jid)
+    tests = {}  # test review -> [categorised findings, mutation findings, mutants tried, mutants survived]
+    for rid, tried, survived in db.q("SELECT id, mut_tried, mut_survived FROM reviews WHERE kind = 'tests'"):
+        tests[rid] = [0, 0, tried, survived]
     for rid, cat in db.q("SELECT f.review_id, f.category FROM findings f JOIN reviews r ON r.id = f.review_id "
                          "WHERE r.kind = 'tests' AND f.category IS NOT NULL"):
         tests[rid][0] += 1
         tests[rid][1] += cat == "mutation"
-    rulings = [(when.get(rid), source, ruling == "confirmed") for rid, source, ruling in
+    rulings = [(when[rid], where[rid], source, ruling == "confirmed") for rid, source, ruling in
                db.q("SELECT f.review_id, f.source, f.ruling FROM findings f JOIN reviews r ON r.id = f.review_id "
-                    "WHERE r.kind = 'judge' AND f.ruling IS NOT NULL")]
-    return merged, [(when.get(rid), c, m) for rid, (c, m) in tests.items()], rulings
+                    "WHERE r.kind = 'judge' AND f.ruling IS NOT NULL AND f.source IN ('tests', 'code')")]
+    return firsts, [(when[rid], where[rid], *t) for rid, t in tests.items()], rulings
 
 
-def period_cells(nums, lo, hi):
-    """The table's cells for the period lo <= start < hi (None: open-ended)."""
-    merged, tests, rulings = nums
-    inside = lambda t: t is not None and (lo is None or t >= lo) and (hi is None or t < hi)  # noqa: E731
-    tr = [(c, m) for t, c, m in tests if inside(t)]
-    cat, mut = sum(c for c, _ in tr), sum(m for _, m in tr)
+def in_period(t, lo, hi):
+    """lo <= t < hi (None: open-ended)."""
+    return t is not None and (lo is None or t >= lo) and (hi is None or t < hi)
+
+
+def period_cells(nums, lo, hi, repo=None):
+    """The table's cells (MILESTONE_ROWS) for the period lo <= start < hi, of one repo (None: all repos)."""
+    firsts, tests, rulings = nums
+    inside = lambda t, r: in_period(t, lo, hi) and (repo is None or r == repo)  # noqa: E731
+    tr = [x[2:] for x in tests if inside(*x[:2])]
+    cat, mut = sum(x[0] for x in tr), sum(x[1] for x in tr)
     per = "not enough data (n=%d)" % len(tr) if len(tr) < MIN_N else "%.1f (n=%d)" % (mut / len(tr), len(tr))
-    cells = [share(mut, cat), per]
+    counts = [(tried, survived) for _, _, tried, survived in tr if tried is not None]
+    tried, survived = sum(x[0] for x in counts), sum(x[1] for x in counts)
+    if len(counts) < MIN_N:
+        surv = "not enough data (n=%d)" % len(counts)
+    elif not tried:
+        surv = "no mutants tried (n=%d)" % len(counts)
+    else:
+        surv = "%.0f%% (%d of %d mutants, n=%d)" % (100.0 * survived / tried, survived, tried, len(counts))
+    cells = [per, surv]
     for src in ("tests", "code"):
-        rs = [ok for t, s, ok in rulings if s == src and inside(t)]
+        rs = [ok for t, r, s, ok in rulings if s == src and inside(t, r)]
         cells.append(share(sum(rs), len(rs)))
-    mg = [fp for t, fp in merged if inside(t)]
-    cells.append(share(sum(mg), len(mg)))
-    return cells
+    fp = [ok for t, r, ok in firsts if inside(t, r)]
+    return cells + [share(sum(fp), len(fp)), share(mut, cat)]
 
 
-MILESTONE_ROWS = ("Mutation share of the test reviews' categorised findings", "Mutation findings per test review",
-                  "Judge confirms: test-review findings", "Judge confirms: code-review findings", "First-pass yield")
+MILESTONE_ROWS = ("Mutation findings per test review", "Surviving mutations, of those the test review tried",
+                  "Judge confirms: test-review findings", "Judge confirms: code-review findings", "First-pass yield",
+                  "Mutation share of finding kinds (test reviews)")
 
 
 def s_milestones(db):
@@ -550,8 +579,11 @@ def s_milestones(db):
                        'apps/stats/milestones.json.</p>', "milestones")
     body = ['<p class="sub">A milestone (apps/stats/milestones.json) is a commit on a repo\'s main. A branch counts '
             'by when its first round started, a review by its branch\'s first round (or its own time, without a '
-            'job), all repos together. Before: from the previous milestone (or the start); after: to the next '
-            'one (or now).</p>']
+            'job). Each repo with data on either side has its own table (a review\'s repo, else its branch\'s); '
+            'All repos sums them, with the reviews that have no repo. First-pass yield: of the branches whose '
+            'first round has finished, the share whose first round merged (or ended ready), so a failed first '
+            'round is not first-pass even when a later round merges. Before: from the previous milestone (or the '
+            'start); after: to the next one (or now).</p>']
     nums = milestone_numbers(db)
     timed = [m[3] for m in ms if m[3]]
     for name, repo, sha, ts, note in ms:
@@ -562,10 +594,13 @@ def s_milestones(db):
             continue
         lo = max((t for t in timed if t < ts), default=None)
         hi = min((t for t in timed if t > ts), default=None)
-        before, after = period_cells(nums, lo, ts), period_cells(nums, ts, hi)
         body.append('<h3>%s <span class="n">%s %s, %s</span></h3>%s' % (
             e(name), e(repo), e(sha[:7]), e(ts[:16].replace("T", " ")), note_p))
-        body.append(table(["", "Before", "After"], [(r, b, a) for r, b, a in zip(MILESTONE_ROWS, before, after)]))
+        repos = sorted({x[1] for rows in nums for x in rows if x[1] and in_period(x[0], lo, hi)})
+        for head, rp in [(r, r) for r in repos] + [("All repos", None)]:
+            before, after = period_cells(nums, lo, ts, rp), period_cells(nums, ts, hi, rp)
+            body.append('<h4>%s</h4>' % e(head))
+            body.append(table(["", "Before", "After"], [(r, b, a) for r, b, a in zip(MILESTONE_ROWS, before, after)]))
     return section("Before and after", "".join(body), "milestones")
 
 

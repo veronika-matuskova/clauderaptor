@@ -4,5 +4,11 @@
     "repo": "clauderaptor",
     "commit": "df22026f211bfa058ca1034b1b0eefd239bb1930",
     "note": "Getting mutation-proof tests right the first time. A test checklist rule (claude/rules/tests.md: messages, both sides of boundaries, options passed on, fallbacks and guards) and the mutation-self-check skill agents run before queueing (#45); the test review gives cosmetic surviving mutations should-fix, not must-fix (#46); the planner writes the four patterns into briefs' Check lines (#47)."
+  },
+  {
+    "name": "self-check 11-29 (17g)",
+    "repo": "clauderaptor",
+    "commit": "e60c57163d44c1f142abf131bcbfff7166558f6f",
+    "note": "The mutation self-check tries about as many mutations as the test review: every behaviour-changing place in the changed code (conditions, boundaries, error paths, fallbacks, guards, early returns), at least 11 and up to 29 per branch, riskiest first, within 20 minutes of its own run time (#52). Before, it was one per changed function, at most 5."
   }
 ]

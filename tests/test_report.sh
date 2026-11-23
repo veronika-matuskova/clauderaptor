@@ -608,8 +608,10 @@ INSERT INTO findings (review_id, n, sev_norm, ruling, source) VALUES ('j2', 1, '
  ('j2', 2, 'blocker', 'confirmed', 'tests'), ('j2', 3, 'blocker', 'rejected', 'code');
 INSERT INTO milestones (name, repo, sha, ts) VALUES
  ('<script>alert(9)</script>', 'app', 'abcdef1234567890', '2026-11-10T12:00:00.000Z'), ('later', 'app', '1234567abc', NULL);"
-# msec <html file>: the visible text of the Before and after section
-msec() { text "$1" | grep -o 'Before and after .* Cost and tokens'; }
+# msec <html file>: the visible text of the Before and after section, and nothing else
+msec() { python3 -I -B -c 'import html, re, sys
+s = re.search(r"<section id=\"milestones\".*?</section>", open(sys.argv[1]).read(), flags=re.S).group(0)
+print(html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", s))).strip())' "$1"; }
 out="$(report --db "$MS" --out "$TMP/out/ms.html")"; rc=$?
 assert "milestones: exits 0" test "$rc" -eq 0
 MT="$(msec "$TMP/out/ms.html")"; MH="$(cat "$TMP/out/ms.html")"
@@ -639,6 +641,12 @@ cp "$MS" "$TMP/out/ms6r.db"; sql "$TMP/out/ms6r.db" "UPDATE reviews SET finished
 report --db "$TMP/out/ms6r.db" --out "$TMP/out/ms6r.html" >/dev/null
 assert_contains "A6: a review without a job written before: before" "$(msec "$TMP/out/ms6r.html")" \
   "Mutation share of the test reviews' categorised findings 76% (n=25) not enough data (n=0) Mutation findings per test review 2.7 (n=7) not enough data (n=0)"
+# A branch merged before the milestone and made again under the same name: its new round 1 starts a new cycle.
+cp "$MS" "$TMP/out/msre.db"; sql "$TMP/out/msre.db" "INSERT INTO jobs (job_id, repo, branch, round, started, ended, outcome) VALUES
+ ('x1', 'app', 'feat/x', 1, '2026-11-09T08:00:00.000Z', '2026-11-09T09:00:00.000Z', 'merged'),
+ ('x2', 'app', 'feat/x', 1, '2026-11-10T13:30:00.000Z', '2026-11-10T14:00:00.000Z', 'merged');"
+assert_contains "a branch merged, then started again after the milestone: its second cycle is after" "$(fp "$TMP/out/msre.db")" \
+  "First-pass yield 71% (n=7) not enough data (n=2)"
 echo "-- before and after: two milestones"
 M2="$TMP/out/ms2.db"; cp "$MS" "$M2"
 sql "$M2" "INSERT INTO jobs (job_id, repo, branch, round, started, ended, outcome) VALUES
@@ -654,12 +662,12 @@ assert_contains "A8: the second's first-pass yield" "$M2T" "First-pass yield not
 echo "-- before and after: no milestones, an old db"
 out="$(report --db "$EMPTY" --out "$TMP/out/nomil.html")"; rc=$?
 assert "A9: no milestones: exits 0" test "$rc" -eq 0
-assert_contains "A9: no milestones: says where to add one" "$(msec "$TMP/out/nomil.html")" \
-  "Before and after No milestones yet: add one to apps/stats/milestones.json. Cost and tokens"
+assert "A9: no milestones: says where to add one, in one line" test "$(msec "$TMP/out/nomil.html")" \
+  = "Before and after No milestones yet: add one to apps/stats/milestones.json."
 cp "$EMPTY" "$TMP/out/nomt.db"; sql "$TMP/out/nomt.db" "DROP TABLE milestones;"
 out="$(report --db "$TMP/out/nomt.db" --out "$TMP/out/nomt.html")"; rc=$?
 assert "A9: a db without the milestones table: exits 0" test "$rc" -eq 0
-assert_contains "A9: and says no data yet" "$(msec "$TMP/out/nomt.html")" "Before and after no data yet Cost and tokens"
+assert "A9: and says no data yet, in one line" test "$(msec "$TMP/out/nomt.html")" = "Before and after no data yet"
 
 echo "-- file URLs"
 py() { python3 -I -B -c 'import importlib.util, sys
@@ -714,26 +722,26 @@ except ValueError as ex:
     print("ValueError", ex)')" "ValueError not a report page"
 
 echo "-- quick links, collapsible sections, the layout and the themes"
-SERVED="$out"; SEC_IDS="queue-now headline rework review-value tokens timeline repos hints data"
+SERVED="$out"; SEC_IDS="queue-now headline rework review-value milestones tokens timeline repos hints data"
 # ids <html> <grep -o pattern> <prefix to cut>: the matches' ids, in order, space-separated
 ids_of() { grep -o "$2" <<<"$1" | sed -E "s/^$3//; s/\".*//" | tr '\n' ' ' | sed 's/ $//'; }
 NAV="$(grep -o '<nav>.*</nav>' "$OUT")"
 assert "A1: one nav" test "$(grep -o '<nav>' "$OUT" | wc -l)" -eq 1
 assert "A1: the nav is before the first section" test "$(grep -bo '<nav>' "$OUT" | cut -d: -f1)" -lt "$(grep -bo '<section ' "$OUT" | head -1 | cut -d: -f1)"
-assert "A1: 9 links in the nav" test "$(grep -o '<a href=' <<<"$NAV" | wc -l)" -eq 9
+assert "A1: 10 links in the nav" test "$(grep -o '<a href=' <<<"$NAV" | wc -l)" -eq 10
 assert "A1: the links' targets are the sections' ids, in order" test "$(ids_of "$NAV" 'href="#[a-z-]*"' 'href="#')" = "$(ids_of "$H" '<section id="[a-z-]*"' '<section id="')"
-assert "A1: the sections are the 9, in order" test "$(ids_of "$H" '<section id="[a-z-]*"' '<section id="')" = "$SEC_IDS"
+assert "A1: the sections are the 10, in order" test "$(ids_of "$H" '<section id="[a-z-]*"' '<section id="')" = "$SEC_IDS"
 NAVT="$(python3 -I -B -c 'import html, re, sys
 n = re.search(r"<nav>(.*?)</nav>", open(sys.argv[1]).read()).group(1)
 n = re.sub(r"<label class=\"palette\"[^>]*>.*?</label>", "", n)  # the theme picker, hidden in the file
 print(html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", n))).strip())' "$OUT")"
 assert_contains "A1: the nav's text (without the hidden theme picker)" "[$NAVT]" \
-  "[Queue now Headline Rework Review value Cost and tokens Timeline By repo What to change Data]"
+  "[Queue now Headline Rework Review value Before and after Cost and tokens Timeline By repo What to change Data]"
 pairs="$(python3 -I -B -c 'import re, sys
 h = open(sys.argv[1]).read()
 links = re.findall(r"<a href=\"#([a-z-]+)\">([^<]*)</a>", re.search(r"<nav>.*?</nav>", h).group(0))
 secs = re.findall(r"<section id=\"([a-z-]+)\"[^>]*><details open><summary><h2>([^<]*)</h2>", h)
-print("same" if links == secs and len(links) == 9 else "differ: %r %r" % (links, secs))' "$OUT")"
+print("same" if links == secs and len(links) == 10 else "differ: %r %r" % (links, secs))' "$OUT")"
 assert_contains "A1: each link's text is its section's title" "$pairs" "same"
 for f in "$OUT" "$QOUT"; do
   while read -r id; do
@@ -741,7 +749,7 @@ for f in "$OUT" "$QOUT"; do
     assert "A2: on a <section> ($(basename "$f"))" test "$(grep -o "<[a-z]* id=\"$id\"" "$f")" = "<section id=\"$id\""
   done < <(grep -o 'href="#[a-z-]*"' "$f" | sed -E 's/href="#//; s/"//')
 done
-assert "A2: the Queue now page has the 9 links too" test "$(grep -o 'href="#' "$QOUT" | wc -l)" -eq 9
+assert "A2: the Queue now page has the 10 links too" test "$(grep -o 'href="#' "$QOUT" | wc -l)" -eq 10
 CSSX="$(py 'print(r.CSS)')"
 # rule <selector> [css]: the declarations of the rules with exactly this selector (media blocks flattened)
 rule() { python3 -I -B -c 'import re, sys
@@ -766,10 +774,10 @@ sec5="$(python3 -I -B -c 'import re, sys
 h = open(sys.argv[1]).read()
 heads = re.findall(r"<section id=\"([a-z-]+)\"(?: class=\"wide\")?><details open><summary><h2>([^<]*)</h2></summary>", h)
 bodies = re.findall(r"<section id=\"[a-z-]+\"[^>]*>(.*?)</section>", h)
-ok = len(bodies) == 9 and all(b.startswith("<details open>") and b.endswith("</details>") and b.count("<details open>") == 1 for b in bodies)
+ok = len(bodies) == 10 and all(b.startswith("<details open>") and b.endswith("</details>") and b.count("<details open>") == 1 for b in bodies)
 print(" ".join(i for i, _ in heads), "|", "bodies inside" if ok else "bodies not inside")' "$OUT")"
-assert_contains "A5: 9 sections, each <details open><summary><h2>, in order" "$sec5" "$SEC_IDS | bodies inside"
-assert "A6: only the 9 section details are open" test "$(grep -o '<details[^>]*>' "$OUT" | grep -vx '<details>' | uniq -c | tr -s ' ')" = " 9 <details open>"
+assert_contains "A5: 10 sections, each <details open><summary><h2>, in order" "$sec5" "$SEC_IDS | bodies inside"
+assert "A6: only the 10 section details are open" test "$(grep -o '<details[^>]*>' "$OUT" | grep -vx '<details>' | uniq -c | tr -s ' ')" = " 10 <details open>"
 assert_contains "A6: the Table details are still there, closed" "$H" "<details><summary>Table</summary>"
 assert "A8: main is 1536px" test "$(decl main max-width)" = 1536px
 assert_not_contains "A8: and nothing is 760px any more" "$CSSX" "max-width:760px"
@@ -830,7 +838,7 @@ assert_contains "A11: the script starts as before" "$SERVED" "<script nonce=\"$N
 assert_contains "A11: and the page ends as before" "$SERVED" "})();</script></body></html>"
 assert_not_contains "A11: the file has no sessionStorage" "$H" "sessionStorage"
 assert_contains "A12: the served page has the nav" "$SERVED" "<nav><a href=\"#queue-now\">Queue now</a>"
-assert "A12: and the 9 open sections" test "$(grep -o '<details open><summary><h2>' <<<"$SERVED" | wc -l)" -eq 9
+assert "A12: and the 10 open sections" test "$(grep -o '<details open><summary><h2>' <<<"$SERVED" | wc -l)" -eq 10
 DEF='.viz-root{color-scheme:light;--surface-1:#fcfcfb;--page:#f9f9f7;--text-primary:#0b0b0b;--text-secondary:#52514e;
 --muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;--border:rgba(11,11,11,.10);--series-1:#2a78d6;--series-2:#eb6834;
 --series-3:#1baf7a;--track:#cde2fb}

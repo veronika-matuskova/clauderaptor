@@ -30,7 +30,7 @@
   it there (open the diff, run the test, read the queue's result), or say that it's the agent's claim and not
   checked. To check a report's or PR body's claims against the commit, run
   `~/code/clauderaptor/scripts/queue/sniff.sh <file or -> [--repo <checkout>] [--commit <sha>]`: it flags missing
-  files, lines, tests and proof, runs the queue's events don't show, and weasel words (exit 0 none, 1 soft, 2 hard).
+  files, lines, tests and proof, runs the queue's events don't show, and weasel words (exit 0 none, 1 soft, 2 hard, 4 it couldn't run).
 - To audit a repo's whole test suite, run `~/code/clauderaptor/scripts/queue/review.sh --suite <checkout>`. It saves
   every finding to a file and prints a summary with the file's path.
 - Shared test infrastructure (a local database stack, a mail catcher, fixed ports) stays one shared instance.

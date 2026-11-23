@@ -42,7 +42,8 @@ heading. The served page remembers collapsed sections across Refresh (the plain 
 a 1200px window the page shows two columns: Queue now, Headline, Cost and tokens, Timeline and By repo span both,
 Rework sits next to Review value and What to change next to Data. Charts never render larger than in one column
 (722px); tables use the section's full width. The theme picker in the link row switches between Default and Iris
-(skydeck's palette, MIT); the served page keeps the choice.
+(skydeck's palette, MIT); the served page keeps the choice in a cookie on 127.0.0.1, so it survives Refresh and a
+new `raptor-stats` run (which gets a new port).
 
 ## Queue now
 

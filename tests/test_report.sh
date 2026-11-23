@@ -663,6 +663,8 @@ assert "A4: at top:0" test "$(decl nav top)" = 0
 assert "A4: over the sections, opaque" test "$(decl nav background)" = "var(--page)"
 assert "A4: a z-index" test -n "$(decl nav z-index)"
 assert "A4: sections clear the nav" test -n "$(decl section scroll-margin-top)"
+assert "A15: the section heading is inline, the marker on its line" test "$(decl 'section>details>summary h2' display)" = inline
+assert "A15: with no margin of its own" test "$(decl 'section>details>summary h2' margin)" = 0
 assert "A4: forced colors: the links are LinkText" grep -q '@media (forced-colors:active){[^@]*nav a{color:LinkText}' <<<"$CSSX"
 sec5="$(python3 -I -B -c 'import re, sys
 h = open(sys.argv[1]).read()
@@ -709,20 +711,23 @@ done
 for bad in zoom "vw" "vh" "clamp(" "scale("; do assert_not_contains "A10: no $bad" "$CSSX" "$bad"; done
 assert_contains "A11: the script keeps collapsed sections in sessionStorage" "$SERVED" 'sessionStorage.getItem(CK)'
 assert_contains "A11: and saves them" "$SERVED" 'sessionStorage.setItem(CK, JSON.stringify(c))'
+assert_contains "A11: the collapsed ones (not the open ones)" "$SERVED" \
+  'for (var j = 0; j < ds.length; j++) if (!ds[j].open) c.push(ds[j].parentNode.id);'
 assert_contains "A11: on each section's toggle" "$SERVED" 'ds[i].addEventListener("toggle", save)'
 assert_contains "A11: of the sections' details" "$SERVED" 'document.querySelectorAll("section > details")'
 assert_contains "A11: closes only the stored sections' ids" "$SERVED" 'if (shut.indexOf(ds[i].parentNode.id) >= 0) ds[i].open = false;'
 pos() { local x="${SERVED%%"$1"*}"; echo "${#x}"; }
 assert "A11/A19: storage code runs before the Refresh check" test "$(pos 'if (!b || !n) return;')" -gt "$(pos 'addEventListener("toggle"')" -a \
-  "$(pos 'if (!b || !n) return;')" -gt "$(pos 'localStorage.getItem')"
+  "$(pos 'if (!b || !n) return;')" -gt "$(pos 'document.cookie.split')"
 untried="$(python3 -I -B -c 'import sys
 ls = sys.stdin.read().split("\n")
 for k, l in enumerate(ls):
-    if "Storage." in l and not ("try {" in l.split("Storage.")[0] or (k and ls[k - 1].rstrip().endswith("try {"))):
+    t = "Storage." if "Storage." in l else "document.cookie" if "document.cookie" in l else None
+    if t and not ("try {" in l.split(t)[0] or (k and ls[k - 1].rstrip().endswith("try {"))):
         print(l)' <<<"$SERVED")"
 assert "A11/A19: every storage call is inside a try" test -z "$untried"
 assert "A11/A19: each try has a catch" test "$(grep -o 'try {' <<<"$SERVED" | wc -l)" -eq "$(grep -o 'catch (x)' <<<"$SERVED" | wc -l)"
-assert "A11/A19: storage calls (5)" test "$(grep -oE '(session|local)Storage\.' <<<"$SERVED" | wc -l)" -eq 5
+assert "A11/A19: storage calls (2 sessionStorage, 2 cookie)" test "$(grep -oE 'sessionStorage\.|document\.cookie' <<<"$SERVED" | wc -l)" -eq 4
 assert_not_contains "A11: no innerHTML" "$SERVED" "innerHTML"
 assert_not_contains "A11: no insertAdjacentHTML or document.write" "$SERVED" "HTML("
 assert_contains "A11: the script starts as before" "$SERVED" "<script nonce=\"$N\">(function () {"
@@ -774,16 +779,27 @@ done
 assert_contains "A17: the source and its licence named" "$CSSX" "skydeck's Iris palette (skydeck, web/style.css, MIT licence)"
 assert_contains "A19: the picker is in the nav, at its end, hidden in the file" "$H" \
   '<a href="#data">Data</a><label class="palette" id="palette-picker" hidden>Theme <select id="palette"><option value="">Default</option><option value="iris">Iris</option></select></label></nav>'
-assert_contains "A19: one localStorage key" "$SERVED" 'PK = "clauderaptor-stats-palette"'
+assert_contains "A19: one cookie name" "$SERVED" 'PK = "clauderaptor-stats-palette"'
 assert "A19: named once" test "$(grep -o 'clauderaptor-stats-palette' <<<"$SERVED" | wc -l)" -eq 1
-assert_contains "A19: read on load, only iris kept" "$SERVED" 'pv = localStorage.getItem(PK) === "iris" ? "iris" : "";'
-assert_contains "A19: saved on change" "$SERVED" 'try { if (v) localStorage.setItem(PK, v); else localStorage.removeItem(PK); } catch (x) {}'
+assert_contains "A19: read on load from the cookie, only iris kept" "$SERVED" \
+  'var cs = document.cookie.split(";");
+    for (i = 0; i < cs.length; i++) if (cs[i].trim() === PK + "=iris") pv = "iris";'
+# A cookie on 127.0.0.1 (no Domain, path=/) is sent to every port, so the next raptor-stats run's server, on a new
+# port, gets it too; localStorage is per port.
+assert_contains "A19: saved on change, for a year, on the whole host, or cleared for Default" "$SERVED" \
+  'try { document.cookie = PK + "=" + (v ? "iris; max-age=31536000" : "; max-age=0") + "; path=/; SameSite=Strict"; } catch (x) {}'
+assert_not_contains "A19: no Domain on the cookie" "$SERVED" "domain="
+assert_not_contains "A19: no localStorage (it is per port)" "$SERVED" "localStorage"
+assert_contains "A19: the picker shows the stored choice" "$SERVED" "palette(pv);
+  if (ps && pw) {
+    ps.value = pv;"
 assert_contains "A19: a change applies only iris" "$SERVED" 'var v = ps.value === "iris" ? "iris" : "";'
 assert_contains "A19: sets only iris, else removes data-palette" "$SERVED" \
   'if (v === "iris") root.setAttribute("data-palette", "iris"); else root.removeAttribute("data-palette");'
 assert "A19: the only setAttribute" test "$(grep -o 'setAttribute(' <<<"$SERVED" | wc -l)" -eq 1
 assert_contains "A19: the script shows the picker" "$SERVED" "pw.hidden = false;"
 assert_not_contains "A19: the file has no localStorage" "$H" "localStorage"
+assert_not_contains "A19: and no cookie code" "$H" "cookie"
 
 echo "-- compact numbers"
 assert_contains "in full under 10,000, compact from it" "$(py 'print(" ".join(r.compact(v) for v in (9999, 10000, 12345, 999949, 999950, 1000000, 2500000000, 1.5)))')" \

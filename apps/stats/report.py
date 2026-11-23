@@ -9,8 +9,9 @@ self-contained (inline CSS and SVG, the logo and icon inlined as data: PNGs, no 
 go to the page's own sections), so opening it makes no network requests. A sticky row of quick links leads to the
 sections, and each section can be collapsed (a <details>, open at first). From a 1200px window the page shows two
 columns; SVG charts never render larger than in the one-column page (722px). Default and Iris (from skydeck) colour
-themes; the served page's script keeps the theme and remembers collapsed sections across Refresh. Like the db it stays on this machine: report.py refuses (exit 2) to write it into a git work tree,
-and writes it 0600, atomically.
+themes; the served page's script keeps the theme (in a cookie, across raptor-stats runs) and remembers collapsed
+sections across Refresh. Like the db it stays on this machine: report.py refuses (exit 2) to write it into a git
+work tree, and writes it 0600, atomically.
 The file has a Refresh button that stays hidden: serve.py serves the page with a script (served_page: a CSP
 nonce) that shows it and asks serve.py, on 127.0.0.1 only, to ingest and rebuild. raptor-stats goes through
 serve.py; report.py --open opens the plain file, without Refresh.
@@ -902,8 +903,10 @@ def csp_served(nonce):
 # The served page's script: shows the button, POSTs /refresh (then reloads, or says why not) and a heartbeat
 # every 60 s, so serve.py stays up while the window is open. Messages go in as text, never as HTML.
 # Before that (so it works without the button): it keeps the collapsed sections' ids in sessionStorage across
-# Refresh, and the theme (Default or Iris) in localStorage. A stored string is only compared with the page's own
-# ids and with "iris"; it never goes into HTML or a selector. Storage errors leave the page working, unsaved.
+# Refresh, and the theme (Default or Iris) in a cookie: serve.py takes a new port each run, and localStorage is
+# per port, a cookie on 127.0.0.1 isn't, so the theme survives a new raptor-stats run. A stored string is only
+# compared with the page's own ids and with "iris"; it never goes into HTML or a selector. Storage errors leave
+# the page working, unsaved.
 SCRIPT = """(function () {
   var T = %s, b = document.getElementById("refresh"), n = document.getElementById("refresh-note");
   var CK = "clauderaptor-stats-collapsed", PK = "clauderaptor-stats-palette", root = document.documentElement;
@@ -925,7 +928,10 @@ SCRIPT = """(function () {
     if (v === "iris") root.setAttribute("data-palette", "iris"); else root.removeAttribute("data-palette");
   }
   var pv = "", ps = document.getElementById("palette"), pw = document.getElementById("palette-picker");
-  try { pv = localStorage.getItem(PK) === "iris" ? "iris" : ""; } catch (x) { pv = ""; }
+  try {
+    var cs = document.cookie.split(";");
+    for (i = 0; i < cs.length; i++) if (cs[i].trim() === PK + "=iris") pv = "iris";
+  } catch (x) { pv = ""; }
   palette(pv);
   if (ps && pw) {
     ps.value = pv;
@@ -933,7 +939,7 @@ SCRIPT = """(function () {
     ps.addEventListener("change", function () {
       var v = ps.value === "iris" ? "iris" : "";
       palette(v);
-      try { if (v) localStorage.setItem(PK, v); else localStorage.removeItem(PK); } catch (x) {}
+      try { document.cookie = PK + "=" + (v ? "iris; max-age=31536000" : "; max-age=0") + "; path=/; SameSite=Strict"; } catch (x) {}
     });
   }
   if (!b || !n) return;

@@ -5,14 +5,18 @@
 
 --db defaults to stats.py's db ($CLAUDERAPTOR_STATS_DIR/stats.db, else
 ${XDG_STATE_HOME:-~/.local/state}/clauderaptor-stats/stats.db), --out to report.html next to it. The page is
-self-contained (inline CSS and SVG, the logo and icon inlined as data: PNGs, no script, no fonts, no links to
-anything), so opening it makes no network requests. Like the db it stays on this machine: report.py refuses (exit 2) to write it into a git work tree,
-and writes it 0600, atomically.
+self-contained (inline CSS and SVG, the logo and icon inlined as data: PNGs, no script, no fonts; the only links
+go to the page's own sections), so opening it makes no network requests. A sticky row of quick links leads to the
+sections, and each section can be collapsed (a <details>, open at first). From a 1200px window the page shows two
+columns; SVG charts never render larger than in the one-column page (722px). Default and Iris (from skydeck) colour
+themes; the served page's script keeps the theme (in a cookie, across raptor-stats runs) and remembers collapsed
+sections across Refresh. Like the db it stays on this machine: report.py refuses (exit 2) to write it into a git
+work tree, and writes it 0600, atomically.
 The file has a Refresh button that stays hidden: serve.py serves the page with a script (served_page: a CSP
 nonce) that shows it and asks serve.py, on 127.0.0.1 only, to ingest and rebuild. raptor-stats goes through
 serve.py; report.py --open opens the plain file, without Refresh.
 --open then opens it in an Edge app window with its own profile (under WSL: msedge.exe through interop, the
-Windows user's %LOCALAPPDATA%\\clauderaptor-stats\\edge-profile). The Windows user is the only one under
+Windows user's %LOCALAPPDATA%\\clauderaptor-stats\\stats-profile). The Windows user is the only one under
 /mnt/c/Users with an Edge folder; with several, name yours (--windows-user or $CLAUDERAPTOR_WINDOWS_USER).
 Outside WSL it prints the report's path instead. $STATS_EDGE overrides msedge.exe's path and
 $STATS_WINDOWS_USERS_DIR /mnt/c/Users (for tests).
@@ -72,7 +76,9 @@ TOP_REASON_SHARE = 0.40
 
 EDGE = "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
 EDGE_FOLDER = ("AppData", "Local", "Microsoft", "Edge")
-PROFILE_FOLDER = ("AppData", "Local", "clauderaptor-stats", "edge-profile")
+# Edge names an app window's taskbar ID after the URL's host and path (not its port) and this folder's name, so
+# the name differs from skydeck's edge-profile: with the same name both windows share one taskbar button.
+PROFILE_FOLDER = ("AppData", "Local", "clauderaptor-stats", "stats-profile")
 HERE = os.path.dirname(os.path.realpath(__file__))
 
 
@@ -363,8 +369,19 @@ def hints(m):
 
 # --- sections -------------------------------------------------------------------------------------------------
 
+# Sections that span both columns of the two-column layout (from a 1200px window); the others sit side by side.
+WIDE = ("queue-now", "headline", "tokens", "timeline", "repos")
+
+
+class Section(str):
+    """A section's HTML, with its title and id, so render() makes the quick links from the sections themselves."""
+
+
 def section(title, body, sid):
-    return '<section id="%s"><h2>%s</h2>%s</section>' % (e(sid), e(title), body)
+    s = Section('<section id="%s"%s><details open><summary><h2>%s</h2></summary>%s</details></section>'
+                % (e(sid), ' class="wide"' if sid in WIDE else "", e(title), body))
+    s.title, s.sid = title, sid
+    return s
 
 
 def s_headline(m):
@@ -884,18 +901,39 @@ CSS = """
 :root[data-theme="dark"] .viz-root{color-scheme:dark;--surface-1:#1a1a19;--page:#0d0d0d;--text-primary:#f0efec;
 --text-secondary:#c3c2b7;--grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--series-1:#3987e5;
 --series-2:#d95926;--series-3:#199e70;--track:#184f95}
+/* Iris: the neutral colours of skydeck's Iris palette (skydeck, web/style.css, MIT licence), light and dark. Like
+   skydeck's palettes it leaves the series colours, the track and forced-colors as they are. Set by
+   <html data-palette="iris">; no attribute is Default (above). */
+:root[data-palette="iris"] .viz-root{--page:#ede6fa;--surface-1:#fcfaff;--text-primary:#241523;
+--text-secondary:#5c4b78;--muted:#8b7ba8;--grid:#e3daf4;--axis:#d3c6ec;--border:#d5c8ee;--accent:#6c47c9}
+@media (prefers-color-scheme:dark){:root[data-palette="iris"]:where(:not([data-theme="light"])) .viz-root{
+--page:#16131f;--surface-1:#241f32;--text-primary:#ece6f2;--text-secondary:#aaa1b9;--muted:#7a7090;--grid:#332c45;
+--axis:#41395a;--border:#4b4364;--accent:#9d7df2}}
+:root[data-palette="iris"][data-theme="dark"] .viz-root{--page:#16131f;--surface-1:#241f32;--text-primary:#ece6f2;
+--text-secondary:#aaa1b9;--muted:#7a7090;--grid:#332c45;--axis:#41395a;--border:#4b4364;--accent:#9d7df2}
 body{margin:0;background:var(--page);color:var(--text-primary);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
-main{max-width:760px;margin:0 auto;padding:24px 16px 48px}
+main{max-width:1536px;margin:0 auto;padding:24px 16px 48px}
 header{display:flex;align-items:center;gap:14px}.logo{width:96px;height:96px;flex:none}
 h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:0 0 12px}h3{font-size:14px;margin:18px 0 6px}
-section{background:var(--surface-1);border:1px solid var(--border);border-radius:8px;padding:16px 18px;margin:16px 0}
+section{background:var(--surface-1);border:1px solid var(--border);border-radius:8px;padding:16px 18px;margin:16px 0;
+scroll-margin-top:64px}
+nav{position:sticky;top:0;z-index:2;background:var(--page);display:flex;flex-wrap:wrap;align-items:center;
+gap:4px 16px;margin:12px 0 0;padding:8px 0}
+nav a{color:var(--accent,var(--text-primary))}.palette{margin-left:auto;color:var(--text-secondary)}
+.palette[hidden]{display:none}.palette select{font:inherit;background:var(--surface-1);color:var(--text-primary);
+border:1px solid var(--axis);border-radius:6px}
+section>details{margin:0}section>details>summary{color:var(--text-primary);font-size:17px;margin:0 0 12px}
+section>details:not([open])>summary{margin:0}section>details>summary::marker{color:var(--accent,var(--text-secondary))}
+section>details>summary h2{display:inline;margin:0}
+@media (min-width:1200px){.sections{display:grid;grid-template-columns:1fr 1fr;column-gap:16px;row-gap:16px;
+align-items:start;margin:16px 0}.sections>section{margin:0;min-width:0}.wide{grid-column:1/-1}}
 .sub,.n,.empty,.legend{color:var(--text-secondary)}.n{font-weight:400;font-size:12px;margin-left:6px}
 .empty{font-style:italic}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px}
 .tile{border:1px solid var(--border);border-radius:8px;padding:10px 12px}
 .tl{color:var(--text-secondary);font-size:12px}.tv{font-size:24px;font-weight:600;margin:2px 0}
 .ts{color:var(--muted);font-size:12px}
-.chart{width:100%;height:auto;display:block}.chart text{font:12px system-ui,-apple-system,"Segoe UI",sans-serif}
+.chart{width:100%;max-width:722px;height:auto;display:block}.chart text{font:12px system-ui,-apple-system,"Segoe UI",sans-serif}
 .lbl,.val{fill:var(--text-primary)}.tick{fill:var(--muted);font-variant-numeric:tabular-nums}
 .grid{stroke:var(--grid);stroke-width:1}.axis{stroke:var(--axis);stroke-width:1}
 .s1{fill:var(--series-1)}.s2{fill:var(--series-2)}.s3{fill:var(--series-3)}.track{fill:var(--track)}
@@ -904,11 +942,11 @@ section{background:var(--surface-1);border:1px solid var(--border);border-radius
 .rule-mark{stroke:var(--series-2);stroke-width:2;stroke-dasharray:4 3}
 .sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
 i.s1{background:var(--series-1)}i.s2{background:var(--series-2)}i.s3{background:var(--series-3)}
-.pair{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media (max-width:640px){.pair{grid-template-columns:1fr}}
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:16px;max-width:722px}@media (max-width:640px){.pair{grid-template-columns:1fr}}
 table{border-collapse:collapse;width:100%;margin:6px 0;font-size:13px}
 th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--grid);overflow-wrap:anywhere}
 th{color:var(--text-secondary);font-weight:600}td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;overflow-wrap:normal}
-details{margin:6px 0}summary{cursor:pointer;color:var(--text-secondary);font-size:12px}
+details{margin:6px 0}summary{cursor:pointer}details details>summary{color:var(--text-secondary);font-size:12px}
 .hints li{margin:6px 0}
 h4{font-size:13px;margin:10px 0 4px;color:var(--text-secondary)}ul.q,ol.q{margin:0;padding-left:22px}
 .q li{margin:2px 0;overflow-wrap:anywhere}.qb{font-weight:600}.decide{color:var(--series-2)}
@@ -916,7 +954,7 @@ h4{font-size:13px;margin:10px 0 4px;color:var(--text-secondary)}ul.q,ol.q{margin
 .refresh button{font:inherit;padding:3px 12px;border:1px solid var(--axis);border-radius:6px;cursor:pointer;
 background:var(--surface-1);color:var(--text-primary)}.refresh button:disabled{opacity:.6;cursor:default}
 .refresh button[hidden]{display:none}
-@media (forced-colors:active){.s1,.s2,.s3{fill:CanvasText}}
+@media (forced-colors:active){.s1,.s2,.s3{fill:CanvasText}nav a{color:LinkText}}
 """
 
 
@@ -937,15 +975,21 @@ def render(dbpath):
     refresh = ('<p class="refresh"><button id="refresh" type="button" hidden>Refresh</button>'
                '<span class="sub">Last ingested: %s.</span><span class="sub" id="refresh-note">%s</span></p>'
                % (e(last_ingested(db, dbpath)), e(FILE_NOTE)))
+    # One link per section, from the same list as the sections: a link targets the <section id> (not its
+    # <details>), so it scrolls to a collapsed section and leaves it collapsed. The theme picker stays hidden in
+    # the file (Default); the served page's script shows it.
+    nav = ('<nav>%s<label class="palette" id="palette-picker" hidden>Theme <select id="palette">'
+           '<option value="">Default</option><option value="iris">Iris</option></select></label></nav>'
+           % "".join('<a href="#%s">%s</a>' % (e(p.sid), e(p.title)) for p in parts))
     return ('<!DOCTYPE html>\n<html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">%s'
             '<link rel="icon" type="image/png" href="%s">'
             '<title>clauderaptor stats</title><style>%s</style></head><body class="viz-root"><main><header>'
             '<img class="logo" src="%s" alt=""><div>'
             '<h1>clauderaptor: how the PR queue is doing</h1><p class="sub">A round is one run of a branch through '
-            'the queue. Shares show their n; below %d they say "not enough data".</p>%s</div></header>%s</main>'
-            '</body></html>\n'
-            % (CSP_META, png_data("icon.png"), CSS, png_data("logo.png"), MIN_N, refresh, "".join(parts)))
+            'the queue. Shares show their n; below %d they say "not enough data".</p>%s</div></header>%s'
+            '<div class="sections">%s</div></main></body></html>\n'
+            % (CSP_META, png_data("icon.png"), CSS, png_data("logo.png"), MIN_N, refresh, nav, "".join(parts)))
 
 
 def csp_served(nonce):
@@ -954,8 +998,46 @@ def csp_served(nonce):
 
 # The served page's script: shows the button, POSTs /refresh (then reloads, or says why not) and a heartbeat
 # every 60 s, so serve.py stays up while the window is open. Messages go in as text, never as HTML.
+# Before that (so it works without the button): it keeps the collapsed sections' ids in sessionStorage across
+# Refresh, and the theme (Default or Iris) in a cookie: serve.py takes a new port each run, and localStorage is
+# per port, a cookie on 127.0.0.1 isn't, so the theme survives a new raptor-stats run. A stored string is only
+# compared with the page's own ids and with "iris"; it never goes into HTML or a selector. Storage errors leave
+# the page working, unsaved.
 SCRIPT = """(function () {
   var T = %s, b = document.getElementById("refresh"), n = document.getElementById("refresh-note");
+  var CK = "clauderaptor-stats-collapsed", PK = "clauderaptor-stats-palette", root = document.documentElement;
+  var ds = document.querySelectorAll("section > details"), i, shut = [];
+  try {
+    shut = JSON.parse(sessionStorage.getItem(CK) || "[]");
+    if (!Array.isArray(shut)) shut = [];
+  } catch (x) { shut = []; }
+  function save() {
+    var c = [];
+    for (var j = 0; j < ds.length; j++) if (!ds[j].open) c.push(ds[j].parentNode.id);
+    try { sessionStorage.setItem(CK, JSON.stringify(c)); } catch (x) {}
+  }
+  for (i = 0; i < ds.length; i++) {
+    if (shut.indexOf(ds[i].parentNode.id) >= 0) ds[i].open = false;
+    ds[i].addEventListener("toggle", save);
+  }
+  function palette(v) {
+    if (v === "iris") root.setAttribute("data-palette", "iris"); else root.removeAttribute("data-palette");
+  }
+  var pv = "", ps = document.getElementById("palette"), pw = document.getElementById("palette-picker");
+  try {
+    var cs = document.cookie.split(";");
+    for (i = 0; i < cs.length; i++) if (cs[i].trim() === PK + "=iris") pv = "iris";
+  } catch (x) { pv = ""; }
+  palette(pv);
+  if (ps && pw) {
+    ps.value = pv;
+    pw.hidden = false;
+    ps.addEventListener("change", function () {
+      var v = ps.value === "iris" ? "iris" : "";
+      palette(v);
+      try { document.cookie = PK + "=" + (v ? "iris; max-age=31536000" : "; max-age=0") + "; path=/; SameSite=Strict"; } catch (x) {}
+    });
+  }
   if (!b || !n) return;
   if (/[?&]k=/.test(location.search)) history.replaceState(null, "", "/?t=" + T);
   function post(p) { return fetch(p, {method: "POST", headers: {"X-Raptor-Token": T}, cache: "no-store"}); }

@@ -11,6 +11,7 @@ unset REVIEW_DIR STATS_EVENTS_FILE CLAUDERAPTOR_STATS_DIR CLAUDERAPTOR_WINDOWS_U
 # Never the real ~/.claude: stats.py ingest reads transcripts from $HOME/.claude/projects by default.
 export HOME="$TMP/home"; unset CLAUDE_CONFIG_DIR
 export STATS_EDGE="$TMP/no-edge/msedge.exe" STATS_WINDOWS_USERS_DIR="$TMP/users"  # never the real Edge
+export STATS_MILESTONES_FILE="$TMP/no-milestones.json"  # never the committed milestones.json
 mkdir -p "$PR_QUEUE_DIR" "$TMP/out"
 
 report() { python3 -I -B "$RP" "$@" 2>&1; }

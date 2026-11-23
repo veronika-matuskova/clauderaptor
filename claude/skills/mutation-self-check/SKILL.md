@@ -1,6 +1,6 @@
 ---
 name: mutation-self-check
-description: Run a small mutation check of your own changed code, in this session, before `pr-queue.sh add`. Use it every time you are about to queue a branch.
+description: Run a mutation check of your own changed code, in this session, before `pr-queue.sh add`. Use it every time you are about to queue a branch.
 ---
 
 Check that the tests of your change catch real bugs, before the queue's test review does. Do it yourself, in
@@ -11,22 +11,33 @@ this session, one step at a time. The machine is WSL with 8 GB and other agents 
 Commit all your work first. Then check that `git status --porcelain` prints nothing. If it prints anything,
 commit or stop: `git restore` below would also wipe uncommitted work.
 
-## 2. Pick a small budget
+## 2. List the places and pick the budget
 
-- List the functions your branch changed: `git diff main...HEAD` (or the branch's base).
-- One mutation per changed function, of one of these kinds:
+- Read what your branch changed: `git diff main...HEAD` (or the branch's base).
+- List every place in the changed non-test code that changes behaviour. Each of these is a place to mutate,
+  and one function can have several:
   - a condition (negate it, `&&` to `||`, drop a clause);
   - a boundary (`<` to `<=`, a limit off by one);
   - an error path (skip the error, return success, drop the message);
-  - a fallback (remove the `|| default`, the guard or the early return).
-- At most 5 mutations per branch. Pick the riskiest functions first.
+  - a fallback (remove the `|| default`);
+  - a guard (drop the check, so the code below it always runs);
+  - an early return (remove it, so the code goes on).
+- Budget: one mutation per place, at least 11 and at most 29 per branch. With fewer than 11 places, try every
+  one of them. With more than 29, try the 29 riskiest; the rest go under "Not checked" as over the budget.
+- Try them riskiest first.
+- Time limit: 20 minutes of the self-check's own run time, from the start of this step to the end of step 7.
+  Time spent waiting for `selfcheck.lock` doesn't count. Note the time (`date +%s`) when you start and check it
+  before each mutation; to see a run's wait, put `--verbose` after `flock` in step 4's command, and it prints
+  `getting lock took <n> seconds`. When the 20 minutes are up, finish the mutation you're on and stop: the
+  mutations left go under "Not checked: over the time limit".
 - Skip test files, and skip mutations that don't change behaviour (e.g. reworded comments, renamed locals).
 - This is not the full check: the queue's test review still does that.
 
 ## 3. Fast tests only
 
-- Run only unit tests and the repo's shell tests, and only the ones that cover the mutated code (one test
-  file, or a name filter).
+- Run only unit tests and the repo's shell tests. Each run uses the smallest test set that covers the mutated
+  code (one test file, or a name filter), so a run takes seconds: the machine is WSL with 8 GB, and while your
+  runs hold `selfcheck.lock` (step 4), the other agents' self-checks wait.
 - Never run e2e tests (Playwright, a browser, a database stack). Code that only e2e tests cover is reported
   as not checked, and left to the queue's review.
 
@@ -37,6 +48,8 @@ Create the folder of `selfcheck.lock` first, because it may not exist yet: `mkdi
 Run every test run like this, with a timeout in seconds that fits the tests (e.g. 300):
 
     flock ~/.local/state/pr-queue/selfcheck.lock ~/code/clauderaptor/scripts/capped.sh timeout <s> <test command>
+
+300 is the upper example: use a smaller timeout for one fast test file.
 
 This lock is only for self-checks, so it doesn't hold up the queue's e2e runs. Run the tests once without a
 mutation first: they must pass, or the check means nothing.
@@ -74,8 +87,10 @@ Read the result:
 
 Add this to your report:
 
+- Places: how many places step 2 found and how many you tried, e.g. `34 places, 29 tried`. When you tried
+  every one (e.g. a change with fewer than 11), write `N places, all tried`, e.g. `7 places, all tried`.
 - Tried: each mutation, as file, function and what changed.
 - Caught: which mutations, and by which test.
 - Tests added: the tests you added or fixed, for the mutations that weren't caught.
 - Not checked: the mutations or functions you didn't check, and why (only e2e covers it, over the budget,
-  or the run was stopped: not checked with 137 / out of memory / 124 / 125).
+  over the time limit, or the run was stopped: not checked with 137 / out of memory / 124 / 125).

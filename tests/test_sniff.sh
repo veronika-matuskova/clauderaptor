@@ -14,14 +14,15 @@ EOF
 chmod +x "$TMP/bin/claude"
 export PATH="$TMP/bin:$PATH" STATS_EVENTS_FILE="$TMP/ev/none.jsonl"
 
-# The fixture: a.js (120 lines) defines load(); tests/test_x.sh has test_bar. The second commit adds later.sh.
+# The fixture: a.js (120 lines) defines load(); tests/test_x.sh has test_bar. The second commit adds later.sh and
+# nonl.txt (3 lines, no final newline).
 R="$TMP/repo"; git init -q -b main "$R"; mkdir -p "$R/tests" "$R/scripts/queue"
 { echo "function load() {}"; for i in $(seq 2 120); do echo "// line $i"; done; } > "$R/a.js"
 printf 'test_bar() { :; }\n' > "$R/tests/test_x.sh"
 echo 'echo x' > "$R/scripts/queue/kept.sh"
 echo 'gone from the working tree' > "$R/deleted.txt"
 git -C "$R" add -A; git -C "$R" commit -q -m one; OLD="$(git -C "$R" rev-parse HEAD)"
-echo 'echo later' > "$R/later.sh"; git -C "$R" add -A; git -C "$R" commit -q -m two
+echo 'echo later' > "$R/later.sh"; printf 'one\ntwo\nthree' > "$R/nonl.txt"; git -C "$R" add -A; git -C "$R" commit -q -m two
 SHA="$(git -C "$R" rev-parse HEAD)"
 rm "$R/deleted.txt"; echo untracked > "$R/untracked.txt"   # the working tree differs from the commit
 
@@ -41,6 +42,9 @@ sn $'Last line a.js:120, one past it a.js:121, a range a.js:110-130.'
 assert_not_contains "the last line isn't flagged" "$out" "a.js:120 —"
 assert_contains "one past the last line is flagged" "$out" "a.js:121 — a.js:121, but a.js has 120 lines"
 assert_contains "a range past the last line is flagged" "$out" "a.js:110-130 —"
+sn $'Last line nonl.txt:3, one past it nonl.txt:4.'
+assert_not_contains "no final newline: the last line isn't flagged" "$out" "nonl.txt:3 —"
+assert_contains "no final newline: one past the last line is flagged" "$out" "nonl.txt:4 — nonl.txt:4, but nonl.txt has 3 lines"
 sn 'Wrote `untracked.txt`.'
 assert_contains "A2: untracked file is a missing reference" "$out" "hard missing reference (line 1): untracked.txt"
 assert "A2: untracked: exit 2" test "$rc" = 2
@@ -61,6 +65,10 @@ echo "-- references left alone"
 sn $'Rules in ~/.claude/rules and logs in /tmp/x.log.\nEvents: $STATE/events.jsonl and ${PR_QUEUE_DIR}/x.\nSee https://example.com/a.js and `<branch>-<sha>-sniff.md`.\nTests: tests/test_*.sh\nNew script `scripts/queue/new.sh`.\n`skills/x/SKILL.md` is in another repo.'
 assert_contains "A6: references not meant to be in the tree: no flags" "$out" "Flags: 0 hard, 0 soft"
 assert "A6: exit 0" test "$rc" = 0
+for m in "Will add" "This adds" "To create" "It creates" "A new file:" "Lives in the other repo:" "Kept in the target repo:" "Lives outside the repo:" "We add"; do
+  sn "$m \`scripts/queue/nothere.sh\`."
+  assert_contains "marker \"$m\": a missing file on that line isn't flagged" "$out" "Flags: 0 hard, 0 soft"
+done
 sn 'Added `scripts/queue/new.sh`.'
 assert_contains "\"added\" isn't a marker: still checked" "$out" "hard missing reference (line 1): scripts/queue/new.sh"
 
@@ -70,6 +78,9 @@ assert_contains "A3: missing proof names A2 and test_foo" "$out" "hard missing p
 assert_not_contains "A3: A1's proof found: no flag" "$out" "(line 1)"
 assert_contains "A3: one hard flag" "$out" "Flags: 1 hard, 0 soft"
 assert "A3: exit 2" test "$rc" = 2
+sn $'- A1: proven by "line 7"\n- A2: proven by "no such line anywhere"'
+assert_not_contains "a quoted proof found at the commit: no flag" "$out" "(line 1)"
+assert_contains "a quoted proof not at the commit: hard missing proof" "$out" "hard missing proof (line 2): - A2: proven by \"no such line anywhere\" — A2's proof no such line anywhere isn't found"
 sn $'- A1: the gate, in tests/nothere.sh'
 assert_contains "a criterion's test file that isn't there is missing proof" "$out" "hard missing proof (line 1)"
 sn $'- A1: proven by test_bar\n- A3: it works\n\nNot proven: none'
@@ -102,6 +113,8 @@ STATS_EVENTS_FILE="$(ev checks-fail.jsonl "{\"event\": \"checks_finished\", \"sh
 assert_contains "A8: checks fail: hard" "$out" "hard run that didn't happen (line 1): All tests pass. — checks_finished result=fail"
 STATS_EVENTS_FILE="$(ev checks-pass.jsonl "{\"event\": \"checks_finished\", \"sha\": \"$SHA\", $J, \"result\": \"pass\"}")" sn 'All tests pass.'
 assert_contains "A8: checks pass: no flag" "$out" "Flags: 0 hard, 0 soft"
+STATS_EVENTS_FILE="$(ev checks-both.jsonl "{\"event\": \"checks_finished\", \"sha\": \"$SHA\", $J, \"result\": \"fail\"}" "{\"event\": \"checks_finished\", \"sha\": \"$SHA\", \"job_id\": \"j2\", \"result\": \"pass\"}")" sn 'All tests pass.'
+assert_contains "checks fail and pass at the same sha: hard" "$out" "hard run that didn't happen (line 1): All tests pass. — checks_finished result=fail"
 sn 'All tests pass.'
 assert_contains "A8: no checks record: soft no record" "$out" "soft run that didn't happen (line 1): All tests pass. — no record of the checks"
 
@@ -110,6 +123,10 @@ sn 'Fixed, should work now.'
 assert_contains "A9: weasel words in a claim: soft" "$out" "soft weasel words (line 1): Fixed, should work now."
 assert_contains "A9: no hard flag" "$out" "Flags: 0 hard, 1 soft"
 assert "A9: exit 1" test "$rc" = 1
+for w in "should work" "probably" "seems to" "robust" "comprehensive"; do
+  sn "Done: the fix is $w here."
+  assert_contains "weasel word \"$w\" in a done-claim: soft" "$out" "soft weasel words (line 1): Done: the fix is $w here. — \"$w\" in a claim"
+done
 sn 'this probably needs a cache later'
 assert_contains "A9: weasel word in a line that claims nothing: no flag" "$out" "Flags: 0 hard, 0 soft"
 
@@ -143,6 +160,13 @@ assert "A12: unknown commit: exit 4" test "$rc" = 4
 assert_contains "A12: unknown commit: message on stderr" "$err" "no such commit"
 err="$(bash "$S" --repo "$R" 2>&1 >/dev/null)"; rc=$?
 assert "bad arguments: exit 4" test "$rc" = 4
+
+echo "-- the rule and the README"
+assert_contains "A15: the rule in claude/rules/pr-queue.md: a set of claims" "$(git -C "$ROOT" grep -n "set of claims" -- claude/rules/pr-queue.md)" "main session that runs the queue: an agent's report is a set of claims"
+assert_contains "A15: the rule names sniff.sh" "$(git -C "$ROOT" grep -n "sniff.sh" -- claude/rules/pr-queue.md)" "scripts/queue/sniff.sh"
+readme="$(git -C "$ROOT" grep -n "sniff.sh" -- README.md)"
+assert_contains "A17: README.md documents sniff.sh's arguments" "$readme" "sniff.sh <file or -> [--repo <checkout>] [--commit <rev>]"
+assert_contains "A17: README.md documents sniff.sh's exit codes" "$readme" "exits 0 for no flags, 1 for soft flags only, 2 for a hard flag, and 4 when it couldn't run"
 
 echo "-- no session, no transcripts, no changes"
 TEXT=$'See a.js:500, `save()`, later.sh.\n- A2: proven by test_foo\nFixed, should work.\nRan the e2e suite.'

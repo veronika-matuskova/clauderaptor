@@ -279,12 +279,191 @@ assert_contains "an error in the sniff itself: message on stderr" "$err" "the sn
 err="$(bash "$S" --repo "$R" 2>&1 >/dev/null)"; rc=$?
 assert "bad arguments: exit 4" test "$rc" = 4
 
+echo "-- brief mode (--brief)"
+# The brief fixture: commit C1 has a.js (defines export(), line 3 is "return 1") and b.js (calls it at lines 12
+# and 14). HEAD adds a test, a doc and migrations that use them, a bash caller (lib.sh, run.sh), tests/run.sh,
+# and m0.js (defines many()) with 12 files that call it.
+BR="$TMP/brepo"; git init -q -b main "$BR"
+printf 'function export() {\n  // body\n  return 1\n}\n' > "$BR/a.js"
+{ for i in $(seq 11); do echo "// line $i"; done; echo "export();"; echo "// 13"; echo "export();"; } > "$BR/b.js"
+git -C "$BR" add -A; git -C "$BR" commit -q -m one; C1="$(git -C "$BR" rev-parse HEAD)"
+mkdir -p "$BR/tests/migrations" "$BR/db/migrations" "$BR/spec"
+printf '#!/usr/bin/env bash\nnode a.js\n' > "$BR/tests/test_a.sh"; echo 'echo ALL PASSED' > "$BR/tests/run.sh"
+printf '# Docs\nCall export() to export.\n' > "$BR/README.md"
+echo 'select export();' > "$BR/db/migrations/001.sql"; echo 'select export();' > "$BR/tests/migrations/002.sql"
+echo 'export();' > "$BR/spec/test_e.js"; printf '# notes\nexport() in tests\n' > "$BR/tests/notes.md"
+printf 'load_it() { :; }\n' > "$BR/lib.sh"; printf '#!/usr/bin/env bash\n. ./lib.sh\nload_it\nload_it\n' > "$BR/run.sh"
+echo 'function many() {}' > "$BR/m0.js"; for i in $(seq 12); do echo 'many();' > "$BR/m$i.js"; done
+git -C "$BR" add -A; git -C "$BR" commit -q -m two; BSHA="$(git -C "$BR" rev-parse HEAD)"
+# bs <text> [args...]: sniffs the text in brief mode at the brief fixture's HEAD (or --commit); out, rc.
+bs() { local t="$1"; shift; printf '%s\n' "$t" > "$TMP/brief.md"; out="$(bash "$S" "$TMP/brief.md" --brief --repo "$BR" "$@" 2>&1)"; rc=$?; }
+# brief <requirements> <criteria> [out of scope]: a brief with those sections (from lines 7, 10, 13 of it)
+brief() { printf '# Brief: x\n\n## Request\nDo x.\n\n## Requirements\n%s\n\n## Acceptance criteria\n%s\n\n## Out of scope\n%s\n' "$1" "$2" "${3:-- nothing}"; }
+OK_CRIT='- A1: it runs. Check: `tests/test_a.sh`'
+
+T="$(brief '- Add `tests/test_new.sh`.' '- A1: it runs. Check: `tests/test_new.sh`')"
+bs "$T"; brief_out="$out"; brief_rc="$rc"
+printf '%s\n' "$T" > "$TMP/brief.md"; plain_out="$(bash "$S" "$TMP/brief.md" --repo "$BR" 2>&1)"
+assert "A1: --brief: no flag" test "$brief_out" = "Flags: 0 hard, 0 soft"
+assert "A1: --brief: exit 0" test "$brief_rc" = 0
+assert "A1: without --brief: part 1's flags" test "$plain_out" = "hard missing proof (line 10): - A1: it runs. Check: \`tests/test_new.sh\` — A1's proof tests/test_new.sh isn't found at ${BSHA:0:12}
+Flags: 1 hard, 0 soft"
+err="$(bash "$S" "$TMP/brief.md" --nope --repo "$BR" 2>&1 >/dev/null)"; rc=$?
+assert "A1: an unknown option: exit 4" test "$rc" = 4
+assert_contains "A1: the usage names --brief" "$err" "sniff: unknown option --nope. usage: sniff.sh <file or -> [--brief] [--repo <checkout>] [--commit <rev>]"
+from_stdin="$(printf '%s\n' "$T" | bash "$S" - --brief --repo "$BR" 2>&1)"
+assert "brief mode reads stdin too" test "$from_stdin" = "$brief_out"
+
+bs "$(brief '- `gone.js` exists and is changed.' "$OK_CRIT")"
+assert_contains "A2: a file the Requirements say exists, not at the commit" "$out" "hard missing reference (line 7): gone.js — gone.js isn't in the tree at ${BSHA:0:12}"
+assert "A2: exit 2" test "$rc" = 2
+
+ADDS='- Add `tests/test_new.sh`, `sniff.md` and `sniff.conf`.'
+USES='- `sniff.md` holds the flags; `sniff.conf` holds the limits.'
+bs "$(brief "$ADDS"$'\n'"$USES" '- A1: it runs. Check: `tests/test_new.sh`')"
+assert "A3: files the brief adds: no flag on any line, a Check included" test "$out" = "Flags: 0 hard, 0 soft"
+bs "$(brief "$USES" '- A1: it runs. Check: `tests/test_new.sh`')"
+assert_contains "A3: without the line that adds them: sniff.md" "$out" "hard missing reference (line 7): sniff.md — sniff.md isn't in the tree"
+assert_contains "A3: without it: sniff.conf" "$out" "hard missing reference (line 7): sniff.conf — sniff.conf isn't in the tree"
+assert_contains "A3: without it: tests/test_new.sh in the Check" "$out" "hard missing reference (line 10): tests/test_new.sh — tests/test_new.sh isn't in the tree"
+assert_contains "A3: without it: the Check can't run" "$out" "hard no real check (line 10): - A1: it runs. Check: \`tests/test_new.sh\` — A1's Check names nothing that can run"
+bs "$(brief '- `sniff.md` holds the flags.' '- A1: adds a new check. Check: `tests/gone_new.sh`')"
+assert_contains "a marker word in a criterion doesn't make its Check known" "$out" "hard missing reference (line 10): tests/gone_new.sh"
+
+FIX='- The test uses fixture files `c.js`, `d.js:12` and `db/migrations/009.sql`.'
+bs "$(brief "$FIX"$'\n''- `c.js` and `d.js:12` show the left-out check.' '- A1: `test_old` becomes `test_new` in `c.js`, from `save()`. Check: `tests/test_a.sh`')"
+assert "A4: fixture and planned names: no flag" test "$out" = "Flags: 0 hard, 0 soft"
+bs "$(brief '- Change `c.js`, `d.js:12`, `db/migrations/009.sql`, test_old and test_new.' "$OK_CRIT")"
+for n in "c.js — c.js isn't in the tree" "d.js:12 — d.js isn't in the tree" "db/migrations/009.sql —" "test_old — git grep doesn't find test_old" "test_new — git grep doesn't find test_new"; do
+  assert_contains "A4: given as existing code in Requirements: ${n%% *} flagged" "$out" "hard missing reference (line 7): $n"
+done
+for m in "e.g." "for example" "a stub" "such as" "like"; do
+  bs "$(brief "- Names $m \`c.js\`."$'\n''- `c.js` again.' "$OK_CRIT")"
+  assert "fixture marker \"$m\": the name is known on every line" test "$out" = "Flags: 0 hard, 0 soft"
+done
+bs "$(brief '- Nothing.' '- A1: in a fixture where `c.js` calls it. Check: `tests/test_a.sh`')"
+assert "a fixture marker before a criterion's Check: its names are known" test "$out" = "Flags: 0 hard, 0 soft"
+bs "$(brief '- Nothing.' '- A1: it runs. Check: the fixture `tests/gone.sh`')"
+assert_contains "a fixture marker in the Check doesn't make the Check known" "$out" "hard no real check (line 10)"
+
+bs "$(brief '- Nothing.' $'- A2: it works well\n- A3: the page renders. Check: the page looks right\n- A4: it runs. Check: `nosuchcmd x`')"
+assert_contains "A5: no Check: hard, names A2" "$out" "hard no real check (line 10): - A2: it works well — A2 has no Check"
+assert_contains "A5: a Check of prose: hard, names A3" "$out" "hard no real check (line 11): - A3: the page renders. Check: the page looks right — A3's Check names nothing that can run"
+assert_contains "A5: a command no one has: hard" "$out" "hard no real check (line 12): - A4: it runs. Check: \`nosuchcmd x\` — A4's Check names nothing that can run"
+assert_contains "A5: three hard flags" "$out" "Flags: 3 hard, 0 soft"
+assert "A5: exit 2" test "$rc" = 2
+bs "$(brief '- Nothing.' $'- A1: a list:\n  - one\n\n  Check: `tests/test_a.sh`')"
+assert "a Check indented under a blank line is the criterion's" test "$out" = "Flags: 0 hard, 0 soft"
+bs "$(brief '- Nothing.' $'- A1: a list:\n  - one\n\nCheck: `tests/test_a.sh`')"
+assert_contains "a line after a blank line, not indented, isn't the criterion's" "$out" "hard no real check (line 10): - A1: a list: — A1 has no Check"
+bs "$(brief '- Nothing.' $'- A1: a list:\n## Out\nCheck: `tests/test_a.sh`')"
+assert_contains "a heading ends the criterion" "$out" "A1 has no Check"
+bs "$(brief '- Nothing.' $'- A1: a list:\n  - one\n\n\n  Check: `tests/test_a.sh`')"
+assert_contains "two blank lines end the criterion" "$out" "A1 has no Check"
+
+for c in '`tests/test_a.sh`' '`tests/run.sh`' '`git grep -n x`' '`a.js:3`' 'tests/test_a.sh' '**Check:** `tests/run.sh`'; do
+  bs "$(brief '- Nothing.' "- A1: it runs. Check: $c")"
+  assert "A6: a Check of $c: no flag" test "$out" = "Flags: 0 hard, 0 soft"
+done
+bs "$(brief '- Add `tests/test_new.sh`.' '- A1: it runs. Check: `bash tests/test_new.sh -v`')"
+assert "A6: a command whose first word... a test the brief adds, as a command's argument" test "$out" = "Flags: 0 hard, 0 soft"
+bs "$(brief '- Add `tests/test_new.sh`.' '- A1: it runs. Check: `tests/test_new.sh -v`')"
+assert "A6: a command whose first word is a file the brief adds" test "$out" = "Flags: 0 hard, 0 soft"
+bs "$(brief '- Nothing.' '- A1: it runs. Check: `a.js:99`')"
+assert_contains "a file:line past the end can't run" "$out" "hard no real check (line 10)"
+assert_contains "a file:line past the end: also a missing reference" "$out" "hard missing reference (line 10): a.js:99 — a.js:99, but a.js has 4 lines"
+bs "$(brief '- Nothing.' '- A1: it runs. Check: `git grep -n "gone.md"`')"
+assert "a command's arguments aren't checked in a Check" test "$out" = "Flags: 0 hard, 0 soft"
+
+for m in "manual: open the page" "open it manually" "by hand: open the page"; do
+  bs "$(brief '- Nothing.' "- A1: the page renders. Check: $m")"
+  assert_contains "A7: an explicit manual Check ($m): soft" "$out" "soft manual check (line 10): - A1: the page renders. Check: $m — A1's Check is manual: nothing runs it"
+  assert_contains "A7: soft only" "$out" "Flags: 0 hard, 1 soft"
+  assert "A7: exit 1" test "$rc" = 1
+done
+bs "$(brief '- Nothing.' '- A1: the page renders. Check: by hand, and `tests/test_a.sh`')"
+assert "a manual Check that also names a test: no flag" test "$out" = "Flags: 0 hard, 0 soft"
+
+P1=$'- Fixed, it should work.\n- `tests/run.sh` ends with ALL PASSED.'
+T8="$(brief "$P1" $'- A1: it runs. Check: `tests/run.sh`\n- A2: it is complete. Check: `tests/test_a.sh`\n\nNot proven: none\n- A3: e2e passed. Check: `tests/run.sh`')"
+bs "$T8"
+assert_not_contains "A8: --brief: no missing proof" "$out" "missing proof"
+assert_not_contains "A8: --brief: no run that didn't happen" "$out" "run that didn't happen"
+assert_not_contains "A8: --brief: no weasel words" "$out" "weasel words"
+assert "A8: --brief: no flag at all" test "$out" = "Flags: 0 hard, 0 soft"
+printf '%s\n' "${T8/it is complete. Check: \`tests\/test_a.sh\`/it is complete}" > "$TMP/brief.md"
+plain="$(bash "$S" "$TMP/brief.md" --repo "$BR" 2>&1)"
+assert_contains "A8: without --brief: missing proof (Not proven: none)" "$plain" "hard missing proof (line 12): - A2: it is complete — Not proven: none (line 14)"
+assert_contains "A8: without --brief: run that didn't happen" "$plain" "soft run that didn't happen (line 8)"
+assert_contains "A8: without --brief: weasel words" "$plain" "soft weasel words (line 7)"
+
+LO="$(brief '- Change `export()` in `a.js`.' '- A1: ok. Check: `git grep -n export`')"
+bs "$LO" --commit "$C1"
+assert "A9: exactly one left-out flag, its text (and b.js:14, the same file, not flagged: A12)" test "$out" = "hard left out (line 7): \`export()\` — \`export()\` is also called from \`b.js:12\`: in scope or out?
+Flags: 1 hard, 0 soft"
+assert "A9: exit 2" test "$rc" = 2
+bs "$(brief '- Change `export()` in `a.js`.' '- A1: ok. Check: `git grep -n export`' '- `b.js` stays as it is.')" --commit "$C1"
+assert "A9: b.js named in Out of scope: no flag" test "$out" = "Flags: 0 hard, 0 soft"
+bs "$(brief '- Change the docs.' '- A1: ok. Check: `git grep -n export`' '- `export()` in `a.js`.')" --commit "$C1"
+assert "A9: export() only in Out of scope: no flag" test "$out" = "Flags: 0 hard, 0 soft"
+bs "$(brief '- Change `export()` in `a.js`, e.g. `b.js`.' '- A1: ok. Check: `git grep -n export`')" --commit "$C1"
+assert "a file named on a fixture line counts as named" test "$out" = "Flags: 0 hard, 0 soft"
+bs "$(brief '- `export()`, for example.' '- A1: ok. Check: `git grep -n export`')" --commit "$C1"
+assert "a name on a fixture line isn't a changed name" test "$out" = "Flags: 0 hard, 0 soft"
+
+bs "$LO"
+assert_contains "A10: a caller"    "$out" "hard left out (line 7): \`export()\` — \`export()\` is also called from \`b.js:12\`: in scope or out?"
+assert_contains "A10: a test, under tests/" "$out" "hard left out (line 7): \`a.js\` — \`a.js\` is also used by the test \`tests/test_a.sh:2\`: in scope or out?"
+assert_contains "A10: a test, named test_*" "$out" "\`export()\` is also used by the test \`spec/test_e.js:1\`"
+assert_contains "A10: a doc"       "$out" "hard left out (line 7): \`export()\` — \`export()\` is also named in the doc \`README.md:2\`: in scope or out?"
+assert_contains "A10: a migration" "$out" "hard left out (line 7): \`export()\` — \`export()\` is also used by the migration \`db/migrations/001.sql:1\`: in scope or out?"
+assert_contains "a migration under tests/ is a migration (the first kind that fits)" "$out" "is also used by the migration \`tests/migrations/002.sql:1\`"
+assert_contains "a .md under tests/ is a test" "$out" "is also used by the test \`tests/notes.md:2\`"
+assert_contains "A10: seven left-out flags" "$out" "Flags: 7 hard, 0 soft"
+bs "$(brief '- Change `a.js` and `a.js:1`.' '- A1: ok. Check: `git grep -n export`')"
+assert "two spellings of a file are one changed name" test "$(grep -c 'tests/test_a.sh:2' <<<"$out")" = 1
+
+bs "$(brief '- Change `load_it()` in `lib.sh`.' "$OK_CRIT")"
+assert_contains "A11: a bash call without parentheses is a caller" "$out" "hard left out (line 7): \`load_it()\` — \`load_it()\` is also called from \`run.sh:3\`: in scope or out?"
+assert_not_contains "A11: one flag per file, at the first line" "$out" "run.sh:4"
+assert_contains "a changed file's caller" "$out" "\`lib.sh\` is also used by \`run.sh:2\`: in scope or out?"
+
+MANY='- Change `many()` in `m0.js`.'
+bs "$(brief "$MANY" "$OK_CRIT" '- `m11.js` and `m12.js`.')"
+assert "A12: 10 left-out references: 10 flags" test "$(grep -c '^hard left out' <<<"$out")" = 10
+assert_not_contains "A12: 10: no \"more\" line" "$out" "more left-out"
+bs "$(brief "$MANY" "$OK_CRIT" '- `m12.js`.')"
+assert "A12: 11: 10 flags" test "$(grep -c '^hard left out' <<<"$out")" = 10
+assert_contains "A12: 11: one line says 1 more" "$out" "(1 more left-out reference was not listed)"
+assert_contains "A12: 11: the Flags line counts the listed ones" "$out" "Flags: 10 hard, 0 soft"
+bs "$(brief "$MANY" "$OK_CRIT")"
+assert_contains "12: 2 more, plural" "$out" "(2 more left-out references were not listed)"
+
+C1_CRIT='- A1: ok. Check: `git grep -n x`'
+bs "$(brief '- `b.js:12` says `export()`, and `b.js:13`: `// 13`.' "$C1_CRIT")" --commit "$C1"
+assert_not_contains "A13: the quoted text is on that line: no flag" "$out" "quoted line"
+bs "$(brief '- `a.js:3` says `return 2`.' "$C1_CRIT")" --commit "$C1"
+assert_contains "A13: the quoted text isn't on that line: hard" "$out" "hard quoted line (line 7): a.js:3 \`return 2\` — line 3 of a.js doesn't have \`return 2\` at ${C1:0:12}"
+assert "A13: exit 2" test "$rc" = 2
+bs "$(brief '- a.js:3 has `return 2`, and `a.js:1-3` holds `return 1`.' "$C1_CRIT")" --commit "$C1"
+assert_contains "a bare file:line before a quote is checked" "$out" "hard quoted line (line 7): a.js:3 \`return 2\`"
+assert_not_contains "a range holds the quote on one of its lines" "$out" "a.js:1-3"
+bs "$(brief '- `a.js:3`, `return 2` and (`a.js:2`). Then `x`.' "$C1_CRIT")" --commit "$C1"
+assert_not_contains "a quote after a comma, or after a closing bracket, isn't the line's" "$out" "quoted line"
+bs "$(brief '- `a.js:9` says `return 2`.' "$C1_CRIT")" --commit "$C1"
+assert_not_contains "a file:line past the end: a missing reference, not a quoted line" "$out" "quoted line"
+assert_contains "a file:line past the end: missing reference" "$out" "hard missing reference (line 7): a.js:9"
+assert "brief mode: the stub claude was never called" test ! -e "$TMP/claude-calls"
+
 echo "-- the rule and the README"
 assert_contains "A15: the rule in claude/rules/pr-queue.md: a set of claims" "$(grep -n "set of claims" "$ROOT/claude/rules/pr-queue.md")" "main session that runs the queue: an agent's report is a set of claims"
 assert_contains "A15: the rule names sniff.sh" "$(grep -n "sniff.sh" "$ROOT/claude/rules/pr-queue.md")" "scripts/queue/sniff.sh"
 readme="$(grep -n "sniff.sh" "$ROOT/README.md")"
 assert_contains "A17: README.md documents sniff.sh's arguments" "$readme" "sniff.sh <file or -> [--repo <checkout>] [--commit <rev>]"
 assert_contains "A17: README.md documents sniff.sh's exit codes" "$readme" "exits 0 for no flags, 1 for soft flags only, 2 for a hard flag, and 4 when it couldn't run"
+assert_contains "README.md documents --brief" "$readme" "With \`--brief\`, it sniffs a brief instead"
+assert_contains "README.md's Planner item names the brief's sniff" "$(grep -n "^- Planner:" "$ROOT/README.md")" "saved next to the brief as \`<brief>-sniff.md\`"
+assert_contains "the rule: show the sniff flags with the brief" "$(grep -n "sniff flags" "$ROOT/claude/rules/pr-queue.md")" "Show the user the brief, its open questions and its sniff flags"
 
 echo "-- no session, no transcripts, no changes"
 TEXT=$'See a.js:500, `save()`, later.sh.\n- A2: proven by test_foo\nFixed, should work.\nRan the e2e suite.'

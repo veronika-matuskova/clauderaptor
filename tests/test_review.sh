@@ -1,4 +1,5 @@
 # shellcheck shell=bash
+# shellcheck disable=SC2016  # the briefs hold backticks on purpose
 # Tests for review.sh: a stub `claude` that records how it was called and prints a canned JSON result.
 # shellcheck source=tests/lib.sh
 source "$(dirname "$0")/lib.sh"
@@ -16,26 +17,43 @@ mkdir -p "$STUB"
 # $STUB/result: the review text to return; $STUB/fail: exit 1 instead; $STUB/hook: a script to run first.
 # $STUB/slow_stop: on TERM, take 0.5 s to end. Logs its cwd and args (and removes neither, so a test can tell
 # whether it ran), and copies the system prompt file it is given to $STUB/sysprompt. $STUB/json: print it
-# instead of the canned JSON.
+# instead of the canned JSON. Each call n (from 1) also logs its args and stdin on their own, to
+# $STUB/calls/<n>.args and <n>.stdin, and its JSON has "session_id": "sess-<n>" ($STUB/nosid: none). A call
+# with --resume (a plan's round) returns $STUB/result2 if there is one, runs $STUB/hook2 instead of
+# $STUB/hook, fails with $STUB/fail2 and prints $STUB/json2 if there is one.
 cat > "$TMP/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 [ -f "$STUB/slow_stop" ] && trap 'sleep 0.5; exit 1' TERM
+n=$(( $(cat "$STUB/calls/n" 2>/dev/null || echo 0) + 1 )); mkdir -p "$STUB/calls"; echo "$n" > "$STUB/calls/n"
 pwd > "$STUB/cwd"; printf '%s\n' "$@" > "$STUB/args"; readlink /proc/$$/fd/0 > "$STUB/stdin"
+cp "$STUB/args" "$STUB/calls/$n.args"; cp "$STUB/stdin" "$STUB/calls/$n.stdin"
 prev=""; for a in "$@"; do [ "$prev" = --append-system-prompt-file ] && cp "$a" "$STUB/sysprompt"; prev="$a"; done
+round=""; case " $* " in *" --resume "*) round=1 ;; esac
+result="$STUB/result"; if [ -n "$round" ] && [ -f "$STUB/result2" ]; then result="$STUB/result2"; fi
 [ -f "$STUB/fail" ] && exit 1
-[ -f "$STUB/hook" ] && bash "$STUB/hook"
+if [ -n "$round" ]; then
+  [ -f "$STUB/fail2" ] && exit 1
+  [ -f "$STUB/hook2" ] && bash "$STUB/hook2"
+  [ -f "$STUB/json2" ] && exec cat "$STUB/json2"
+else
+  [ -f "$STUB/hook" ] && bash "$STUB/hook"
+fi
 [ -f "$STUB/json" ] && exec cat "$STUB/json"
-python3 -I -c 'import json, sys; print(json.dumps({"result": open(sys.argv[1]).read(), "total_cost_usd": 0.42, "duration_ms": 61000}))' "$STUB/result"
+sid="sess-$n"; [ -f "$STUB/nosid" ] && sid=""
+python3 -I -c 'import json, sys
+d = {"result": open(sys.argv[1]).read(), "total_cost_usd": 0.42, "duration_ms": 61000}
+if sys.argv[2]: d["session_id"] = sys.argv[2]
+print(json.dumps(d))' "$result" "$sid"
 EOF
-# timeout: logs the limit it was given ($STUB/timeout), then runs the real one.
+# timeout: logs the limit it was given ($STUB/timeout, and one line per call in $STUB/timeouts), then runs the real one.
 REAL_TIMEOUT="$(command -v timeout)"; export REAL_TIMEOUT
 cat > "$TMP/bin/timeout" <<'EOF'
 #!/usr/bin/env bash
-echo "$1 $2 $3" > "$STUB/timeout"
+echo "$1 $2 $3" > "$STUB/timeout"; echo "$1 $2 $3" >> "$STUB/timeouts"
 exec "$REAL_TIMEOUT" "$@"
 EOF
 chmod +x "$TMP/bin/claude" "$TMP/bin/timeout"
-rv() { rm -f "$STUB/args" "$STUB/sysprompt"; PATH="$TMP/bin:$PATH" bash "$ROOT/scripts/queue/review.sh" "$@" 2>&1; echo "exit=$?"; }
+rv() { rm -rf "$STUB/args" "$STUB/sysprompt" "$STUB/calls" "$STUB/timeouts"; PATH="$TMP/bin:$PATH" bash "$ROOT/scripts/queue/review.sh" "$@" 2>&1; echo "exit=$?"; }
 # commit: a new commit on the worktree's branch, so the next review isn't a cached one
 commit() { git -C "$W" commit -q --allow-empty -m "change $1"; sha="$(git -C "$W" rev-parse --short=12 HEAD)"; }
 
@@ -663,6 +681,7 @@ brief_text() {  # brief_text <verdict> [section to leave out]
     [ "$h" = "${2:-}" ] && continue
     printf '\n## %s\n' "$h"
     if [ "$h" = "Acceptance criteria" ]; then printf -- '- A1: notes are saved. Check: tests/test_notes.sh\n'
+    elif [ "$h" = Requirements ]; then echo "- Add tests/test_notes.sh, for the notes page."
     else echo "- text"; fi
   done
   printf '\nVerdict: %s\n' "$1"
@@ -672,7 +691,7 @@ M="$TMP/repo"; msha="$(git -C "$M" rev-parse --short=12 HEAD)"
 brief_text ready > "$STUB/result"
 echo "echo x >> '$M/tracked.txt'" > "$STUB/hook"
 out="$(rv --plan "$M" "$TMP/request.md")"; rm "$STUB/hook"; git -C "$M" checkout -q tracked.txt
-bfile="$(find "$BRIEF_DIR" -name "repo-$msha-*.md" | head -1)"
+bfile="$(find "$BRIEF_DIR" -name "repo-$msha-*.md" ! -name '*-sniff.md' | head -1)"
 assert_contains "plan: ready -> exit 0"       "$out" "exit=0"
 assert_contains "plan: prints the brief"      "$out" "A1: notes are saved."
 assert_contains "plan: names the saved file"  "$out" "(saved to $bfile)"
@@ -703,8 +722,16 @@ assert_contains "plan: the repo's rules"      "$(cat "$STUB/sysprompt")" "Base r
 assert_contains "plan: the user's rules"      "$(cat "$STUB/sysprompt")" "User rule: keep changes minimal."
 assert_contains "plan: a sidecar"             "$(sc "${bfile%.md}.json" '[d["kind"], d["verdict"], d["exit"], d["level"]]')" '["plan", "ready", 0, null]'
 assert "plan: not a review file"              test -z "$(find "$REVIEW_DIR" -name "repo-$msha-*")"
+assert "A14: no flags: exactly one claude call" test "$(cat "$STUB/calls/n")" = 1
+assert_contains "A14: the sniff file"         "$(cat "${bfile%.md}-sniff.md")" "Flags: 0 hard, 0 soft"
+assert_contains "A14: no requests sent"       "$(cat "${bfile%.md}-sniff.md")" $'## Requests sent to the planner\n\nnone'
+assert_contains "A14: names the sniff file, after the brief and before the brief's file" "$out" \
+  $'Flags: 0 hard, 0 soft\n(sniff saved to '"${bfile%.md}-sniff.md)"$'\n(saved to '"$bfile)"
+assert "A16: one brief and its sniff, the sniff never taken for a brief" test "$(find "$BRIEF_DIR" -name "repo-$msha-*.md" | wc -l)" = 2
 brief_text questions > "$STUB/result"; out="$(rv --plan "$M" "$TMP/request.md")"
 assert_contains "plan: open questions -> exit 1" "$out" "exit=1"
+assert "A14: questions: one claude call"      test "$(cat "$STUB/calls/n")" = 1
+assert_contains "A14: questions: the sniff file printed" "$out" "(sniff saved to "
 assert_contains "plan: says so"               "$out" "the brief has open questions for the user"
 qfile="$(sed -n 's/^(saved to \(.*\))$/\1/p' <<<"$out")"
 assert "plan: each brief a file of its own"   test "$qfile" != "$bfile"
@@ -712,6 +739,10 @@ assert_contains "plan: a sidecar's verdict questions" "$(sc "${qfile%.md}.json" 
 brief_text ready Risk > "$STUB/result"; out="$(rv --plan "$M" "$TMP/request.md")"
 assert_contains "plan: a missing section -> exit 2" "$out" "exit=2"
 assert_contains "plan: names it"              "$out" "the brief has no Risk (saved to"
+rfile="$(sed -n 's/.*the brief has no Risk (saved to \(.*\))$/\1/p' <<<"$out")"
+assert "A26: a missing section: the brief is saved" test -f "$rfile"
+assert "A26: a missing section: no sniff file" test ! -e "${rfile%.md}-sniff.md"
+assert_not_contains "A26: a missing section: no sniff printed" "$out" "sniff"
 brief_text ready | sed 's/A1:/AA:/' > "$STUB/result"; out="$(rv --plan "$M" "$TMP/request.md")"
 assert_contains "plan: no A1 -> exit 2"       "$out" "exit=2"
 assert_contains "plan: says the criteria are missing" "$out" "the brief has no the criteria A1…"
@@ -719,6 +750,7 @@ brief_text ready | sed 's/- A1:/- **A1:**/' > "$STUB/result"
 assert_contains "plan: a bold A1 counts"      "$(rv --plan "$M" "$TMP/request.md")" "exit=0"
 brief_text ready | grep -v Verdict > "$STUB/result"; out="$(rv --plan "$M" "$TMP/request.md")"
 assert_contains "plan: no verdict -> exit 2"  "$out" "no verdict in the brief"
+assert_not_contains "plan: no verdict: no sniff" "$out" "sniff"
 brief_text ready > "$STUB/result"
 echo "git -C '$M' commit -q --allow-empty -m moved" > "$STUB/hook"
 out="$(rv --plan "$M" "$TMP/request.md")"; rm "$STUB/hook"
@@ -735,6 +767,171 @@ assert_contains "plan: in a worktree, named after its repo" "$(rv --plan "$W" "$
 git -C "$M" checkout -q --detach
 assert_contains "plan: a detached HEAD is fine" "$(rv --plan "$M" "$TMP/request.md")" "exit=0"
 git -C "$M" checkout -q main
+# --- the brief's sniff (sniff.sh --brief) and its round with the planner ---
+# The fixture: a.js defines export(), b.js:12 calls it. pbrief <out of scope> [verdict] [extra requirement]
+P="$TMP/prepo"; git init -q -b main "$P"
+printf 'function export() {}\n' > "$P/a.js"; { for i in $(seq 11); do echo "// $i"; done; echo 'export();'; } > "$P/b.js"
+git -C "$P" add -A; git -C "$P" commit -q -m one; psha="$(git -C "$P" rev-parse --short=12 HEAD)"
+pbrief() {
+  printf '# Brief: export\n\n## Request\n- Change export.\n\n## Requirements\n- Change `export()` in `a.js`.\n%s\n' "${3:-}"
+  printf '\n## Acceptance criteria\n- A1: export works. Check: `git grep -n export`\n\n## Out of scope\n- %s\n' "$1"
+  printf '\n## Risk\n- Low.\n\n## Open questions\n- none\n\nVerdict: %s\n' "${2:-ready}"
+}
+LEFT='`export()` is also called from `b.js:12`: in scope or out?'
+pv() { rv --plan "$P" "$TMP/request.md"; }
+saved_of() { sed -n 's/^(saved to \(.*\))$/\1/p' <<<"$1"; }
+arg_after() { sed -n "/^$1\$/{n;p}" "$2"; }
+rm -f "$STUB/result2" "$STUB/fail2" "$STUB/hook2" "$STUB/json2" "$STUB/nosid"
+
+pbrief nothing > "$STUB/result"; pbrief '`b.js` stays as it is.' > "$STUB/result2"
+out="$(pv)"; pfile="$(saved_of "$out")"; c2="$STUB/calls/2.args"
+assert "A17: a left-out flag: a second call" test "$(cat "$STUB/calls/n")" = 2
+assert "A17: the round resumes the first call's session" test "$(arg_after --resume "$c2")" = sess-1
+assert "A17: the first call isn't a resume" test -z "$(arg_after --resume "$STUB/calls/1.args")"
+assert "A17: the same --model" test "$(arg_after --model "$c2")" = "$(arg_after --model "$STUB/calls/1.args")"
+assert "A17: --model opus" test "$(arg_after --model "$c2")" = opus
+assert "A17: the same --effort (high)" test "$(arg_after --effort "$c2")" = high
+assert "A17: --safe-mode" grep -qx -- --safe-mode "$c2"
+assert "A17: the same system prompt file" test "$(arg_after --append-system-prompt-file "$c2")" = "$(arg_after --append-system-prompt-file "$STUB/calls/1.args")"
+assert "A17: no edit tools" test "$(arg_after --disallowed-tools "$c2")" = "Edit,Write,NotebookEdit"
+assert "A17: JSON output" test "$(arg_after --output-format "$c2")" = json
+assert_contains "A17: no stdin" "$(cat "$STUB/calls/2.stdin")" "/dev/null"
+assert "A17: both calls under timeout -k 30 1800" test "$(cat "$STUB/timeouts")" = $'-k 30 1800\n-k 30 1800'
+rp="$(cat "$c2")"
+assert_contains "A17: the prompt names the claim and where it is" "$rp" "- hard left out (line 9): \`export()\` — $LEFT"
+assert_contains "A17: the prompt names b.js:12 and asks in scope or out" "$rp" "\`b.js:12\`: in scope or out?"
+assert_contains "A17: the answer wanted" "$rp" "Wanted: a scope decision: name the file in Requirements (in scope) or in Out of scope (out)"
+assert_contains "A17: no new requirement or finding" "$rp" "Add no new requirement or finding"
+assert_contains "A17: the whole revised brief back" "$rp" "reply with the whole revised brief"
+assert_contains "the prompt names the saved brief" "$rp" "the saved brief, $pfile"
+assert_contains "A19: the answer settles it: exit 0" "$out" "exit=0"
+assert_contains "A19: the saved brief is the answer" "$(cat "$pfile")" "- \`b.js\` stays as it is."
+assert "A19: the brief file is the title and the answer" test "$(tail -n +3 "$pfile")" = "$(cat "$STUB/result2")"
+sfile="${pfile%.md}-sniff.md"
+assert_contains "A19: the sniff file lists the request sent" "$(cat "$sfile")" $'## Requests sent to the planner\n\n- hard left out (line 9): `export()` — '"$LEFT"
+assert_contains "A19: the sniff file: no flag left" "$(cat "$sfile")" $'## Flags\n\nFlags: 0 hard, 0 soft'
+assert_not_contains "A19: no hard flag left: no line" "$out" "hard flag"
+assert_contains "A24: the title adds up both calls" "$(head -1 "$pfile")" "# Brief for prepo at $psha (cost \$0.84, 122 s, opus at high effort)"
+assert_contains "A24: the sidecar: cost and time of both, the first session" "$(sc "${pfile%.md}.json" '[d["cost_usd"], d["duration_ms"], d["session_id"], d["exit"]]')" '[0.84, 122000, "sess-1", 0]'
+
+pbrief nothing > "$STUB/result2"; out="$(pv)"; pfile="$(saved_of "$out")"; sfile="${pfile%.md}-sniff.md"
+assert "A21: an answer that still has flags: exactly two calls" test "$(cat "$STUB/calls/n")" = 2
+assert_contains "A20: the output marks it unanswered" "$out" "hard left out, unanswered (line 9): \`export()\` — $LEFT"
+assert_contains "A20: so does the sniff file" "$(cat "$sfile")" "hard left out, unanswered (line 9)"
+assert "A20: the brief file is the planner's text, nothing added" test "$(tail -n +3 "$pfile")" = "$(cat "$STUB/result2")"
+assert_contains "A20: exit 1" "$out" "exit=1"
+assert_contains "A20: says how many are left" "$out" "the brief's sniff has 1 hard flag left"
+assert_contains "A20: after the brief's file" "$out" $'(saved to '"$pfile)"$'\nthe brief\'s sniff has 1 hard flag left'
+pbrief nothing questions > "$STUB/result"; pbrief nothing questions '- And `gone.js`.' > "$STUB/result2"; out="$(pv)"
+assert_contains "two hard flags left: plural" "$out" "the brief's sniff has 2 hard flags left"
+assert_contains "questions and flags left: both lines" "$out" $'the brief has open questions for the user\nthe brief\'s sniff has 2 hard flags left\nexit=1'
+
+pbrief nothing > "$STUB/result"; pbrief '`b.js` stays.' > "$STUB/result2"
+touch "$STUB/nosid"; out="$(pv)"; rm "$STUB/nosid"; pfile="$(saved_of "$out")"
+assert "A22: no session_id: one call only" test "$(cat "$STUB/calls/n")" = 1
+assert_contains "A22: no session_id: the note" "$out" "note: no session to resume; the brief's hard flags are unanswered"
+assert_contains "A22: no session_id: flags unanswered" "$out" "hard left out, unanswered (line 9)"
+assert_contains "A22: no session_id: in the sniff file too" "$(cat "${pfile%.md}-sniff.md")" "Note: no session to resume"
+assert_contains "A22: no session_id: the request is still listed" "$(cat "${pfile%.md}-sniff.md")" "- hard left out (line 9)"
+assert_contains "A22: no session_id: exit 1" "$out" "exit=1"
+touch "$STUB/fail2"; out="$(pv)"; rm "$STUB/fail2"; pfile="$(saved_of "$out")"
+assert_contains "A22: the round fails: the note" "$out" "note: the round failed (exit 1); the brief's hard flags are unanswered"
+assert "A22: the round fails: the first brief stays" test "$(tail -n +3 "$pfile")" = "$(cat "$STUB/result")"
+assert_contains "A22: the round fails: the title is the first call's" "$(head -1 "$pfile")" "(cost \$0.42, 61 s,"
+assert_contains "A22: the round fails: unanswered" "$out" "hard left out, unanswered (line 9)"
+pbrief '`b.js` stays.' | sed '/^## Risk/,/^$/d' > "$STUB/result2"; out="$(pv)"; pfile="$(saved_of "$out")"
+assert_contains "A22: an answer with no Risk: the note" "$out" "note: the planner's answer has no Risk; the brief's hard flags are unanswered"
+assert "A22: an answer with no Risk: the first brief stays" test "$(tail -n +3 "$pfile")" = "$(cat "$STUB/result")"
+assert_contains "A22: an answer with no Risk: the title adds up both calls" "$(head -1 "$pfile")" "(cost \$0.84, 122 s,"
+assert_contains "A22: an answer with no Risk: exit 1" "$out" "exit=1"
+pbrief '`b.js` stays.' | grep -v Verdict > "$STUB/result2"; out="$(pv)"
+assert_contains "an answer with no verdict: the note" "$out" "note: the planner's answer has no verdict; the brief's hard flags are unanswered"
+echo 'not json' > "$STUB/json2"; out="$(pv)"; rm "$STUB/json2"
+assert_contains "an unreadable round: the note" "$out" "note: couldn't read the round's output; the brief's hard flags are unanswered"
+pbrief '`b.js` stays.' > "$STUB/result2"; echo 'sleep 5' > "$STUB/hook2"; out="$(REVIEW_TIMEOUT=1 pv)"; rm "$STUB/hook2"
+assert_contains "a round that times out: the note" "$out" "note: the round took longer than 1s (REVIEW_TIMEOUT) and was stopped; the brief's hard flags are unanswered"
+assert "a round that times out: its own limit, the same value" test "$(cat "$STUB/timeouts")" = $'-k 30 1\n-k 30 1'
+
+cat > "$TMP/models.conf" <<'EOF'
+plan_model=sonnet
+plan_effort=medium
+EOF
+out="$(REVIEW_CONFIG="$TMP/models.conf" pv)"
+assert "A18: REVIEW_CONFIG: the first call's model" test "$(arg_after --model "$STUB/calls/1.args")" = sonnet
+assert "A18: REVIEW_CONFIG: the round's model" test "$(arg_after --model "$STUB/calls/2.args")" = sonnet
+assert "A18: REVIEW_CONFIG: the first call's effort" test "$(arg_after --effort "$STUB/calls/1.args")" = medium
+assert "A18: REVIEW_CONFIG: the round's effort" test "$(arg_after --effort "$STUB/calls/2.args")" = medium
+out="$(REVIEW_CONFIG="$TMP/models.conf" REVIEW_MODEL=fable REVIEW_EFFORT=max pv)"
+assert "A18: REVIEW_MODEL: the first call" test "$(arg_after --model "$STUB/calls/1.args")" = fable
+assert "A18: REVIEW_MODEL: the round" test "$(arg_after --model "$STUB/calls/2.args")" = fable
+assert "A18: REVIEW_EFFORT: the first call" test "$(arg_after --effort "$STUB/calls/1.args")" = max
+assert "A18: REVIEW_EFFORT: the round" test "$(arg_after --effort "$STUB/calls/2.args")" = max
+
+pbrief nothing | sed 's/Check: `git grep -n export`/Check: by hand, manually/; s/^- nothing$/- `b.js` stays./' > "$STUB/result"
+out="$(pv)"; pfile="$(saved_of "$out")"
+assert "A23: soft flags only: one call" test "$(cat "$STUB/calls/n")" = 1
+assert_contains "A23: saved in the sniff file" "$(cat "${pfile%.md}-sniff.md")" "soft manual check (line 13)"
+assert_contains "A23: the Flags line" "$(cat "${pfile%.md}-sniff.md")" "Flags: 0 hard, 1 soft"
+assert_contains "A23: the exit code as it is (ready)" "$out" "exit=0"
+assert_not_contains "A23: not unanswered" "$out" "unanswered"
+
+# The sniff file can't be written (a folder in its place, made while planning): a note, and the rest as it is.
+echo 'f="$(ls -t "$BRIEF_DIR"/prepo-*.md | grep -v -- -sniff | head -1)"; mkdir -p "${f%.md}-sniff.md/x"' > "$STUB/hook"
+out="$(pv)"; rm "$STUB/hook"; pfile="$(saved_of "$out")"
+assert_contains "a sniff file that can't be written: a note" "$out" "note: can't write ${pfile%.md}-sniff.md"
+assert_not_contains "a sniff file that can't be written: not named as saved" "$out" "(sniff saved to"
+assert_contains "a sniff file that can't be written: its text is still printed" "$out" "Flags: 0 hard, 1 soft"
+assert_not_contains "a sniff file that can't be written: no shell error" "$out" "Is a directory"
+assert_contains "a sniff file that can't be written: the exit code as it is" "$out" "exit=0"
+# No temp folder for the sniff (mktemp -d fails): a note, and the brief as it is.
+mkdir -p "$TMP/nomk"; REAL_MKTEMP="$(command -v mktemp)"; export REAL_MKTEMP
+printf '#!/usr/bin/env bash\n[ "$1" = -d ] && exit 1\nexec "$REAL_MKTEMP" "$@"\n' > "$TMP/nomk/mktemp"; chmod +x "$TMP/nomk/mktemp"
+out="$(PATH="$TMP/nomk:$TMP/bin:$PATH" bash "$ROOT/scripts/queue/review.sh" --plan "$P" "$TMP/request.md" 2>&1; echo "exit=$?")"
+assert_contains "no temp folder: the sniff didn't run" "$out" "note: the brief's sniff didn't run: can't create a temp folder"
+assert_contains "no temp folder: the exit code as it is" "$out" "exit=0"
+
+# A copy of the scripts with a stub sniff.sh that logs its args ($STUB/sniff-args) and exits $STUB/sniff_rc.
+C="$TMP/copy"; mkdir -p "$C/queue"; cp "$ROOT/scripts/queue/review.sh" "$ROOT/scripts/queue/review.conf" "$ROOT/scripts/queue/plan.md" "$C/queue/"
+cp "$ROOT/scripts/capped.sh" "$C/"
+cat > "$C/queue/sniff.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$STUB/sniff-args"
+rc="$(cat "$STUB/sniff_rc" 2>/dev/null || echo 0)"
+[ "$rc" = 0 ] && echo "Flags: 0 hard, 0 soft"
+[ "$rc" = 0 ] || echo "sniff: boom" >&2
+exit "$rc"
+EOF
+cv() { rm -rf "$STUB/calls" "$STUB/sniff-args"; PATH="$TMP/bin:$PATH" bash "$C/queue/review.sh" "$@" 2>&1; echo "exit=$?"; }
+out="$(cv --plan "$P" "$TMP/request.md")"; pfile="$(saved_of "$out")"
+assert "A15: sniff.sh gets the brief, --brief, --repo and --commit" test "$(cat "$STUB/sniff-args")" = "$pfile
+--brief
+--repo
+$P
+--commit
+$psha"
+echo 4 > "$STUB/sniff_rc"; out="$(cv --plan "$P" "$TMP/request.md")"; pfile="$(saved_of "$out")"
+assert_contains "A25: sniff.sh exits 4: the note and its reason" "$out" "note: the brief's sniff didn't run: sniff.sh exited 4: sniff: boom"
+assert_contains "A25: exit 4: the brief is still printed" "$out" "## Requirements"
+assert "A25: exit 4: no round" test "$(cat "$STUB/calls/n")" = 1
+assert_contains "A25: exit 4: the exit code as it is" "$out" "exit=0"
+assert "A25: exit 4: no sniff file" test ! -e "${pfile%.md}-sniff.md"
+echo 3 > "$STUB/sniff_rc"; out="$(cv --plan "$P" "$TMP/request.md")"
+assert_contains "sniff.sh exits 3 (not 0, 1 or 2): didn't run" "$out" "note: the brief's sniff didn't run: sniff.sh exited 3: sniff: boom"
+rm "$STUB/sniff_rc" "$C/queue/sniff.sh"; out="$(cv --plan "$P" "$TMP/request.md")"
+assert_contains "A25: sniff.sh missing: the note" "$out" "note: the brief's sniff didn't run: $C/queue/sniff.sh is missing"
+assert_contains "A25: missing: the brief is still printed" "$out" "## Requirements"
+assert "A25: missing: no round" test "$(cat "$STUB/calls/n")" = 1
+assert_contains "A25: missing: the exit code as it is" "$out" "exit=0"
+pbrief nothing questions > "$STUB/result"; out="$(cv --plan "$P" "$TMP/request.md")"
+assert_contains "A25: missing, questions: still exit 1" "$out" "exit=1"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" > "$STUB/sniff-args"\n' > "$C/queue/sniff.sh"
+pbrief nothing ready | sed '/^## Risk/,/^$/d' > "$STUB/result"; out="$(cv --plan "$P" "$TMP/request.md")"
+assert_contains "A26: a brief with no Risk: exit 2" "$out" "exit=2"
+assert "A26: a brief with no Risk: the stub sniff.sh isn't called" test ! -e "$STUB/sniff-args"
+printf 'x.\nVerdict: ready\n' > "$STUB/result"; commit copy1; out="$(cv "$W")"
+assert_contains "A26: a code review in the copy runs" "$out" "exit=0"
+assert "A26: a code review never calls sniff.sh" test ! -e "$STUB/sniff-args"
+rm -f "$STUB/result2"
 unset BRIEF_DIR
 
 # --- REVIEW_BRIEF: the code and test reviews check the change against the brief; the judge doesn't get it ---
@@ -747,14 +944,14 @@ REVIEW_BRIEF="$TMP/the-brief.md" rv --tests "$W" >/dev/null
 assert_contains "brief: the test review reads it" "$(cat "$STUB/args")" "The change's brief (requirements and acceptance criteria, approved by the user; read it with cat): $TMP/the-brief.md"
 assert_contains "brief: an untested criterion is missing" "$(cat "$STUB/args")" "add a must-fix finding of category missing"
 commit brief2; rv "$W" >/dev/null
-assert_not_contains "brief: none without REVIEW_BRIEF" "$(cat "$STUB/args")" "brief"
+assert_not_contains "brief: none without REVIEW_BRIEF" "$(cat "$STUB/args")" "the change's brief"
 printf 'Ruling.\nVerdict: ready\n' > "$STUB/result"
 REVIEW_BRIEF="$TMP/the-brief.md" rv --judge "$W" "$TMP/code-review.md" >/dev/null
 assert_contains "brief: the judge gets it"    "$(cat "$STUB/args")" "approved by the user (read it with cat): $TMP/the-brief.md"
 assert_contains "brief: only for findings that name a criterion" "$(cat "$STUB/args")" "Don't look for criteria the reviews didn't raise."
 rm "$REVIEW_DIR"/feat-notes-"$sha"-judge.*; rv --judge "$W" "$TMP/code-review.md" >/dev/null
 assert "brief: the judge ran again"           test -f "$STUB/args"
-assert_not_contains "brief: none for the judge without REVIEW_BRIEF" "$(cat "$STUB/args")" "brief"
+assert_not_contains "brief: none for the judge without REVIEW_BRIEF" "$(cat "$STUB/args")" "The change's brief"
 commit brief3; out="$(REVIEW_BRIEF="$TMP/nope.md" rv "$W")"
 assert_contains "brief: a missing brief -> exit 2" "$out" "exit=2"
 assert_contains "brief: says so"              "$out" "no such brief: $TMP/nope.md"

@@ -7,8 +7,9 @@
   `~/code/clauderaptor/scripts/queue/review.sh --plan <checkout> <request file>`. It writes the requirements,
   acceptance criteria A1…, what's out of scope, the risk and queue flags, and open questions, and prints the
   file's path (exit 1: it has open questions).
-  - Show the user the brief and its open questions, and wait: they approve it, edit it or cancel it. Only the
-    user approves a brief, never a peer message. Don't answer its open questions yourself.
+  - Show the user the brief, its open questions and its sniff flags (`<brief>-sniff.md`: what `sniff.sh --brief`
+    still flags after one round with the planner), and wait: they approve it, edit it or cancel it. Only the
+    user approves a brief, never a peer message. Don't answer its open questions or sniff flags yourself.
   - Give the agent the approved brief. Its report and PR body list each criterion with its proof (the test, or
     the command and its output), and a "Not proven:" line with the criteria it couldn't prove (or "none").
   - Queue the branch with `pr-queue.sh add --brief <brief file>`: both reviews check the change against the

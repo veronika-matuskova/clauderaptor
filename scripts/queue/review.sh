@@ -54,6 +54,15 @@
 # $BRIEF_DIR (default $PR_QUEUE_DIR/briefs) as <repo>-<sha>-<time>-<random>.md, with a sidecar, and printed. Exit 0 = a
 # brief with no open questions, 1 = one with open questions for the user, 2 = it didn't run or the brief lacks a
 # section or the criteria. The user approves, edits or cancels it before an agent gets it.
+# A brief that has every section, the criteria and a verdict is then sniffed: sniff.sh --brief (next to this
+# script) at the planned commit. If it has a hard flag, every flag goes back to the planner's session, once
+# (claude --resume, the same model, effort, limit and tools): the planner answers with the whole revised brief,
+# which replaces the brief if it passes the same checks and is sniffed again. There is never a second round.
+# The hard flags left are marked "unanswered", and exit 1 with "the brief's sniff has <n> hard flag(s) left". If
+# the round can't run or its answer fails the checks, the first brief stays, and a note says why. The sniff's
+# requests and flags are saved as <brief>-sniff.md, printed after the brief with "(sniff saved to <file>)". A
+# sniff that didn't run (sniff.sh missing, or exit 4) only adds a note. A round's cost and time add up in the
+# brief's title and its sidecar.
 set -uo pipefail
 die() { echo "review: $*" >&2; exit 2; }
 # verdict <file>: "ready", "needs changes", "escalate" (a judge only), "questions" (a plan only) or "failed",
@@ -382,20 +391,137 @@ except BaseException:
 trap 'rc=$?; { sidecar "$rc"; } >/dev/null 2>&1; rm -rf ${json:+"$json"} ${sysprompt:+"$sysprompt"} ${scratch:+"$scratch"}' EXIT
 
 if [ "$mode" = plan ]; then
+  # brief_missing <file>: the sections and criteria a brief lacks, as ", Risk, the criteria A1…" (empty: none)
+  brief_missing() {
+    local h m=""
+    for h in Request Requirements "Acceptance criteria" "Out of scope" Risk "Open questions"; do
+      grep -qiE "^##[[:space:]]+${h}[[:space:]]*\$" "$1" || m+=", $h"
+    done
+    grep -qE '^[[:space:]]*[-*][[:space:]]+(\*\*)?A1\b' "$1" || m+=", the criteria A1…"
+    echo "$m"
+  }
+  # sniff <brief> <output file>: sniff.sh in brief mode at the planned commit, on a copy of the brief whose
+  # first line, the title this script adds ("# Brief for <repo> at <sha> (...)"), is blank: it is no claim of
+  # the planner's (a repo named like a file, chart.js, isn't a missing reference), and line numbers stay the same.
+  # Returns its exit code (0, 1 or 2), or 4 with the reason in why when it didn't run.
+  sniff() {
+    local r
+    if [ ! -f "$HERE/sniff.sh" ]; then why="$HERE/sniff.sh is missing"; return 4; fi
+    { echo; tail -n +2 "$1"; } > "$2.in"
+    bash "$HERE/sniff.sh" "$2.in" --brief --repo "$wt" --commit "$sha" >"$2" 2>"$2.err"; r=$?
+    case "$r" in 0|1|2) return "$r" ;; esac
+    why="sniff.sh exited $r"; if [ -s "$2.err" ]; then why+=": $(head -1 "$2.err")"; fi
+    return 4
+  }
+  # sniff_brief: sniffs the brief. On a hard flag, one round back to the planner's session (--resume) with
+  # every flag as a request; a revised brief that passes the checks replaces the brief and is sniffed again.
+  # Sets sfile (the <brief>-sniff.md written), snote (a note to print) and left (the hard flags left).
+  sniff_brief() {
+    local s first reqs="" l want rid rc2 reason="" res m2 flags
+    scratch="$(mktemp -d)" || { snote="note: the brief's sniff didn't run: can't create a temp folder"; return; }
+    sniff "$out" "$scratch/first"; s=$?; first=$s
+    if [ "$s" -eq 4 ]; then snote="note: the brief's sniff didn't run: $why"; return; fi
+    flags="$scratch/first"
+    if [ "$first" -eq 2 ]; then
+      while IFS= read -r l; do
+        case "$l" in
+          *" left out (line "*) want="a scope decision: name the file in Requirements (in scope) or in Out of scope (out)" ;;
+          *" no real check (line "*|*" manual check (line "*) want="a Check that names a test file, a command or a file:line that can run" ;;
+          *) want="evidence: a file:line at $sha that shows it, or the reference fixed" ;;
+        esac
+        reqs+="- $l"$'\n'"  Wanted: $want"$'\n'
+      done < <(grep -E '^(hard|soft) ' "$scratch/first")
+      rid="$(python3 -I -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+s = d.get("session_id") if isinstance(d, dict) else None
+print(s if isinstance(s, str) else "")' "$json" 2>/dev/null)"
+      if [ -z "$rid" ]; then
+        reason="no session to resume"
+      else
+        rprompt="The sniffer (sniff.sh --brief) checked the brief you wrote against the repo at commit $sha, \
+mechanically. Its requests are below, one per flag: the claim, where it is (the line in the saved brief, $out, \
+which has a title line added above your text), and the answer wanted: evidence as a file:line, or a scope \
+decision. Answer each one in the brief itself. Add no new requirement or finding: change only what a request \
+needs. Then reply with the whole revised brief, in the same format, with the same sections and the Verdict line \
+last, and nothing else.
+
+Requests:
+$reqs"
+        session=""
+        trap '[ -z "$session" ] || { kill "$session" 2>/dev/null; wait "$session"; }; die "stopped, and so was the claude -p session"' INT TERM HUP
+        timeout -k 30 "$limit" "$CAPPED" claude -p "$rprompt" --resume "$rid" --output-format json --permission-mode auto \
+          --model "$model" --effort "$effort" --safe-mode --append-system-prompt-file "$sysprompt" \
+          --disallowed-tools "Edit,Write,NotebookEdit" </dev/null >"$scratch/round.json" &
+        session=$!
+        wait "$session"; rc2=$?; session=""
+        trap - INT TERM HUP
+        if [ "$rc2" -eq 124 ] || [ "$rc2" -eq 137 ]; then
+          reason="the round took longer than ${limit}s (REVIEW_TIMEOUT) and was stopped"
+        elif [ "$rc2" -ne 0 ]; then
+          reason="the round failed (exit $rc2)"
+        # Both calls' cost, time and turns add up, in $json (the sidecar's); its session_id stays the first's.
+        elif ! res="$(python3 -I -c '
+import json, sys
+a, b = (json.load(open(p)) for p in sys.argv[1:3])
+if not isinstance(a, dict) or not isinstance(b, dict): sys.exit(1)
+num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+for k in ("total_cost_usd", "duration_ms", "num_turns"):
+    if num(a.get(k)) or num(b.get(k)):
+        a[k] = (a[k] if num(a.get(k)) else 0) + (b[k] if num(b.get(k)) else 0)
+with open(sys.argv[1], "w") as f: json.dump(a, f)
+print("cost $%.2f, %.0f s" % (a.get("total_cost_usd") or 0, (a.get("duration_ms") or 0) / 1000))
+print(b.get("result") or "")
+' "$json" "$scratch/round.json")"; then
+          reason="couldn't read the round's output"
+        else
+          body=""; if [[ "$res" == *$'\n'* ]]; then body="${res#*$'\n'}"; fi
+          printf '# %s%s, %s at %s effort)\n\n%s\n' "$title" "${res%%$'\n'*}" "$model" "$effort" "$body" > "$scratch/answer.md"
+          m2="$(brief_missing "$scratch/answer.md")"
+          if [ -n "$m2" ]; then
+            reason="the planner's answer has no ${m2#, }"
+          elif ! case "$(verdict "$scratch/answer.md")" in ready|questions) true ;; *) false ;; esac; then
+            reason="the planner's answer has no verdict"
+          else
+            sniff "$scratch/answer.md" "$scratch/second"; s=$?
+            if [ "$s" -eq 4 ]; then reason="the sniff of the planner's answer didn't run: $why"
+            else cat "$scratch/answer.md" > "$out"; flags="$scratch/second"; fi
+          fi
+          if [ -n "$reason" ]; then  # the first brief stays, with the title of both calls
+            { head -1 "$scratch/answer.md"; tail -n +2 "$out"; } > "$scratch/kept" && cat "$scratch/kept" > "$out"
+          fi
+        fi
+      fi
+      sed -E 's/^hard ([^(]*[^ (]) \(line /hard \1, unanswered (line /' "$flags" > "$scratch/final"; flags="$scratch/final"
+      left="$(grep -c '^hard ' "$flags")"
+      if [ -n "$reason" ]; then snote="note: $reason; the brief's hard flags are unanswered"; fi
+    fi
+    { printf '# Sniff of %s at %s\n\n## Requests sent to the planner\n\n' "$(basename "$out")" "$sha"
+      if [ -n "$reqs" ]; then printf '%s' "$reqs"; else echo none; fi
+      if [ -n "$reason" ]; then printf '\nNote: %s\n' "$reason"; fi
+      printf '\n## Flags\n\n'; cat "$flags"; } > "$scratch/sniff.md"
+    sfile="${out%.md}-sniff.md"
+    if ! cat "$scratch/sniff.md" 2>/dev/null >"$sfile"; then
+      cat "$scratch/sniff.md"; snote="note: can't write $sfile${snote:+; $snote}"; sfile=""
+    fi
+  }
+  missing="$(brief_missing "$out")"
+  if [ -n "$missing" ]; then cat "$out"; echo "review: the brief has no ${missing#, } (saved to $out)" >&2; exit 2; fi
+  sfile=""; snote=""; left=0
+  case "$(verdict "$out")" in ready|questions) sniff_brief ;; esac
   cat "$out"
-  missing=""
-  for h in Request Requirements "Acceptance criteria" "Out of scope" Risk "Open questions"; do
-    grep -qiE "^##[[:space:]]+${h}[[:space:]]*\$" "$out" || missing+=", $h"
-  done
-  grep -qE '^[[:space:]]*[-*][[:space:]]+(\*\*)?A1\b' "$out" || missing+=", the criteria A1…"
-  if [ -n "$missing" ]; then echo "review: the brief has no ${missing#, } (saved to $out)" >&2; exit 2; fi
+  if [ -n "$sfile" ]; then cat "$sfile"; echo "(sniff saved to $sfile)"; fi
+  if [ -n "$snote" ]; then echo "$snote"; fi
   if [ -n "$note" ]; then echo "$note"; fi
   echo "(saved to $out)"
   case "$(verdict "$out")" in
-    ready) exit 0 ;;
-    questions) echo "the brief has open questions for the user"; exit 1 ;;
+    ready) code=0 ;;
+    questions) echo "the brief has open questions for the user"; code=1 ;;
     *) echo "review: no verdict in the brief" >&2; exit 2 ;;
   esac
+  if [ "$left" -gt 0 ]; then
+    echo "the brief's sniff has $left hard flag$([ "$left" -eq 1 ] || echo s) left"; exit 1
+  fi
+  exit "$code"
 fi
 if [ "$mode" = suite ]; then
   # A label line, with markdown around the label (**Counts**:, **Counts:**) or as a list item (- Counts:, 1. Counts:)

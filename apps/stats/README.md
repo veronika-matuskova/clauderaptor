@@ -56,10 +56,20 @@ the db, so Refresh shows the current queue; "As of" says when that was.
 ## Milestones
 
 A milestone is a commit on a repo's main that splits the stats into before and after, such as the merge of a
-rule change. The report's "Before and after" section shows, for each one, side by side: the share of the test
-reviews' categorised findings that are surviving mutations (and how many per test review), the share of the
-judge's rulings it confirms for test-review and for code-review findings, and first-pass yield, each with its n.
-All repos count together.
+rule change. The report's "Before and after" section shows, for each one, side by side, each with its n: mutation
+findings per test review; surviving mutations, the share of the mutants the test reviews tried that survived
+(over the test reviews that report counts, which are its n; "no mutants tried" when they tried none); the share
+of the judge's rulings it confirms for test-review and for code-review findings; first-pass yield; and last, the
+mutation share of the test reviews' finding kinds (of their findings with a category, those of kind mutation).
+
+First-pass yield counts every branch whose first round has finished (merged, ready, failed or escalated; a first
+round still queued or running doesn't count yet), and it is first-pass when that first round merged (or ended
+ready, with the PR left open). A branch whose first round failed is not first-pass, even when a later round
+merges it.
+
+Each repo with data on either side gets its own table, under the repo's name (a review's repo, else its
+branch's), and a last table, "All repos", sums them all, with the reviews that have no repo. A repo with data on
+one side only shows "not enough data (n=0)" on the other.
 
 To add one, append an entry to `apps/stats/milestones.json` (a committed list, `[]` at first) once its commit is
 on main, and run `raptor-stats` (or Refresh):

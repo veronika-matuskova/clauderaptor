@@ -461,6 +461,10 @@ SID=s-review EP=sdk-cli CWD="$WT" BR=feat/x
 line 2026-11-10T11:00:00.000Z r1 $O 10 20 30 0 40 > "$PROJ/-home-u-code-app/s-review.jsonl"
 SID=s-judge; line 2026-11-10T11:10:00.000Z j1 $O 1 2 3 0 4 > "$PROJ/-home-u-code-app/s-judge.jsonl"
 SID=s-suite; line 2026-11-10T11:20:00.000Z u1 $O 1 1 1 0 1 > "$PROJ/-home-u-code-app/s-suite.jsonl"
+# The planner (review.sh --plan) runs in the main checkout, like main, and has a subagent.
+SID=s-plan EP=sdk-cli CWD=/home/u/code/app BR=main line 2026-11-10T11:30:00.000Z p1 $O 2 2 2 0 2 > "$PROJ/-home-u-code-app/s-plan.jsonl"
+mkdir -p "$PROJ/-home-u-code-app/s-plan/subagents"
+SID=s-plan EP=sdk-cli CWD=/home/u/code/app BR=main line 2026-11-10T11:30:10.000Z p2 $O 3 0 0 0 0 > "$PROJ/-home-u-code-app/s-plan/subagents/agent-p1.jsonl"
 # A review from before the sidecars: the sdk-cli session in a worktree that ended as it was written.
 SID=s-oldrev; { line 2026-11-10T12:00:00.000Z o1 $O 5 5 5 0 5; line 2026-11-10T12:04:00.000Z; } > "$PROJ/-home-u-code-app/s-oldrev.jsonl"
 # An agent session that was still running when a review of its branch, with no session of its own, was
@@ -510,6 +514,10 @@ printf '{"v":1,"kind":"judge","branch":"feat/x","file":"feat-x-abcabcabcabc-judg
   > "$R4/feat-x-abcabcabcabc-judge.json"
 printf '{"v":1,"kind":"suite","file":"app-suite-abcabcabcabc.md","session_id":"s-suite","cost_usd":2,"finished":"2026-11-10T11:20:30.000Z"}\n' \
   > "$R4/app-suite-abcabcabcabc.json"
+mkdir -p "$S4/briefs"
+printf '{"v":1,"kind":"plan","branch":"main","file":"app-abcabcabcabc-20261110-113000-AbCd.md","session_id":"s-plan","cost_usd":0.4,"finished":"2026-11-10T11:31:00.000Z"}\n' \
+  > "$S4/briefs/app-abcabcabcabc-20261110-113000-AbCd.json"
+printf '# Brief\n' > "$S4/briefs/app-abcabcabcabc-20261110-113000-AbCd.md"
 # shellcheck disable=SC2016  # literal dollar sign, not an expansion
 printf '# Review of feat/x at abcabcabcabc (/code-review medium, cost $1.00, 60 s)\nVerdict: ready\n' > "$R4/feat-x-abcabcabcabc-medium.md"
 touch -d '2026-11-10 12:04:30' "$R4/feat-x-abcabcabcabc-medium.md"
@@ -531,7 +539,7 @@ touch -d '2026-11-10 12:01:00' "$R4/feat-u-eeeeeeeeeeee-tests.md"
 ev2 2026-11-10T13:00:00.000Z merged mx feat/x '"pr":1' | sed 's/"repo":"one"/"repo":"app"/' > "$S4/events.jsonl"
 out="$(PR_QUEUE_DIR="$S4" ingest "$DB2")"; rc=$?
 assert "ingest with transcripts exits 0" test "$rc" -eq 0
-assert_contains "the summary counts the transcripts" "$out" "21 transcripts read, 11 new messages"
+assert_contains "the summary counts the transcripts" "$out" "23 transcripts read, 13 new messages"
 assert_contains "the summary names the model with no price" "$out" "no price for claude-mystery-9"
 assert_not_contains "a model with no tokens is not unpriced" "$out" "$O:"
 
@@ -553,6 +561,8 @@ assert_contains "a subagent's file: subagent, linked to its parent" "$(q "$SQ = 
 assert_contains "a test review's sidecar session: test review" "$(q "$SQ = 's-review'")" "test review|app"
 assert_contains "a judge's sidecar session: judge" "$(q "$SQ = 's-judge'")" "judge|app"
 assert_contains "a suite audit's sidecar session: suite" "$(q "$SQ = 's-suite'")" "suite|app"
+assert_contains "a brief's sidecar session: planner, not main" "$(q "$SQ = 's-plan'")" "planner|app"
+assert "a brief is not a review" test "$(q "SELECT COUNT(*) FROM reviews WHERE kind = 'plan' OR session_id = 's-plan'")" -eq 0
 assert_contains "no sidecar, ended as a code review of its branch was written: code review" \
   "$(q "SELECT role, review_id FROM sessions WHERE session_id = 's-oldrev'")" "code review|feat-x-abcabcabcabc-medium.md"
 assert_contains "a session still running when a review of its branch was written stays an agent" \
@@ -575,6 +585,7 @@ assert_contains "a main session's subagent in a worktree: its most frequent work
   "$(q "$RE = 's-main:agent-m1'")" "subagent|agent|app|app-feat-x|feat/x|worktree"
 assert_contains "a main session's subagent in the main checkout stays main" "$(q "$RE = 's-main:agent-m2'")" "subagent|main|app|app|main|cwd"
 assert_contains "a subagent whose parent has no transcript stays subagent" "$(q "$RE = 's-ghost:agent-g'")" "subagent|subagent|app|app|main|cwd"
+assert_contains "a planner's subagent rolls up into planner" "$(q "$RE = 's-plan:agent-p1'")" "subagent|planner|app|app|main|cwd"
 assert_contains "an agent's subagent rolls up into agent" "$(q "$RE = 's-agent:agent-a1'")" "subagent|agent|app|app-feat-x|feat/x"
 assert_contains "the lines per place of a subagent" "$(q "SELECT group_concat(worktree || ':' || branch || ':' || lines, ',') FROM (SELECT * FROM session_places WHERE session_id = 's-main:agent-m1' ORDER BY worktree, lines)")" \
   "app:main:1,app-feat-q:feat/q:2,app-feat-x:feat/x:1,app-feat-x:feat/x:2"
@@ -611,7 +622,7 @@ assert_contains "tokens by role: unpriced messages counted" "$(q "SELECT ifnull(
 assert_contains "cache hit rate: cache reads / all input" "$(q "SELECT tokens_cache_r, tokens_input, cache_hit_rate FROM v_cache_hit_rate WHERE role = 'agent'")" \
   "1000000|4200000|0.2381"
 assert "cache hit rate: per rolled-up role, no subagent row" \
-  test "$(q "SELECT group_concat(role) FROM (SELECT role FROM v_cache_hit_rate ORDER BY role)")" = "agent,code review,judge,main,suite,test review"
+  test "$(q "SELECT group_concat(role) FROM (SELECT role FROM v_cache_hit_rate ORDER BY role)")" = "agent,code review,judge,main,planner,suite,test review"
 assert_contains "cost per merged branch: agent and its subagent (est.), review and judge from the review files" \
   "$(q "SELECT repo, branch, job_id, agent_sessions, agent_cost_usd_est, review_cost_usd, judge_cost_usd FROM v_cost_per_merged_branch")" \
   "app|feat/x|mx|3|11.6|1.5|0.25"
@@ -740,7 +751,7 @@ c.commit()' "$DB3"
 PR_QUEUE_DIR="$S4" ingest "$DB3" >/dev/null
 DB2="$DB3"
 assert "migrated: version 6" test "$(q "SELECT group_concat(version) FROM schema_version")" = 6
-assert "migrated: the sessions are read" test "$(q "SELECT COUNT(*) FROM sessions")" -eq 20
+assert "migrated: the sessions are read" test "$(q "SELECT COUNT(*) FROM sessions")" -eq 22
 assert_contains "migrated: the views work" "$(q "SELECT agent_cost_usd_est FROM v_cost_per_merged_branch")" "11.6"
 unset DB2 PROJ
 

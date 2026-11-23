@@ -600,7 +600,7 @@ def brief_sniff():
             left.append((n, disp, f"{disp} {what} `{path}:{ln}`: in scope or out?"))
     for n, disp, why in left[:LEFT_OUT_CAP]:
         flag("hard", "left out", n, disp, why)
-    return len(left) - LEFT_OUT_CAP if len(left) > LEFT_OUT_CAP else 0
+    return max(0, len(left) - LEFT_OUT_CAP)
 
 more = brief_sniff() if brief else 0
 

@@ -204,6 +204,9 @@ assert "A7: no record: exit 1" test "$rc" = 1
 STATS_EVENTS_FILE="$(ev e2e-other.jsonl "{\"event\": \"e2e_finished\", \"sha\": \"$OLD\", $J, \"rc\": 0}")" sn 'I ran the e2e suite.'
 assert_contains "A7: a record only at another sha: soft no record" "$out" "soft run that didn't happen (line 1): I ran the e2e suite. — no record of the run"
 assert "A7: other sha: exit 1" test "$rc" = 1
+STATS_EVENTS_FILE="$(ev e2e-prefix.jsonl "{\"event\": \"e2e_finished\", \"sha\": \"${SHA:0:12}\", $J, \"rc\": 1}" "{\"event\": \"e2e_finished\", \"sha\": \"${SHA}0\", $J, \"rc\": 1}" "{\"event\": \"e2e_finished\", \"sha\": \"${SHA^^}\", $J, \"rc\": 1}")" sn 'I ran the e2e suite.'
+assert_contains "a record at a short, longer or upper-case sha doesn't count: soft no record" "$out" "soft run that didn't happen (line 1): I ran the e2e suite. — no record of the run"
+assert "a record at a near-match sha: exit 1" test "$rc" = 1
 E2E_PASS="$(ev e2e-pass.jsonl "{\"event\": \"e2e_finished\", \"sha\": \"$SHA\", $J, \"rc\": 0}" "{\"event\": \"merged\", \"sha\": \"$SHA\", $J}")"
 STATS_EVENTS_FILE="$E2E_PASS" sn 'I ran the e2e suite.'
 assert_contains "A7: e2e rc 0 with no later failure: no flag" "$out" "Flags: 0 hard, 0 soft"
@@ -269,11 +272,24 @@ err="$(bash "$S" --repo "$R" 2>&1 >/dev/null)"; rc=$?
 assert "bad arguments: exit 4" test "$rc" = 4
 
 echo "-- the rule and the README"
-assert_contains "A15: the rule in claude/rules/pr-queue.md: a set of claims" "$(git -C "$ROOT" grep -n "set of claims" -- claude/rules/pr-queue.md)" "main session that runs the queue: an agent's report is a set of claims"
-assert_contains "A15: the rule names sniff.sh" "$(git -C "$ROOT" grep -n "sniff.sh" -- claude/rules/pr-queue.md)" "scripts/queue/sniff.sh"
-readme="$(git -C "$ROOT" grep -n "sniff.sh" -- README.md)"
+assert_contains "A15: the rule in claude/rules/pr-queue.md: a set of claims" "$(grep -n "set of claims" "$ROOT/claude/rules/pr-queue.md")" "main session that runs the queue: an agent's report is a set of claims"
+assert_contains "A15: the rule names sniff.sh" "$(grep -n "sniff.sh" "$ROOT/claude/rules/pr-queue.md")" "scripts/queue/sniff.sh"
+readme="$(grep -n "sniff.sh" "$ROOT/README.md")"
 assert_contains "A17: README.md documents sniff.sh's arguments" "$readme" "sniff.sh <file or -> [--repo <checkout>] [--commit <rev>]"
 assert_contains "A17: README.md documents sniff.sh's exit codes" "$readme" "exits 0 for no flags, 1 for soft flags only, 2 for a hard flag, and 4 when it couldn't run"
+
+# A16: the reviews' own instructions are as they were at the brief's base. A copy without that commit (the test
+# review runs the tests in one) can't tell, and says so.
+BASE=a8ecdae62165
+REVIEW_FILES=(scripts/queue/review.sh scripts/queue/review-judge.md scripts/queue/review-tests.md scripts/queue/plan.md scripts/queue/review.conf)
+if git -C "$ROOT" cat-file -e "$BASE^{commit}" 2>/dev/null; then
+  stat="$(git -C "$ROOT" diff --stat "$BASE" -- "${REVIEW_FILES[@]}" 2>&1)"; rc=$?
+  assert "A16: git diff against the brief's base ran" test "$rc" = 0
+  assert "A16: the review scripts are unchanged since $BASE" test -z "$stat"
+  [ -z "$stat" ] || printf '       | %s\n' "$stat"
+else
+  echo "  skipped: no git history (A16: commit $BASE isn't in $ROOT)"
+fi
 
 echo "-- no session, no transcripts, no changes"
 TEXT=$'See a.js:500, `save()`, later.sh.\n- A2: proven by test_foo\nFixed, should work.\nRan the e2e suite.'

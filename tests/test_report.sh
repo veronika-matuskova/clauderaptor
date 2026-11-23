@@ -102,7 +102,7 @@ assert_contains "data note: row counts" "$T" "jobs 13 reviews 18 findings 24"
 assert_contains "data note: stays on this machine" "$T" "The data stays on this machine"
 assert_contains "transcript tables, no transcripts ingested: empty" "$T" "sessions 0 usage_daily 0"
 
-# no_network <html file>: the page links to nothing, loads nothing and has no script
+# no_network <html file>: the page links only to its own sections, loads nothing and has no script
 no_network() {
   local h B tags png_re uri bad
   h="$(cat "$1")"
@@ -127,7 +127,7 @@ no_network() {
   assert_not_contains "no other link" "$tags" "<link"
   assert_not_contains "no other img" "$tags" "<img"
   assert_not_contains "no other tag with a src" "$tags" "src="
-  assert_not_contains "no other tag with an href" "$tags" "href="
+  assert "the only other tags with an href are same-page links" test -z "$(grep 'href=' <<<"$tags" | grep -vxE '<a href="#[a-z-]+">')"
   assert_contains "a CSP that allows nothing but inline styles and data: images" "$h" \
     "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'\">"
 }
@@ -215,7 +215,7 @@ assert_contains "A6: results.log's text as text" "$QH" "&lt;script&gt;alert(2)&l
 assert_not_contains "A6: paths are text, not links" "$QH" "href=\"/s"
 no_network "$QOUT"
 assert "A7: Queue now is the first section" test "$(grep -o '<section id="[a-z-]*"' "$QOUT" | head -1)" = '<section id="queue-now"'
-assert "A7: the As of time is HH:MM:SS" grep -qE '<h2>Queue now</h2><p class="sub">As of [0-2][0-9]:[0-5][0-9]:[0-5][0-9]\.</p>' "$QOUT"
+assert "A7: the As of time is HH:MM:SS" grep -qE '<h2>Queue now</h2></summary><p class="sub">As of [0-2][0-9]:[0-5][0-9]:[0-5][0-9]\.</p>' "$QOUT"
 assert_contains "A7: the repos in order" "$(grep -o '<h3>[a-z]*</h3>' "$QOUT" | tr -d '\n')" "<h3>app</h3><h3>idle</h3><h3>lib</h3><h3>web</h3>"
 qtext() { text "$1" | sed -E 's/ ([:,]) /\1 /g'; }
 QE="$TMP/q-events.jsonl"; cp "$Q/events.jsonl" "$QE"; ev "$J" 5 e2e_started
@@ -387,14 +387,17 @@ assert_contains "row counts of the new tables" "$T4" "sessions 12 usage_daily 12
 H4="$(cat "$TMP/out/tokens.html")"
 assert_contains "a role name is escaped" "$H4" "&lt;b&gt;main&lt;/b&gt;"
 assert_contains "a branch name is escaped" "$H4" "&lt;i&gt;feat/two&lt;/i&gt;"
-assert_contains "no transcripts ingested: no data yet, but the merged branches are listed" "$(grep -o 'Cost and tokens.*Timeline' <<<"$T")" \
+# tokslice <text>: the Cost and tokens section's text, from after the quick links' text
+tokslice() { grep -o 'Cost and tokens.*Timeline' <<<"${1#*What to change Data }"; }
+assert_not_contains "A7: the Cost and tokens slice doesn't start at the quick links" "$(tokslice "$T")" "Headline Rework Review value"
+assert_contains "no transcripts ingested: no data yet, but the merged branches are listed" "$(tokslice "$T")" \
   "Estimated \$ by role (estimate) no data yet Cache hit rate by role no data yet Subagent share no data yet Cost per merged branch Agent cost found for 0 of 5 merged branches"
 NV="$TMP/out/noviews.db"; cp "$FX" "$NV"
 sql "$NV" "DROP VIEW v_tokens_by_role; DROP VIEW v_cache_hit_rate; DROP VIEW v_subagent_share; DROP VIEW v_cost_per_merged_branch;
 DROP TABLE sessions; DROP TABLE usage_daily;"
 report --db "$NV" --out "$TMP/out/noviews.html" >/dev/null
 T6="$(text "$TMP/out/noviews.html")"
-assert_contains "without the views (a db from before them): no data yet, four times" "$(grep -o 'Cost and tokens.*Timeline' <<<"$T6")" \
+assert_contains "without the views (a db from before them): no data yet, four times" "$(tokslice "$T6")" \
   "Estimated \$ by role (estimate) no data yet Cache hit rate by role no data yet Subagent share no data yet Cost per merged branch no data yet"
 assert_contains "and the transcript tables have no table yet" "$T6" "sessions no table yet usage_daily no table yet"
 
@@ -617,6 +620,190 @@ assert_contains "refuses a page that is not a report" "$(py 'try:
     r.served_page("<html><body></body></html>", "nonceNONCEnonce1234", "tokenTOKENtoken-_123456")
 except ValueError as ex:
     print("ValueError", ex)')" "ValueError not a report page"
+
+echo "-- quick links, collapsible sections, the layout and the themes"
+SERVED="$out"; SEC_IDS="queue-now headline rework review-value tokens timeline repos hints data"
+# ids <html> <grep -o pattern> <prefix to cut>: the matches' ids, in order, space-separated
+ids_of() { grep -o "$2" <<<"$1" | sed -E "s/^$3//; s/\".*//" | tr '\n' ' ' | sed 's/ $//'; }
+NAV="$(grep -o '<nav>.*</nav>' "$OUT")"
+assert "A1: one nav" test "$(grep -o '<nav>' "$OUT" | wc -l)" -eq 1
+assert "A1: the nav is before the first section" test "$(grep -bo '<nav>' "$OUT" | cut -d: -f1)" -lt "$(grep -bo '<section ' "$OUT" | head -1 | cut -d: -f1)"
+assert "A1: 9 links in the nav" test "$(grep -o '<a href=' <<<"$NAV" | wc -l)" -eq 9
+assert "A1: the links' targets are the sections' ids, in order" test "$(ids_of "$NAV" 'href="#[a-z-]*"' 'href="#')" = "$(ids_of "$H" '<section id="[a-z-]*"' '<section id="')"
+assert "A1: the sections are the 9, in order" test "$(ids_of "$H" '<section id="[a-z-]*"' '<section id="')" = "$SEC_IDS"
+NAVT="$(python3 -I -B -c 'import html, re, sys
+n = re.search(r"<nav>(.*?)</nav>", open(sys.argv[1]).read()).group(1)
+n = re.sub(r"<label class=\"palette\"[^>]*>.*?</label>", "", n)  # the theme picker, hidden in the file
+print(html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", n))).strip())' "$OUT")"
+assert_contains "A1: the nav's text (without the hidden theme picker)" "[$NAVT]" \
+  "[Queue now Headline Rework Review value Cost and tokens Timeline By repo What to change Data]"
+pairs="$(python3 -I -B -c 'import re, sys
+h = open(sys.argv[1]).read()
+links = re.findall(r"<a href=\"#([a-z-]+)\">([^<]*)</a>", re.search(r"<nav>.*?</nav>", h).group(0))
+secs = re.findall(r"<section id=\"([a-z-]+)\"[^>]*><details open><summary><h2>([^<]*)</h2>", h)
+print("same" if links == secs and len(links) == 9 else "differ: %r %r" % (links, secs))' "$OUT")"
+assert_contains "A1: each link's text is its section's title" "$pairs" "same"
+for f in "$OUT" "$QOUT"; do
+  while read -r id; do
+    assert "A2: #$id is an id once ($(basename "$f"))" test "$(grep -o "id=\"$id\"" "$f" | wc -l)" -eq 1
+    assert "A2: on a <section> ($(basename "$f"))" test "$(grep -o "<[a-z]* id=\"$id\"" "$f")" = "<section id=\"$id\""
+  done < <(grep -o 'href="#[a-z-]*"' "$f" | sed -E 's/href="#//; s/"//')
+done
+assert "A2: the Queue now page has the 9 links too" test "$(grep -o 'href="#' "$QOUT" | wc -l)" -eq 9
+CSSX="$(py 'print(r.CSS)')"
+# rule <selector> [css]: the declarations of the rules with exactly this selector (media blocks flattened)
+rule() { python3 -I -B -c 'import re, sys
+css = re.sub(r"/\*.*?\*/", "", sys.argv[2], flags=re.S)
+css = re.sub(r"@media[^{]*\{((?:[^{}]*\{[^}]*\})*)\s*\}", r"\1", css)
+print(";".join(b for s, b in re.findall(r"([^{}]+)\{([^}]*)\}", css) if s.strip() == sys.argv[1]))' "$1" "${2:-$CSSX}"; }
+# decl <selector> <property>: that property's values in those rules
+decl() { rule "$1" | tr ';' '\n' | sed -n "s/^$2://p" | tr '\n' ' ' | sed 's/ $//'; }
+assert "A4: nav is sticky" test "$(decl nav position)" = sticky
+assert "A4: at top:0" test "$(decl nav top)" = 0
+assert "A4: over the sections, opaque" test "$(decl nav background)" = "var(--page)"
+# shellcheck disable=SC2329 # called through assert
+above() { [[ "$(decl nav z-index)" =~ ^[1-9][0-9]*$ ]]; }
+assert "A4: a positive z-index, above the sections" above
+# shellcheck disable=SC2329 # called through assert
+clears() { local m; m="$(decl section scroll-margin-top)"; [[ "$m" =~ ^([0-9]+)px$ ]] && [ "${BASH_REMATCH[1]}" -ge 48 ]; }
+assert "A4: sections clear the nav (scroll-margin-top at least 48px, its height)" clears
+assert "A15: the section heading is inline, the marker on its line" test "$(decl 'section>details>summary h2' display)" = inline
+assert "A15: with no margin of its own" test "$(decl 'section>details>summary h2' margin)" = 0
+assert "A4: forced colors: the links are LinkText" grep -q '@media (forced-colors:active){[^@]*nav a{color:LinkText}' <<<"$CSSX"
+sec5="$(python3 -I -B -c 'import re, sys
+h = open(sys.argv[1]).read()
+heads = re.findall(r"<section id=\"([a-z-]+)\"(?: class=\"wide\")?><details open><summary><h2>([^<]*)</h2></summary>", h)
+bodies = re.findall(r"<section id=\"[a-z-]+\"[^>]*>(.*?)</section>", h)
+ok = len(bodies) == 9 and all(b.startswith("<details open>") and b.endswith("</details>") and b.count("<details open>") == 1 for b in bodies)
+print(" ".join(i for i, _ in heads), "|", "bodies inside" if ok else "bodies not inside")' "$OUT")"
+assert_contains "A5: 9 sections, each <details open><summary><h2>, in order" "$sec5" "$SEC_IDS | bodies inside"
+assert "A6: only the 9 section details are open" test "$(grep -o '<details[^>]*>' "$OUT" | grep -vx '<details>' | uniq -c | tr -s ' ')" = " 9 <details open>"
+assert_contains "A6: the Table details are still there, closed" "$H" "<details><summary>Table</summary>"
+assert "A8: main is 1536px" test "$(decl main max-width)" = 1536px
+assert_not_contains "A8: and nothing is 760px any more" "$CSSX" "max-width:760px"
+MQ="$(py 'import re; m = re.findall(r"@media \(min-width:1200px\)\{[^@]*?\}\}", r.CSS); print(m[0] if len(m) == 1 else "")')"
+assert "A8: one @media (min-width:1200px) rule" test -n "$MQ"
+assert "A8: from 1200px, the sections are two columns" test "$(decl .sections grid-template-columns)" = "1fr 1fr"
+assert_contains "A8: in the 1200px media rule" "$(rule .sections "$MQ")" "display:grid;grid-template-columns:1fr 1fr"
+assert_contains "A8: column gap 16px" "$(rule .sections "$MQ")" "column-gap:16px"
+assert_contains "A8: rows aligned at the top" "$(rule .sections "$MQ")" "align-items:start"
+assert_contains "A8: a 16px row gap" "$(rule .sections "$MQ")" "row-gap:16px"
+assert "A8: no section margins in the grid" test "$(rule '.sections>section' "$MQ")" = "margin:0;min-width:0"
+assert "A8: wide sections span both columns, in the grid" test "$(rule .wide "$MQ")" = "grid-column:1/-1"
+assert "A8: outside it, the wrapper is no grid" test -z "$(rule .sections "${CSSX/"$MQ"/}")$(rule .wide "${CSSX/"$MQ"/}")"
+assert "A8: the wide sections" test "$(ids_of "$H" '<section id="[a-z-]*" class="wide"' '<section id="')" = "queue-now headline tokens timeline repos"
+assert "A8: the nav is outside the wrapper" grep -q '</nav><div class="sections"><section id="queue-now"' "$OUT"
+assert "A9: .chart is capped at 722px" test "$(decl .chart max-width)" = 722px
+assert "A9: .pair is capped at 722px" test "$(decl .pair max-width)" = 722px
+widths="$(python3 -I -B -c 'import re, sys
+css = re.sub(r"/\*.*?\*/", "", sys.argv[1], flags=re.S)
+for sel, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css):
+    if re.search(r"\.chart|\bsvg\b|\.pair", sel):
+        for p, v in re.findall(r"(?:^|;)\s*((?:max-)?width):([^;]*)", body):
+            print(sel.strip(), p, v)' "$CSSX")"
+assert "A9: no other width on .chart, svg or .pair" test "$(grep -vxE '\.chart (width 100%|max-width 722px)|\.pair max-width 722px' <<<"$widths")" = ""
+assert "A9: the table rule keeps width:100%" test "$(decl table width)" = 100%
+assert "A9: and has no max-width" test -z "$(decl table max-width)"
+sizes="$(grep -oE 'font(-size)?:[0-9.]+[a-z%]*' <<<"$CSSX" | sed -E 's/.*://' | sort -u | tr '\n' ' ')"
+assert "A10: only today's font sizes" test "$sizes" = "12px 13px 14px 17px 22px 24px "
+for rs in "body:font:14px/1.45" "h1:font-size:22px" "h2:font-size:17px" "h3:font-size:14px" "h4:font-size:13px" \
+  "table:font-size:13px" ".chart text:font:12px" ".tv:font-size:24px" "details details>summary:font-size:12px" \
+  "section>details>summary:font-size:17px"; do
+  sel="${rs%%:*}"; want="${rs#*:}"
+  assert "A10: $sel keeps $want" grep -q "\(^\|;\)${want//./\\.}" <<<"$(rule "$sel" | tr ';' '\n')"
+done
+for bad in zoom "vw" "vh" "clamp(" "scale("; do assert_not_contains "A10: no $bad" "$CSSX" "$bad"; done
+assert_contains "A11: the script keeps collapsed sections in sessionStorage" "$SERVED" 'sessionStorage.getItem(CK)'
+assert_contains "A11: and saves them" "$SERVED" 'sessionStorage.setItem(CK, JSON.stringify(c))'
+assert_contains "A11: the collapsed ones (not the open ones)" "$SERVED" \
+  'for (var j = 0; j < ds.length; j++) if (!ds[j].open) c.push(ds[j].parentNode.id);'
+assert_contains "A11: on each section's toggle" "$SERVED" 'ds[i].addEventListener("toggle", save)'
+assert_contains "A11: of the sections' details" "$SERVED" 'document.querySelectorAll("section > details")'
+assert_contains "A11: closes only the stored sections' ids" "$SERVED" 'if (shut.indexOf(ds[i].parentNode.id) >= 0) ds[i].open = false;'
+pos() { local x="${SERVED%%"$1"*}"; echo "${#x}"; }
+assert "A11/A19: storage code runs before the Refresh check" test "$(pos 'if (!b || !n) return;')" -gt "$(pos 'addEventListener("toggle"')" -a \
+  "$(pos 'if (!b || !n) return;')" -gt "$(pos 'document.cookie.split')"
+untried="$(python3 -I -B -c 'import sys
+ls = sys.stdin.read().split("\n")
+for k, l in enumerate(ls):
+    t = "Storage." if "Storage." in l else "document.cookie" if "document.cookie" in l else None
+    if t and not ("try {" in l.split(t)[0] or (k and ls[k - 1].rstrip().endswith("try {"))):
+        print(l)' <<<"$SERVED")"
+assert "A11/A19: every storage call is inside a try" test -z "$untried"
+assert "A11/A19: each try has a catch" test "$(grep -o 'try {' <<<"$SERVED" | wc -l)" -eq "$(grep -o 'catch (x)' <<<"$SERVED" | wc -l)"
+assert "A11/A19: storage calls (2 sessionStorage, 2 cookie)" test "$(grep -oE 'sessionStorage\.|document\.cookie' <<<"$SERVED" | wc -l)" -eq 4
+assert_not_contains "A11: no innerHTML" "$SERVED" "innerHTML"
+assert_not_contains "A11: no insertAdjacentHTML or document.write" "$SERVED" "HTML("
+assert_contains "A11: the script starts as before" "$SERVED" "<script nonce=\"$N\">(function () {"
+assert_contains "A11: and the page ends as before" "$SERVED" "})();</script></body></html>"
+assert_not_contains "A11: the file has no sessionStorage" "$H" "sessionStorage"
+assert_contains "A12: the served page has the nav" "$SERVED" "<nav><a href=\"#queue-now\">Queue now</a>"
+assert "A12: and the 9 open sections" test "$(grep -o '<details open><summary><h2>' <<<"$SERVED" | wc -l)" -eq 9
+DEF='.viz-root{color-scheme:light;--surface-1:#fcfcfb;--page:#f9f9f7;--text-primary:#0b0b0b;--text-secondary:#52514e;
+--muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;--border:rgba(11,11,11,.10);--series-1:#2a78d6;--series-2:#eb6834;
+--series-3:#1baf7a;--track:#cde2fb}
+@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])) .viz-root{color-scheme:dark;
+--surface-1:#1a1a19;--page:#0d0d0d;--text-primary:#f0efec;--text-secondary:#c3c2b7;--grid:#2c2c2a;--axis:#383835;
+--border:rgba(255,255,255,.10);--series-1:#3987e5;--series-2:#d95926;--series-3:#199e70;--track:#184f95}}
+:root[data-theme="dark"] .viz-root{color-scheme:dark;--surface-1:#1a1a19;--page:#0d0d0d;--text-primary:#f0efec;
+--text-secondary:#c3c2b7;--grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--series-1:#3987e5;
+--series-2:#d95926;--series-3:#199e70;--track:#184f95}'
+assert_contains "A16: Default's light and dark values, as today, without data-palette" "$CSSX" "$DEF"
+assert "A16: they come first, before any Iris rule" test "${CSSX%%"$DEF"*}" = $'\n'
+assert_contains "A16: the page has no data-palette (Default)" "$H" '<html lang="en"><head>'
+assert "A16: data-palette only in the Iris rules" test "$(grep -o 'data-palette' <<<"$CSSX" | wc -l)" -eq "$(grep -o 'data-palette' "$OUT" | wc -l)"
+iris="$(python3 -I -B -c 'import re, sys
+css = sys.argv[1]
+L = {"--page": "#ede6fa", "--surface-1": "#fcfaff", "--text-primary": "#241523", "--text-secondary": "#5c4b78",
+     "--muted": "#8b7ba8", "--grid": "#e3daf4", "--axis": "#d3c6ec", "--border": "#d5c8ee", "--accent": "#6c47c9"}
+D = {"--page": "#16131f", "--surface-1": "#241f32", "--text-primary": "#ece6f2", "--text-secondary": "#aaa1b9",
+     "--muted": "#7a7090", "--grid": "#332c45", "--axis": "#41395a", "--border": "#4b4364", "--accent": "#9d7df2"}
+sels = {"light": (r":root\[data-palette=\"iris\"\] \.viz-root\{([^}]*)\}", L),
+        "system dark": (r"@media \(prefers-color-scheme:dark\)\{:root\[data-palette=\"iris\"\]:where\(:not\(\[data-theme=\"light\"\]\)\) \.viz-root\{([^}]*)\}\}", D),
+        "data-theme dark": (r":root\[data-palette=\"iris\"\]\[data-theme=\"dark\"\] \.viz-root\{([^}]*)\}", D)}
+def lum(c):
+    v = [int(c[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    v = [x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4 for x in v]
+    return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]
+def ratio(a, b):
+    a, b = sorted((lum(a), lum(b)), reverse=True)
+    return (a + 0.05) / (b + 0.05)
+for name, (pat, want) in sels.items():
+    m = re.findall(pat, css)
+    got = dict(d.split(":", 1) for d in m[0].replace("\n", "").split(";") if d) if len(m) == 1 else None
+    print("%s: %s" % (name, "as skydeck" if got == want else "differs: %r" % got))
+    if got:
+        bad = [(t, bg, round(ratio(got[t], got[bg]), 2)) for t, need in (("--text-primary", 4.5), ("--text-secondary", 4.5), ("--muted", 3.0))
+               for bg in ("--page", "--surface-1") if ratio(got[t], got[bg]) < need]
+        print("%s contrast: %s" % (name, "AA" if not bad else bad))' "$CSSX")"
+for m in "light" "system dark" "data-theme dark"; do
+  assert_contains "A17: Iris $m: skydeck's values, no series colours" "$iris" "$m: as skydeck"
+  assert_contains "A18: Iris $m: text contrast AA (4.5, muted 3)" "$iris" "$m contrast: AA"
+done
+assert_contains "A17: the source and its licence named" "$CSSX" "skydeck's Iris palette (skydeck, web/style.css, MIT licence)"
+assert_contains "A19: the picker is in the nav, at its end, hidden in the file" "$H" \
+  '<a href="#data">Data</a><label class="palette" id="palette-picker" hidden>Theme <select id="palette"><option value="">Default</option><option value="iris">Iris</option></select></label></nav>'
+assert_contains "A19: one cookie name" "$SERVED" 'PK = "clauderaptor-stats-palette"'
+assert "A19: named once" test "$(grep -o 'clauderaptor-stats-palette' <<<"$SERVED" | wc -l)" -eq 1
+assert_contains "A19: read on load from the cookie, only iris kept" "$SERVED" \
+  'var cs = document.cookie.split(";");
+    for (i = 0; i < cs.length; i++) if (cs[i].trim() === PK + "=iris") pv = "iris";'
+# A cookie on 127.0.0.1 (no Domain, path=/) is sent to every port, so the next raptor-stats run's server, on a new
+# port, gets it too; localStorage is per port.
+assert_contains "A19: saved on change, for a year, on the whole host, or cleared for Default" "$SERVED" \
+  'try { document.cookie = PK + "=" + (v ? "iris; max-age=31536000" : "; max-age=0") + "; path=/; SameSite=Strict"; } catch (x) {}'
+assert_not_contains "A19: no Domain on the cookie" "$SERVED" "domain="
+assert_not_contains "A19: no localStorage (it is per port)" "$SERVED" "localStorage"
+assert_contains "A19: the picker shows the stored choice" "$SERVED" "palette(pv);
+  if (ps && pw) {
+    ps.value = pv;"
+assert_contains "A19: a change applies only iris" "$SERVED" 'var v = ps.value === "iris" ? "iris" : "";'
+assert_contains "A19: sets only iris, else removes data-palette" "$SERVED" \
+  'if (v === "iris") root.setAttribute("data-palette", "iris"); else root.removeAttribute("data-palette");'
+assert "A19: the only setAttribute" test "$(grep -o 'setAttribute(' <<<"$SERVED" | wc -l)" -eq 1
+assert_contains "A19: the script shows the picker" "$SERVED" "pw.hidden = false;"
+assert_not_contains "A19: the file has no localStorage" "$H" "localStorage"
+assert_not_contains "A19: and no cookie code" "$H" "cookie"
 
 echo "-- compact numbers"
 assert_contains "in full under 10,000, compact from it" "$(py 'print(" ".join(r.compact(v) for v in (9999, 10000, 12345, 999949, 999950, 1000000, 2500000000, 1.5)))')" \

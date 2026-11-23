@@ -851,6 +851,18 @@ assert_contains "an unreadable round: the note" "$out" "note: couldn't read the 
 pbrief '`b.js` stays.' > "$STUB/result2"; echo 'sleep 5' > "$STUB/hook2"; out="$(REVIEW_TIMEOUT=1 pv)"; rm "$STUB/hook2"
 assert_contains "a round that times out: the note" "$out" "note: the round took longer than 1s (REVIEW_TIMEOUT) and was stopped; the brief's hard flags are unanswered"
 assert "a round that times out: its own limit, the same value" test "$(cat "$STUB/timeouts")" = $'-k 30 1\n-k 30 1'
+# timeout's -k kill: the round ends with 137 (the stub claude killed with SIGKILL).
+echo 'kill -9 $PPID' > "$STUB/hook2"; out="$(pv)"; rm "$STUB/hook2"
+assert_contains "a round killed (137): the note" "$out" "note: the round took longer than 1800s (REVIEW_TIMEOUT) and was stopped; the brief's hard flags are unanswered"
+assert_contains "a round killed (137): flags unanswered" "$out" "hard left out, unanswered (line 9)"
+# The answer wanted for each kind of request: a Check that can't run (hard), a manual one (soft, sent too), and
+# a missing reference.
+pbrief '`b.js` stays.' ready '- And `gone.js`.' | sed 's/Check: `git grep -n export`/Check: `nosuchcmd x`/; /^- A1:/a - A2: it looks right. Check: by hand.' > "$STUB/result"
+out="$(pv)"; rp="$(cat "$STUB/calls/2.args")"
+assert_contains "Wanted for a Check that can't run" "$rp" $'- hard no real check (line 13): - A1: export works. Check: `nosuchcmd x` — A1\'s Check names nothing that can run\n  Wanted: a Check that names a test file, a command or a file:line that can run'
+assert_contains "Wanted for a manual Check" "$rp" $'- soft manual check (line 14): - A2: it looks right. Check: by hand. — A2\'s Check is manual: nothing runs it\n  Wanted: a Check that names a test file, a command or a file:line that can run'
+assert_contains "Wanted for a missing reference" "$rp" $'- hard missing reference (line 10): gone.js — gone.js isn\'t in the tree at '"$psha"$'\n  Wanted: evidence: a file:line at '"$psha"' that shows it, or the reference fixed'
+pbrief nothing > "$STUB/result"
 
 cat > "$TMP/models.conf" <<'EOF'
 plan_model=sonnet

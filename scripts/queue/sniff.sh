@@ -44,8 +44,10 @@
 # Brief mode (--brief, for a brief that review.sh --plan wrote, or one edited by hand): a brief plans work and
 # proves nothing yet, so it skips the missing proof, "Not proven: none", run and weasel checks, and checks:
 # - missing reference (hard), as above, except that the names the brief adds or calls fixtures count as known on
-#   every line: the references on a line (outside Acceptance criteria) whose prose has a marker word above, or
-#   "fixture", "stub", "example", "for example" or "e.g.". A criterion (its line and the lines under it, also
+#   every line: the references on a line whose prose has a marker word above ("add", "new", ...), or "fixture",
+#   "stub", "example", "for example" or "e.g.". In a criterion, its text before "Check:" and its Check count
+#   apart ("Check: add tests/test_x.sh, asserting ..." adds that file), and a fixture marker only before the
+#   Check. A criterion (its line and the lines under it, also
 #   indented ones after a blank line, up to the next criterion or heading; a "# line" in a ``` or ~~~ fenced code
 #   block is no heading, there or for the sections), and the rest of Acceptance criteria,
 #   are checked only in its Check: its files and file:lines, not its test names or name()s (planned tests).
@@ -54,7 +56,8 @@
 #   a file:line at the commit. A Check that says it is manual ("manual", "manually", "by hand") and names
 #   nothing that can run is a soft "manual check" instead.
 # - quoted line (hard): a `file:line` followed by a `snippet` (optionally after says, reads, has, holds,
-#   contains, shows or is) whose line, at the commit, doesn't have the snippet.
+#   contains, shows or is) whose line, at the commit, doesn't have the snippet. Checked on every line of a file
+#   at the commit, also on a line that adds names; not on a line in another repo.
 # - left out (hard): the changed names are the `name()`s and files at the commit named in the Requirements
 #   section (not on a fixture line). For each, git grep -w at the commit finds its references (a file by its
 #   path as written or its base name) in files the brief names nowhere (any section, Out of scope included).
@@ -347,7 +350,8 @@ FIXTURE_RE = re.compile(r"\b(fixture|stub|example|for example)\b", re.I)
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 EG_RE = re.compile(r"(?<!\w)e\.g\.", re.I)
 HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.*?)\s*$")
-CHECK_RE = re.compile(r"[*_`]*\bcheck\s*[*_`]*\s*:[*_`]*", re.I)
+# "Check:", "Checks:", or "Check (manual, after the PR opens):": the parenthetical is part of the Check's text.
+CHECK_RE = re.compile(r"[*_`]*\bchecks?\s*(\([^)\n]*\))?\s*[*_`]*\s*:[*_`]*", re.I)
 MANUAL_RE = re.compile(r"\b(manual|manually|by hand)\b", re.I)
 CONNECT = r"\s*(?:(?:says|reads|has|holds|contains|shows|is)\s*)?:?\s*"
 CONNECT_RE = re.compile(rf"^{CONNECT}$")
@@ -460,20 +464,25 @@ def brief_sniff():
             m = CHECK_RE.search(lines[i])
             if m:
                 started = True
-                check_text[i] = lines[i][m.end():]; parts.append(check_text[i]); pre_check[i] = lines[i][:m.start()]
+                check_text[i] = (m.group(1) or "") + " " + lines[i][m.end():]
+                parts.append(check_text[i]); pre_check[i] = lines[i][:m.start()]
             else:
                 pre_check[i] = lines[i]
         block_check[start] = "\n".join(parts) if started else None
 
     in_crit = lambda i: i in block_of or section[i] == "acceptance criteria"
 
-    # Known names: the ones a line outside the criteria says it adds, or calls fixtures, stubs or examples.
+    # Known names: the ones a line says it adds, or calls fixtures, stubs or examples. In a criterion, its text
+    # before the Check and its Check count apart: a marker in one makes only the names in that one known (a
+    # fixture marker only before the Check), so "Check: add tests/test_x.sh, asserting ..." adds the file.
     known, fixture_lines = set(), set()
     for i, line in enumerate(lines):
         if in_crit(i):
-            # in a criterion, only a fixture marker before its Check, for the names there (never the Check's)
-            if is_fixture_line(pre_check.get(i, "")):
-                known.update(names_on(pre_check[i]))
+            before = pre_check.get(i, "")
+            if is_fixture_line(before) or NEW_RE.search(prose_of(before)):
+                known.update(names_on(before))
+            if i in check_text and NEW_RE.search(prose_of(check_text[i])):
+                known.update(names_on(check_text[i]))
             continue
         fx = is_fixture_line(line)
         if fx:
@@ -509,7 +518,9 @@ def brief_sniff():
                 continue
             text, crit_line = command_heads(check_text[i]), True
         else:
-            if NEW_RE.search(prose_of(line)) or ELSEWHERE_RE.search(prose_of(line)):
+            # A line in another repo isn't checked here. A line that adds names isn't skipped: its names are
+            # known, and its quoted lines of files at the commit are still checked.
+            if ELSEWHERE_RE.search(prose_of(line)):
                 continue
             text, crit_line = line, False
         ws, spans = words(text)
@@ -535,8 +546,8 @@ def brief_sniff():
         for loc, snip in quoted_pairs(check_text[i] if crit_line else text):
             lm = LOC_RE.match(loc)
             path, a, b = lm.group(1), int(lm.group(2)), int(lm.group(3) or lm.group(2))
-            if loc in known or not file_like(path) or skipped(path):
-                continue
+            if not file_like(path) or skipped(path):
+                continue  # a quote of a file the brief adds (not at the commit) is left alone below
             cands = tracked(path)
             if not cands or b > max(len(blob_lines(c)) for c in cands):
                 continue  # a missing reference, flagged above

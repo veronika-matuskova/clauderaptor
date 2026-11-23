@@ -75,15 +75,27 @@ The report goes back to the session that asked for it. Keep it short, and make t
 
     1. [must-fix] [mutation] path:line: what is wrong.
        Evidence: <the mutation and the tests that still passed, or the concrete case>. Fix: <one line>.
-    2. [should-fix] (pre-existing) [duplicate] path:line and path:line: ...
+    2. [should-fix] [mutation] web/app.css:12: cosmetic: a deleted rule no test catches.
+       Evidence: <the mutation and the tests that still passed>. Fix: <one line>.
+    3. [should-fix] (pre-existing) [duplicate] path:line and path:line: ...
 
     Dropped: <n> candidates that didn't hold up.
     Not checked: <what you couldn't run or verify>
     Verdict: ready | needs changes
 
 - Kinds: mutation, missing, empty, duplicate, not atomic, rule.
-- `must-fix`: a problem of one of these kinds in the tests or code that the change adds or changes.
+- `must-fix`: a problem of one of these kinds in the tests or code that the change adds or changes, except a
+  cosmetic surviving mutation (below).
   `should-fix (pre-existing)`: the same problem in tests or code the change didn't touch.
+- A surviving mutation in code the change adds or changes:
+  - `must-fix` when the mutation changes behaviour, data or error handling the user meets. Messages, hints and
+    failure reasons the user reads on stdout/stderr or in a UI are behaviour too.
+  - `should-fix` when the mutation is in cosmetic code only: CSS that only changes the look (colour, spacing,
+    fonts), the wording of log lines, comments and docstrings. A test for it is not "not needed", just lower
+    priority: report it with its evidence and a fix line, but it doesn't block. CSS that hides, shows or
+    disables something is behaviour, not cosmetic, so it stays `must-fix`.
+  - Write a cosmetic one as `[should-fix] [mutation] path:line: cosmetic: ...`, with the two tags next to each
+    other and no "(pre-existing)" between them.
 - The verdict is "needs changes" exactly when there's a must-fix finding. Otherwise it's "ready".
 - Give at most 10 findings, must-fix first. With no findings, say so in one line.
 - If you can't review at all (e.g. the commit is missing), say why and end with `Verdict: failed`.

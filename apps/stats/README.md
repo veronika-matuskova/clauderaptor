@@ -35,6 +35,15 @@ a one-time link, not the token. The page's script runs under a CSP nonce and can
 page sends a heartbeat every minute; the server stops 10 minutes after its last request (`--idle`), so soon
 after the window closes. Opened as a plain file, the page has no script and the button stays hidden.
 
+## Layout
+
+A sticky row of quick links at the top leads to each section, and each section can be collapsed by clicking its
+heading. The served page remembers collapsed sections across Refresh (the plain file starts with all open). From
+a 1200px window the page shows two columns: Queue now, Headline, Cost and tokens, Timeline and By repo span both,
+Rework sits next to Review value and What to change next to Data. Charts never render larger than in one column
+(722px); tables use the section's full width. The theme picker in the link row switches between Default and Iris
+(skydeck's palette, MIT); the served page keeps the choice.
+
 ## Queue now
 
 The report's first section shows what the PR queue is doing right now, per repo: the running branch, its step

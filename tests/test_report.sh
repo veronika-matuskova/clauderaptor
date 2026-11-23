@@ -661,8 +661,12 @@ decl() { rule "$1" | tr ';' '\n' | sed -n "s/^$2://p" | tr '\n' ' ' | sed 's/ $/
 assert "A4: nav is sticky" test "$(decl nav position)" = sticky
 assert "A4: at top:0" test "$(decl nav top)" = 0
 assert "A4: over the sections, opaque" test "$(decl nav background)" = "var(--page)"
-assert "A4: a z-index" test -n "$(decl nav z-index)"
-assert "A4: sections clear the nav" test -n "$(decl section scroll-margin-top)"
+# shellcheck disable=SC2329 # called through assert
+above() { [[ "$(decl nav z-index)" =~ ^[1-9][0-9]*$ ]]; }
+assert "A4: a positive z-index, above the sections" above
+# shellcheck disable=SC2329 # called through assert
+clears() { local m; m="$(decl section scroll-margin-top)"; [[ "$m" =~ ^([0-9]+)px$ ]] && [ "${BASH_REMATCH[1]}" -ge 48 ]; }
+assert "A4: sections clear the nav (scroll-margin-top at least 48px, its height)" clears
 assert "A15: the section heading is inline, the marker on its line" test "$(decl 'section>details>summary h2' display)" = inline
 assert "A15: with no margin of its own" test "$(decl 'section>details>summary h2' margin)" = 0
 assert "A4: forced colors: the links are LinkText" grep -q '@media (forced-colors:active){[^@]*nav a{color:LinkText}' <<<"$CSSX"

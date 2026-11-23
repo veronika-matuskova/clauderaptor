@@ -25,6 +25,12 @@
   - "needs your decision" (the judge rejected a finding that would be critical if real, or the branch needed
     changes in two judged rounds): goes to the user. Show them the judge's file and the reviews, with options, and
     wait. Only then send the agent what the user chose, or queue the branch with `--review none` / `--tests none`.
+- To the main session that runs the queue: an agent's report is a set of claims, not proof: the diff, the tests
+  and the runs you can see are the truth. Before you tell the user that something is done, fixed or passing, check
+  it there (open the diff, run the test, read the queue's result), or say that it's the agent's claim and not
+  checked. To check a report's or PR body's claims against the commit, run
+  `~/code/clauderaptor/scripts/queue/sniff.sh <file or -> [--repo <checkout>] [--commit <sha>]`: it flags missing
+  files, lines, tests and proof, runs the queue's events don't show, and weasel words (exit 0 none, 1 soft, 2 hard).
 - To audit a repo's whole test suite, run `~/code/clauderaptor/scripts/queue/review.sh --suite <checkout>`. It saves
   every finding to a file and prints a summary with the file's path.
 - Shared test infrastructure (a local database stack, a mail catcher, fixed ports) stays one shared instance.

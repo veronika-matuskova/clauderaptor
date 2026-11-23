@@ -59,10 +59,12 @@ Read the result:
 ## 6. A mutation no test catches
 
 1. Restore the file (`git restore <path>`).
-2. Add a test, or fix the one that should have caught it.
-3. Make the same mutation again and run the tests: the new test must fail. If it doesn't, fix the test.
-4. Restore the file again (`git restore <path>`), run the tests: they pass.
-5. Commit the test.
+2. Add a test, or fix the one that should have caught it. Run the tests: they pass. Commit the test now, before
+   the next mutation: the test may live in the same file as the code (e.g. Rust `#[cfg(test)]`, doctests), and
+   `git restore` would wipe it if it weren't committed.
+3. Make the same mutation again and run the tests: the new test must fail. If it doesn't, restore the file
+   (`git restore <path>`), fix the test, commit it, and try again.
+4. Restore the file again (`git restore <path>`): it goes back to the commit with the test.
 
 ## 7. Finish clean
 

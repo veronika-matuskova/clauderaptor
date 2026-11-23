@@ -53,6 +53,25 @@ branches in order, with their wait; and the last failures that nobody has re-que
 decision" marked). It is read from the queue's files (`$PR_QUEUE_DIR`) each time the report is built, not from
 the db, so Refresh shows the current queue; "As of" says when that was.
 
+## Milestones
+
+A milestone is a commit on a repo's main that splits the stats into before and after, such as the merge of a
+rule change. The report's "Before and after" section shows, for each one, side by side: the share of the test
+reviews' categorised findings that are surviving mutations (and how many per test review), the share of the
+judge's rulings it confirms for test-review and for code-review findings, and first-pass yield, each with its n.
+All repos count together.
+
+To add one, append an entry to `apps/stats/milestones.json` (a committed list, `[]` at first) once its commit is
+on main, and run `raptor-stats` (or Refresh):
+
+    [{"name": "test rules (17a-17c)", "repo": "clauderaptor", "commit": "<sha of the last merge>"}]
+
+Its time is that commit's time on the repo's main; until the commit is there, the report lists it as "not on main
+yet". A branch counts by when its first round started (the round-1 job's start, else its queue time, else its
+end), so a branch started before the milestone stays "before" even when it merges after it; its reviews count
+with it, and a review without a job by its own time. With several milestones, each one's "before" runs from the
+previous milestone (or the beginning of the data) and its "after" to the next one (or now).
+
 ## Data
 The db and the report stay on this machine, in `${XDG_STATE_HOME:-~/.local/state}/clauderaptor-stats/`, never in
 a git checkout: `report.py` and `serve.py` refuse one, and the repo's pre-commit hook refuses stats data. So do the

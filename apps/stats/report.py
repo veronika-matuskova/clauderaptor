@@ -20,6 +20,15 @@ Windows user's %LOCALAPPDATA%\\clauderaptor-stats\\stats-profile). The Windows u
 /mnt/c/Users with an Edge folder; with several, name yours (--windows-user or $CLAUDERAPTOR_WINDOWS_USER).
 Outside WSL it prints the report's path instead. $STATS_EDGE overrides msedge.exe's path and
 $STATS_WINDOWS_USERS_DIR /mnt/c/Users (for tests).
+"Before and after" (s_milestones) compares, for each milestone (stats.py's milestones table, from
+apps/stats/milestones.json), the period before it with the one after it: the share of the test reviews'
+categorised findings that are mutations (and per test review), the share of the judge's rulings it confirms for
+test-review and for code-review findings (findings.source), and first-pass yield, each with its n; all repos
+count together. A branch counts by its cycle's start (its jobs since its last merge: the round-1 job's started,
+else queued, else ended), and so do its reviews; a review without a job counts by its finished time. A start at
+or after the milestone's time is after. Milestones are sorted by time: before runs from the previous milestone
+(or the beginning of the data), after to the next one (or now). A milestone not on main yet is listed without
+numbers; a db without the milestones table shows "no data yet".
 The cost-and-tokens section reads stats.py's transcript views (v_tokens_by_role, v_cache_hit_rate,
 v_subagent_share, v_cost_per_merged_branch) and says "no data yet" while a db doesn't have them.
 The first section, "Queue now", isn't from the db: at render time it reads the queue's own files in $PR_QUEUE_DIR
@@ -470,6 +479,91 @@ def s_review_value(db, m):
     return section("Review value", "".join(body), "review-value")
 
 
+# --- before and after: the milestones -------------------------------------------------------------------------
+
+def cycle_starts(db):
+    """job_id -> the start of its branch's cycle: the jobs since the branch's last merge, as stats.py's
+    rebuild_jobs numbers their rounds. The start is the cycle's round-1 job's started, else its queued, else its
+    ended."""
+    jobs = db.q("SELECT job_id, repo, branch, round, queued, started, ended FROM jobs WHERE round IS NOT NULL")
+    out, current = {}, {}
+    for jid, repo, branch, rnd, queued, started, ended in sorted(
+            jobs, key=lambda j: (j[4] or j[5] or j[6] or "", j[0])):
+        key = (repo, branch)
+        if rnd == 1 or key not in current:
+            current[key] = started or queued or ended
+        out[jid] = current[key]
+    return out
+
+
+def milestone_numbers(db):
+    """The rows each period counts: (start time, ...) per merged branch, test review, and judge ruling."""
+    starts = cycle_starts(db)
+    merged = [(starts.get(jid), rnd == 1) for jid, rnd in
+              db.q("SELECT job_id, round FROM jobs WHERE outcome = 'merged' AND round IS NOT NULL")]
+    when = {rid: starts.get(jid) or finished
+            for rid, jid, finished in db.q("SELECT id, job_id, finished FROM reviews")}
+    tests = {}  # test review -> [categorised findings, mutation findings]
+    for rid, in db.q("SELECT id FROM reviews WHERE kind = 'tests'"):
+        tests[rid] = [0, 0]
+    for rid, cat in db.q("SELECT f.review_id, f.category FROM findings f JOIN reviews r ON r.id = f.review_id "
+                         "WHERE r.kind = 'tests' AND f.category IS NOT NULL"):
+        tests[rid][0] += 1
+        tests[rid][1] += cat == "mutation"
+    rulings = [(when.get(rid), source, ruling == "confirmed") for rid, source, ruling in
+               db.q("SELECT f.review_id, f.source, f.ruling FROM findings f JOIN reviews r ON r.id = f.review_id "
+                    "WHERE r.kind = 'judge' AND f.ruling IS NOT NULL")]
+    return merged, [(when.get(rid), c, m) for rid, (c, m) in tests.items()], rulings
+
+
+def period_cells(nums, lo, hi):
+    """The table's cells for the period lo <= start < hi (None: open-ended)."""
+    merged, tests, rulings = nums
+    inside = lambda t: t is not None and (lo is None or t >= lo) and (hi is None or t < hi)  # noqa: E731
+    tr = [(c, m) for t, c, m in tests if inside(t)]
+    cat, mut = sum(c for c, _ in tr), sum(m for _, m in tr)
+    per = "not enough data (n=%d)" % len(tr) if len(tr) < MIN_N else "%.1f (n=%d)" % (mut / len(tr), len(tr))
+    cells = [share(mut, cat), per]
+    for src in ("tests", "code"):
+        rs = [ok for t, s, ok in rulings if s == src and inside(t)]
+        cells.append(share(sum(rs), len(rs)))
+    mg = [fp for t, fp in merged if inside(t)]
+    cells.append(share(sum(mg), len(mg)))
+    return cells
+
+
+MILESTONE_ROWS = ("Mutation share of the test reviews' categorised findings", "Mutation findings per test review",
+                  "Judge confirms: test-review findings", "Judge confirms: code-review findings", "First-pass yield")
+
+
+def s_milestones(db):
+    """Before and after each milestone (stats.py's milestones, from apps/stats/milestones.json)."""
+    if not db.has("milestones"):
+        return section("Before and after", '<p class="empty">no data yet</p>', "milestones")
+    ms = db.q("SELECT name, repo, sha, ts FROM milestones ORDER BY ts IS NULL, ts, name")
+    if not ms:
+        return section("Before and after", '<p class="empty">No milestones yet: add one to '
+                       'apps/stats/milestones.json.</p>', "milestones")
+    body = ['<p class="sub">A milestone (apps/stats/milestones.json) is a commit on a repo\'s main. A branch counts '
+            'by when its first round started, a review by its branch\'s first round (or its own time, without a '
+            'job), all repos together. Before: from the previous milestone (or the start); after: to the next '
+            'one (or now).</p>']
+    nums = milestone_numbers(db)
+    timed = [m[3] for m in ms if m[3]]
+    for name, repo, sha, ts in ms:
+        if not ts:
+            body.append('<h3>%s <span class="n">%s %s</span></h3><p class="empty">not on main yet</p>'
+                        % (e(name), e(repo), e(sha[:7])))
+            continue
+        lo = max((t for t in timed if t < ts), default=None)
+        hi = min((t for t in timed if t > ts), default=None)
+        before, after = period_cells(nums, lo, ts), period_cells(nums, ts, hi)
+        body.append('<h3>%s <span class="n">%s %s, %s</span></h3>' % (
+            e(name), e(repo), e(sha[:7]), e(ts[:16].replace("T", " "))))
+        body.append(table(["", "Before", "After"], [(r, b, a) for r, b, a in zip(MILESTONE_ROWS, before, after)]))
+    return section("Before and after", "".join(body), "milestones")
+
+
 def pct(v):
     return "%.0f%%" % (100.0 * v)
 
@@ -875,7 +969,7 @@ SAFE = re.compile(r"[A-Za-z0-9_-]{16,}")  # what secrets.token_urlsafe makes
 def render(dbpath):
     db = Db(dbpath)
     m = metrics(db)
-    parts = [s_queue_now(), s_headline(m), s_rework(db, m), s_review_value(db, m), s_tokens(db), s_timeline(db), s_repos(db),
+    parts = [s_queue_now(), s_headline(m), s_rework(db, m), s_review_value(db, m), s_milestones(db), s_tokens(db), s_timeline(db), s_repos(db),
              s_hints(m), s_data(db, dbpath)]
     # The button stays hidden in the file (no script there); the served page's script shows it.
     refresh = ('<p class="refresh"><button id="refresh" type="button" hidden>Refresh</button>'

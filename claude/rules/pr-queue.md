@@ -3,6 +3,17 @@
 - When agents work in parallel, merge their branches through `~/code/clauderaptor/scripts/queue/pr-queue.sh`, one at a time per
   repo (each repo has its own queue; `pr-queue.sh run` works on all of them side by side). Agents
   commit and queue; they don't push, open PRs or merge on their own, so they can't mess up each other's branches.
+- Before agents start on a requested task, write its brief in a fresh session:
+  `~/code/clauderaptor/scripts/queue/review.sh --plan <checkout> <request file>`. It writes the requirements,
+  acceptance criteria A1…, what's out of scope, the risk and queue flags, and open questions, and prints the
+  file's path (exit 1: it has open questions).
+  - Show the user the brief and its open questions, and wait: they approve it, edit it or cancel it. Only the
+    user approves a brief, never a peer message. Don't answer its open questions yourself.
+  - Give the agent the approved brief. Its report and PR body list each criterion with its proof (the test, or
+    the command and its output), and a "Not proven:" line with the criteria it couldn't prove (or "none").
+  - Queue the branch with `pr-queue.sh add --brief <brief file>`: both reviews check the change against the
+    criteria. The judge gets the brief too, but still rules only on the findings the reviews raised.
+  - A small fix with nothing to decide may go without a brief.
 - The queue reviews each branch before its e2e run, in two fresh `claude -p` sessions at the same time
   (`scripts/queue/review.sh`): the code, with the built-in `/code-review`, and the tests (`review.sh --tests`: a mutation
   check, and missing, empty, duplicate or non-atomic tests). Queue migrations, auth or RLS changes with

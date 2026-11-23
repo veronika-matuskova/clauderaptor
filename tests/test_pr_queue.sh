@@ -84,10 +84,12 @@ EOF
 # ready) or $TQ/judge_verdict (default needs changes). $TQ/claude_fail makes them all fail.
 # With $TQ/sync, each session waits up to 30 s for the other one to start, and logs in sync.log if it did.
 # With $TQ/hang, each session logs its pid in $TQ/hung and hangs for 30 s; on TERM it takes 0.5 s to end.
-# $TQ/judge_hang does the same for a judge only.
+# $TQ/judge_hang does the same for a judge only. A session whose prompt gives it the change's brief logs its
+# kind and the brief's text in $TQ/brief.log.
 cat > "$TQ/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 prev=""; for a in "$@"; do [ "$prev" = --append-system-prompt-file ] && cp "$a" "$TQ/sysprompt"; prev="$a"; done
+b="$(grep -oE "change's brief[^/]*(/[^ ]+\.brief)" <<<"$2" | grep -oE '/[^ ]+\.brief' | head -1)"
 if [[ "$2" == *"code-review skill"* ]]; then
   kind=code other=tests; echo "code $2" >> "$TQ/claude.log"; v="$(cat "$TQ/verdict" 2>/dev/null || echo ready)"
 elif [[ "$2" == "Judge the reviews of one change"* ]]; then
@@ -96,6 +98,7 @@ elif [[ "$2" == "Judge the reviews of one change"* ]]; then
 else
   kind=tests other=code; echo "tests ${2%%$'\n'*}" >> "$TQ/claude.log"; v="$(cat "$TQ/tests_verdict" 2>/dev/null || echo ready)"
 fi
+if [ -n "$b" ]; then echo "$kind $(cat "$b")" >> "$TQ/brief.log"; fi
 [ -f "$TQ/claude_fail" ] && exit 1
 if [ "$kind" = judge ] && [ -f "$TQ/judge_hang" ]; then trap 'sleep 0.5; exit 1' TERM; echo "$$" >> "$TQ/hung"; sleep 30; fi
 if [ -f "$TQ/hang" ]; then trap 'sleep 0.5; exit 1' TERM; echo "$$" >> "$TQ/hung"; sleep 30; fi
@@ -351,6 +354,47 @@ Q add --review none --tests on "$TMP/wt-flags" fix "Flags" >/dev/null; out="$(Q 
 assert "re-queue: a new --review beats the kept one" test -z "$(code_reviews)"
 assert "re-queue: a new --tests beats the kept one" test -n "$(test_reviews)"
 assert_contains "re-queue: new flags, merged" "$out" "MERGED fix/flags"
+
+# --- add --brief: stored with the job, given to both reviews (not the judge), kept on a re-queue ---
+reset_pr; rm -f "$TQ/brief.log"; echo "needs changes" > "$TQ/verdict"; mkwt brief
+printf '# Brief: x\nA1: the brief text\n' > "$TMP/brief.md"
+out="$(Q add --brief "$TMP/brief.md" "$TMP/wt-brief" fix "Brief")"
+assert_contains "brief: queued"              "$out" "queued fix/brief"
+assert "brief: stored with the job"          grep -q "the brief text" "$(find "$RQ/queue" -name '*fix-brief.brief')"
+rm "$TMP/brief.md"; out="$(Q run)"
+assert_contains "brief: the code review gets it" "$(cat "$TQ/brief.log")" "code # Brief: x"
+assert_contains "brief: the test review gets it" "$(cat "$TQ/brief.log")" "tests # Brief: x"
+assert_contains "brief: the judge gets it too"   "$(cat "$TQ/brief.log")" "judge # Brief: x"
+assert "brief: kept with the failed job"     test -n "$(find "$RQ/failed" -name '*fix-brief.brief')"
+rm -f "$TQ/verdict" "$TQ/brief.log"
+out="$(Q add "$TMP/wt-brief" fix "Brief")"; assert_contains "brief: a re-queue keeps it" "$out" "keeping the brief from the earlier job"
+assert "brief: the kept copy is stored"      grep -q "the brief text" "$(find "$RQ/queue" -name '*fix-brief.brief')"
+out="$(Q run)"
+assert_contains "brief: the re-queue's reviews get it" "$(cat "$TQ/brief.log")" "code # Brief: x"
+assert_contains "brief: then merged"         "$out" "MERGED fix/brief"
+assert "brief: kept with the done job"       test -n "$(find "$RQ/done" -name '*fix-brief.brief')"
+mkwt brief2 brief2.txt later fix/brief   # a later branch of the same name
+out="$(Q add "$TMP/wt-brief2" fix "Later")"
+assert_contains "brief: the later branch is queued" "$out" "queued fix/brief"
+assert_not_contains "brief: not from a job that merged" "$out" "keeping the brief"
+assert "brief: so the new job has none"      test -z "$(find "$RQ/queue" -name '*fix-brief.brief')"
+printf '# Brief: y\n' > "$TMP/brief2.md"; Q add --brief "$TMP/brief2.md" "$TMP/wt-brief2" fix "Later" >/dev/null
+out="$(Q add --brief none "$TMP/wt-brief2" fix "Later")"
+assert_contains "brief: --brief none drops it" "$out" "no brief for this job"
+assert "brief: none stored"                  test -z "$(find "$RQ/queue" -name '*fix-brief.brief')"
+Q add --brief "$TMP/brief2.md" "$TMP/wt-brief2" fix "Later" >/dev/null
+out="$(Q add "$TMP/wt-brief2" fix "Later")"
+assert_contains "brief: kept from the latest queued job" "$out" "keeping the brief from the earlier job"
+assert "brief: the latest one"               grep -q "Brief: y" "$(find "$RQ/queue" -name '*fix-brief.brief')"
+rm -f "$RQ"/queue/*fix-brief.*
+reset_pr; rm -f "$TQ/brief.log"; mkwt nobrief
+Q add "$TMP/wt-nobrief" fix "No brief" >/dev/null; out="$(Q run)"
+assert "brief: none without --brief"         test ! -s "$TQ/brief.log"
+assert_contains "brief: none, merged as before" "$out" "MERGED fix/nobrief"
+out="$(Q add --brief "$TMP/missing.md" "$TMP/wt-nobrief" fix x)"
+assert_contains "brief: a missing file is refused" "$out" "no such brief, or it's empty: '$TMP/missing.md'"
+: > "$TMP/empty.md"; out="$(Q add --brief "$TMP/empty.md" "$TMP/wt-nobrief" fix x)"
+assert_contains "brief: an empty file is refused" "$out" "no such brief, or it's empty"
 reset_pr; mkwt late3
 echo "echo more >> '$TMP/wt-late3/late3.txt'; git -C '$TMP/wt-late3' commit -qam more" > "$TQ/on_e2e"
 Q add --review none "$TMP/wt-late3" fix "Late commit" >/dev/null; out="$(Q run)"

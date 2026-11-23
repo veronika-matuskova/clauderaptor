@@ -16,8 +16,10 @@
 #   (a.js:120, a.js:10-20) past the file's last line. A backticked `name()`, or a test_<word> token, that
 #   git grep doesn't find at the commit.
 # - missing proof (hard): a criterion line (A<n>: ... proven by X, or A<n>: ... X) whose proof X isn't found at
-#   the commit: X is the token after "proven by" (a test file, a test_<word>, a "quoted name", a word, or the
-#   test files and test_<word>s in a `backticked command`), else the line's test_<word> tokens and test files.
+#   the commit: after "proven by", up to the end of its clause, every "quoted name", test_<word>, file:line (checked
+#   like a reference) and file, also inside a `backticked command` (several are all checked); with none of them,
+#   the first word that isn't a filler (the, a, test, ...). Without "proven by": the line's test_<word> tokens and
+#   test files.
 #   It is checked whatever marker words (below) the line has. And a "Not proven: none" line while a criterion (its line and
 #   the lines under it, up to the next criterion or a blank line) names no test, no file:line and no backticked
 #   command.
@@ -132,10 +134,14 @@ TEST_RE = re.compile(r"(?<![\w/.\-])test_\w+(?![\w/\-]|\.\w)")
 FUNC_RE = re.compile(r"^(?:[A-Za-z_][\w$]*(?:\.|::))*([A-Za-z_][\w$]*)\(\)$")
 CRIT_RE = re.compile(r"^[\s>*+\-]*[*_`]*A(\d+)[*_`]*\s*:")
 NOT_PROVEN_NONE_RE = re.compile(r"not proven[*_`]*\s*:\s*[*_`]*none\b", re.I)
-PROVEN_BY_RE = re.compile(r"proven by\s+(`[^`]+`|\"[^\"]+\"|\S+)", re.I)
+PROVEN_BY_RE = re.compile(r"proven by\b(.*)", re.I)
+# The end of the proof after "proven by": a ;, a sentence's full stop (not e.g. or i.e.), or a dash between clauses.
+PROOF_END_RE = re.compile(r";|(?<!\be\.g)(?<!\bi\.e)\.(?:\s|$)| [—–-] ")
+FILLER = {"the", "a", "an", "test", "tests", "unit", "case", "cases", "file", "script", "function", "in", "and", "or",
+          "plus", "with", "its", "my", "our", "both", "named", "called"}
 E2E_RE = re.compile(r"\b(?:ran|has run|have run|passed)\s+(?:the\s+)?(?:full\s+)?(?:local\s+)?(?:e2e|end-to-end)\b"
                     r"|\b(?:e2e|end-to-end)(?:\s+(?:suite|tests?|run))?\s+(?:passed|passes|pass|is green|are green|succeeded|ran)\b", re.I)
-TESTS_PASS_RE = re.compile(r"\btests?\s+(?:all\s+)?(?:pass|passes|passed|are passing|are green)\b|tests/run\.sh\s+(?:pass|passes|passed)\b"
+TESTS_PASS_RE = re.compile(r"(?<!e2e\s)(?<!end-to-end\s)\btests?\s+(?:all\s+)?(?:pass|passes|passed|are passing|are green)\b|tests/run\.sh\s+(?:pass|passes|passed)\b"
                            r"|\bCI\s+(?:is\s+|was\s+)?(?:green|passes|passed)\b|\bALL PASSED\b", re.I)
 WEASEL_RE = re.compile(r"\b(should work|probably|seems to|robust|comprehensive)\b", re.I)
 CLAIM_RE = re.compile(r"\b(done|fixed|fixes|works|working|passing|passes|passed|proven|complete|completed|implemented|resolved)\b", re.I)
@@ -177,6 +183,47 @@ def words(line):
             if w:
                 out.append((w, code))
     return out, spans
+
+def fileline_problem(w):
+    """Why a file:line (a.js:120, a.js:10-20) is wrong at the commit, or "" if it is fine."""
+    m = FILELINE_RE.match(w)
+    path, last = m.group(1), int(m.group(3) or m.group(2))
+    cands = [p for p in matches(path) if p in fileset]
+    if not cands:
+        return f"{path} isn't in the tree at {short}"
+    longest = max(cands, key=count_lines)
+    if last > count_lines(longest):
+        return f"{w}, but {path} has {count_lines(longest)} lines at {short}"
+    return ""
+
+def proofs_after(tail):
+    """The proofs named after "proven by", up to the end of its clause: "quoted names", test_<word>s, file:lines
+    and files (also inside `backticked commands`). Several (test_a and test_b) are all checked. With none of
+    those, the first word that isn't a filler (the, a, test, ...) is the proof; a command with none has none."""
+    end = PROOF_END_RE.search(tail.lstrip(" :"))
+    tail = tail.lstrip(" :")
+    tail = tail[:end.start()] if end else tail
+    quoted = r'"([^"]+)"|“([^”]+)”'
+    proofs = [("quoted", a or b) for a, b in re.findall(quoted, tail)]
+    tail = re.sub(quoted, " ", tail)
+    first_word = None
+    for i, seg in enumerate(tail.split("`")):
+        code = i % 2 == 1
+        for w in (clean(x) for x in SPLIT_RE.split(seg)):
+            if not w or skipped(w):
+                continue
+            fm = FILELINE_RE.match(w)
+            if fm and file_like(fm.group(1)):
+                proofs.append(("fileline", w))
+            elif TEST_RE.fullmatch(w):
+                proofs.append(("test", w))
+            elif file_like(w):
+                proofs.append(("file", w))
+            elif first_word is None and w.lower() not in FILLER:
+                first_word = "" if code and len(seg.split()) > 1 else w
+    if not proofs and first_word:
+        proofs.append(("word", first_word))
+    return proofs
 
 def is_test_file(tok):
     return bool(re.search(r"(^|/)(tests?|spec|__tests__)/|(^|/)test_[^/]*$|[._-](test|spec)\.\w+$|_test\.\w+$", tok))
@@ -263,29 +310,19 @@ for n, line in enumerate(lines, 1):
         m = PROVEN_BY_RE.search(line)
         proofs = []
         if m:
-            p = m.group(1)
-            if p.startswith('"'):
-                proofs.append(("quoted", p.strip('"')))
-            elif p.startswith("`") and len(p.strip("`").split()) > 1:
-                # a command: its test names and files are the proof (a command with none has nothing to check)
-                for w in (clean(x) for x in SPLIT_RE.split(p.strip("`"))):
-                    if skipped(w):
-                        continue
-                    if TEST_RE.fullmatch(w):
-                        proofs.append(("test", w))
-                    elif file_like(w):
-                        proofs.append(("file", w))
-            else:
-                p = clean(p.strip("`"))
-                if not skipped(p):
-                    proofs.append(("test" if TEST_RE.fullmatch(p) else "file" if file_like(p) else "word", p))
+            proofs = proofs_after(m.group(1))
         else:
             proofs += [("test", t) for t in TEST_RE.findall(line)]
             proofs += [("file", w) for w, _ in ws if not skipped(w) and file_like(w) and is_test_file(w)]
         for kind, p in proofs:
-            ok = (bool(matches(p)) if kind == "file" else found(p, fixed=True) if kind == "quoted" else found(p))
-            if not ok:
-                flag("hard", "missing proof", n, claim_of(line), f"{crit}'s proof {p} isn't found at {short}")
+            if kind == "fileline":
+                why = fileline_problem(p)
+            elif (bool(matches(p)) if kind == "file" else found(p, fixed=True) if kind == "quoted" else found(p)):
+                why = ""
+            else:
+                why = f"{p} isn't found at {short}"
+            if why:
+                flag("hard", "missing proof", n, claim_of(line), f"{crit}'s proof {why}")
                 proof_flagged.add(p)
 
     # missing reference
@@ -295,14 +332,9 @@ for n, line in enumerate(lines, 1):
                 continue
             m = FILELINE_RE.match(w)
             if m and file_like(m.group(1)):
-                path, last = m.group(1), int(m.group(3) or m.group(2))
-                cands = [p for p in matches(path) if p in fileset]
-                if not cands:
-                    flag("hard", "missing reference", n, w, f"{path} isn't in the tree at {short}")
-                    continue
-                longest = max(cands, key=count_lines)
-                if last > count_lines(longest):
-                    flag("hard", "missing reference", n, w, f"{w}, but {path} has {count_lines(longest)} lines at {short}")
+                why = fileline_problem(w)
+                if why:
+                    flag("hard", "missing reference", n, w, why)
                 continue
             if file_like(w) and not matches(w):
                 flag("hard", "missing reference", n, w, f"{w} isn't in the tree at {short}")
@@ -321,7 +353,7 @@ for n, line in enumerate(lines, 1):
             flag("hard", "run that didn't happen", n, claim_of(line), why)
         elif state == "none":
             flag("soft", "run that didn't happen", n, claim_of(line), why)
-    elif TESTS_PASS_RE.search(line):
+    if TESTS_PASS_RE.search(line):
         state, why = checks_state()
         if state == "fail":
             flag("hard", "run that didn't happen", n, claim_of(line), why)

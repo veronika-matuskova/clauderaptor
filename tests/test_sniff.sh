@@ -64,6 +64,12 @@ sn 'Wrote ./missing/x.sh.'
 assert_contains "./x that isn't there is flagged" "$out" "hard missing reference (line 1): missing/x.sh — missing/x.sh isn't in the tree"
 sn 'Covered by test_missing.'
 assert_contains "a test_<word> at the end of a sentence is checked" "$out" "hard missing reference (line 1): test_missing — git grep doesn't find test_missing"
+sn 'See a.js:500 and a.js:500 and `save()` `save()`'
+assert_contains "the same flag twice on a line is one flag" "$out" "Flags: 2 hard, 0 soft"
+sn 'Changed scripts/queue and scripts/nope.'
+assert_not_contains "a folder at the commit isn't flagged" "$out" "scripts/queue —"
+assert_contains "a folder that isn't there is flagged" "$out" "hard missing reference (line 1): scripts/nope — scripts/nope isn't in the tree"
+assert_contains "folders: one flag" "$out" "Flags: 1 hard, 0 soft"
 sn 'Proof in test_nothere and test_bar.'
 assert_contains "test_<word> not found is flagged" "$out" "hard missing reference (line 1): test_nothere"
 assert_not_contains "test_<word> found isn't flagged" "$out" "test_bar —"
@@ -76,6 +82,10 @@ for m in "Will add" "This adds" "To create" "It creates" "A new file:" "Lives in
   sn "$m \`scripts/queue/nothere.sh\`."
   assert_contains "marker \"$m\": a missing file on that line isn't flagged" "$out" "Flags: 0 hard, 0 soft"
 done
+sn 'Changed scripts/new_thing.sh and scripts/add/x.sh.'
+assert_contains "a marker word inside a path doesn't count: new_thing.sh flagged" "$out" "hard missing reference (line 1): scripts/new_thing.sh"
+assert_contains "a marker word inside a path doesn't count: add/x.sh flagged" "$out" "hard missing reference (line 1): scripts/add/x.sh"
+assert_contains "a marker word inside a path: two flags" "$out" "Flags: 2 hard, 0 soft"
 sn 'See ../other/missing.sh and `../x/y.sh`.'
 assert_contains "../ paths aren't flagged" "$out" "Flags: 0 hard, 0 soft"
 sn 'Added `scripts/queue/new.sh`.'
@@ -95,6 +105,42 @@ assert_contains "a backticked command as proof: its test file is checked, found:
 sn $'- A1: proven by `bash tests/test_gone.sh -v`'
 assert_contains "a backticked command as proof: its test file missing: hard missing proof" "$out" "hard missing proof (line 1): - A1: proven by \`bash tests/test_gone.sh -v\` — A1's proof tests/test_gone.sh isn't found"
 assert_contains "a backticked command as proof: one flag" "$out" "Flags: 1 hard, 0 soft"
+sn $'- A1: parses flags, proven by tests/test_x.sh:1'
+assert_contains "a file:line proof within the file: no flag" "$out" "Flags: 0 hard, 0 soft"
+sn $'- A1: parses flags, proven by tests/test_x.sh:42'
+assert_contains "a file:line proof past the end: hard missing proof" "$out" "hard missing proof (line 1): - A1: parses flags, proven by tests/test_x.sh:42 — A1's proof tests/test_x.sh:42, but tests/test_x.sh has 1 lines"
+assert_contains "a file:line proof past the end: one flag" "$out" "Flags: 1 hard, 0 soft"
+sn $'- A1: proven by tests/test_x.sh:1-3'
+assert_contains "a file:line-range proof past the end: hard missing proof" "$out" "A1's proof tests/test_x.sh:1-3, but tests/test_x.sh has 1 lines"
+sn $'- A1: proven by tests/gone.sh:1'
+assert_contains "a file:line proof in a file that isn't there: hard missing proof" "$out" "A1's proof tests/gone.sh isn't in the tree"
+sn $'- A2: add stdin support, proven by the test test_nonexistent'
+assert_contains "proven by the test test_x: the test name is the proof" "$out" "hard missing proof (line 1): - A2: add stdin support, proven by the test test_nonexistent — A2's proof test_nonexistent isn't found"
+sn $'- A2: proven by the test test_bar'
+assert_contains "proven by the test test_bar (found): no flag" "$out" "Flags: 0 hard, 0 soft"
+sn $'- A1: proven by test_bar and test_gone'
+assert_contains "a proof list: each is checked" "$out" "A1's proof test_gone isn't found"
+assert_contains "a proof list: only the missing one is flagged" "$out" "Flags: 1 hard, 0 soft"
+sn $'- A1: proven by: **test_bar** (tests/test_x.sh).'
+assert_contains "proof with a colon, emphasis, parentheses and a full stop: no flag" "$out" "Flags: 0 hard, 0 soft"
+sn $'- A1: proven by: test_gone.'
+assert_contains "proof after a colon, with a full stop: checked" "$out" "A1's proof test_gone isn't found"
+sn $'- A1: proven by “no such line anywhere”'
+assert_contains "a proof in curly quotes is a quoted name" "$out" "A1's proof no such line anywhere isn't found"
+sn $'- A1: proven by “line 7”'
+assert_contains "a proof in curly quotes, found: no flag" "$out" "Flags: 0 hard, 0 soft"
+sn $'- A1: proven by e.g. test_gone'
+assert_contains "e.g. doesn't end the proof" "$out" "hard missing proof (line 1): - A1: proven by e.g. test_gone — A1's proof test_gone isn't found"
+assert_contains "e.g.: one flag" "$out" "Flags: 1 hard, 0 soft"
+sn $'- A1: proven by `npm test`'
+assert_contains "a command proof with no test file or name: nothing to check" "$out" "Flags: 0 hard, 0 soft"
+sn $'- A1: proven by test_bar; it also renames test_gone'
+assert_contains "after the proof's clause: a reference, not a proof" "$out" "hard missing reference (line 1): test_gone"
+assert_not_contains "after the proof's clause: not a missing proof" "$out" "missing proof"
+sn $'- A1: proven by hand'
+assert_contains "a plain word proof is checked" "$out" "A1's proof hand isn't found"
+sn $'- A1: proven by a manual run'
+assert_contains "filler words before a plain word proof are skipped" "$out" "A1's proof manual isn't found"
 sn $'- A1: adds a flag, proven by test_missing'
 assert_contains "a criterion with a marker word: its proof is still checked" "$out" "hard missing proof (line 1): - A1: adds a flag, proven by test_missing — A1's proof test_missing isn't found"
 sn $'- A1: covered in test_missing.'
@@ -133,6 +179,12 @@ STATS_EVENTS_FILE="$E2E_PASS" sn 'I ran the e2e suite.'
 assert_contains "A7: e2e rc 0 with no later failure: no flag" "$out" "Flags: 0 hard, 0 soft"
 STATS_EVENTS_FILE="$(ev checks-fail.jsonl "{\"event\": \"checks_finished\", \"sha\": \"$SHA\", $J, \"result\": \"fail\"}")" sn 'All tests pass.'
 assert_contains "A8: checks fail: hard" "$out" "hard run that didn't happen (line 1): All tests pass. — checks_finished result=fail"
+E2E_OK_CHECKS_FAIL="$(ev e2e-ok-checks-fail.jsonl "{\"event\": \"e2e_finished\", \"sha\": \"$SHA\", $J, \"rc\": 0}" "{\"event\": \"checks_finished\", \"sha\": \"$SHA\", $J, \"result\": \"fail\"}")"
+STATS_EVENTS_FILE="$E2E_OK_CHECKS_FAIL" sn 'e2e passed and all tests pass'
+assert_contains "e2e and tests-pass claims on one line are both checked" "$out" "hard run that didn't happen (line 1): e2e passed and all tests pass — checks_finished result=fail"
+assert_contains "e2e and tests-pass on one line: one flag" "$out" "Flags: 1 hard, 0 soft"
+STATS_EVENTS_FILE="$E2E_OK_CHECKS_FAIL" sn 'The e2e tests pass.'
+assert_contains "\"e2e tests pass\" is an e2e claim only" "$out" "Flags: 0 hard, 0 soft"
 STATS_EVENTS_FILE="$(ev checks-pass.jsonl "{\"event\": \"checks_finished\", \"sha\": \"$SHA\", $J, \"result\": \"pass\"}")" sn 'All tests pass.'
 assert_contains "A8: checks pass: no flag" "$out" "Flags: 0 hard, 0 soft"
 STATS_EVENTS_FILE="$(ev checks-both.jsonl "{\"event\": \"checks_finished\", \"sha\": \"$SHA\", $J, \"result\": \"fail\"}" "{\"event\": \"checks_finished\", \"sha\": \"$SHA\", \"job_id\": \"j2\", \"result\": \"pass\"}")" sn 'All tests pass.'

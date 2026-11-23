@@ -2,7 +2,7 @@
 # A queue that turns finished branches into merged PRs, one at a time, so agents can build in parallel
 # without testing against a main that moves under them.
 #
-#   pr-queue.sh add [--review <level>] [--tests on|none] <worktree> <type> "<description>" [body-file]   queue a committed branch
+#   pr-queue.sh add [--review <level>] [--tests on|none] [--brief <file>|none] <worktree> <type> "<description>" [body-file]   queue a committed branch
 #   pr-queue.sh run [<checkout>]                                     work through the queues until they are empty
 #   pr-queue.sh status                                               show the queues and their last results
 #   pr-queue.sh lock <command...>                                    run a command holding the e2e lock
@@ -16,7 +16,10 @@
 #      - the tests (review.sh --tests: mutation check, missing, empty, duplicate and non-atomic tests).
 #        add --tests none skips it for that job. PR_QUEUE_TEST_REVIEW=0 skips it, except for jobs queued with
 #        --tests on.
-#      A re-queue of the branch keeps its --review and --tests. The job waits for both reviews, even when one
+#      add --brief <file> (a brief from review.sh --plan, approved by the user) gives both reviews the change's
+#      requirements and acceptance criteria, which they check it against, and the judge, which checks the
+#      findings that name a criterion (REVIEW_BRIEF). A re-queue of the branch keeps its --review, --tests and
+#      --brief: the brief only from its latest job, if that one didn't merge (--brief none drops it). The job waits for both reviews, even when one
 #      fails early, so the branch's agent gets all the findings in one round. A review that didn't run fails
 #      the job. "Needs changes" from either one goes to a judge (review.sh --judge, a third fresh session),
 #      which keeps only the findings that are real and worth fixing:
@@ -131,7 +134,7 @@ jobs_for() {
 }
 
 add() {
-  local review="" tests=""
+  local review="" tests="" brief=""
   while :; do
     case "${1:-}" in
       --review)
@@ -140,6 +143,11 @@ add() {
       --tests)
         tests="${2:-}"; shift 2 || usage
         case "$tests" in on|none) ;; *) die "--tests takes on or none, not '$tests'" ;; esac ;;
+      --brief)
+        brief="${2:-}"; shift 2 || usage
+        if [ "$brief" != none ] && { [ ! -f "$brief" ] || [ ! -s "$brief" ]; }; then
+          die "no such brief, or it's empty: '$brief'"
+        fi ;;
       *) break ;;
     esac
   done
@@ -156,7 +164,7 @@ add() {
   if [ -z "$type" ] || [ -z "$desc" ]; then die "type and description must not be empty"; fi
   if [ -n "$body" ]; then [ -f "$body" ] || die "no such body file: $body"; fi
   # Without --review or --tests, keep what the branch's latest earlier job asked for (a fix after a failed review).
-  local d old_review="" old_tests=""
+  local d old_review="" old_tests="" old_brief=""
   for d in "$RQ/failed" "$RUNNING" "$QUEUE"; do
     while read -r job; do
       [ -n "$job" ] || continue
@@ -170,17 +178,39 @@ add() {
   if [ -z "$tests" ] && [ -n "$old_tests" ]; then
     tests="$old_tests"; echo "pr-queue: keeping --tests $tests from the earlier job"
   fi
+  # The brief: only the branch's latest job's (by its name, which starts with the time it was queued), and
+  # not when that one merged, so that a later branch of the same name never gets an old brief.
+  local latest=""
+  for d in "$RQ/failed" "$RUNNING" "$QUEUE" "$RQ/done"; do
+    while read -r job; do
+      if [ -n "$job" ] && [[ "$(basename "$job")" > "$(basename "$latest")" ]]; then latest="$job"; fi
+    done < <(jobs_for "$d" "$branch")
+  done
+  if [ -n "$latest" ] && [ "$(dirname "$latest")" != "$RQ/done" ] && [ -f "${latest%.job}.brief" ]; then
+    old_brief="${latest%.job}.brief"
+  fi
+  if [ "$brief" = none ]; then
+    brief=""; old_brief=""; echo "pr-queue: no brief for this job"
+  fi
+  # A copy: the earlier job's files may be removed below, before the new job is written.
+  local kept=""
+  if [ -z "$brief" ] && [ -n "$old_brief" ]; then
+    if ! kept="$(mktemp)" || ! cp "$old_brief" "$kept"; then die "can't keep the brief of the earlier job"; fi
+    brief="$kept"; echo "pr-queue: keeping the brief from the earlier job"
+  fi
   # Re-queueing a branch (after a fix) replaces its old job.
   # Its event: job_failed, replaced (no sha: the job file doesn't keep its commit; its job_queued has it).
   while read -r job; do
     EV_REPO="$REPO" EV_BRANCH="$branch" EV_JOB_ID="$(basename "${job%.job}")" EV_SHA="" emit job_failed step=queue reason=replaced
-    rm -f "$job" "${job%.job}.body"
+    rm -f "$job" "${job%.job}.body" "${job%.job}.brief"
   done < <(jobs_for "$QUEUE" "$branch")
   if [ -n "$(jobs_for "$RUNNING" "$branch")" ]; then
     echo "pr-queue: $branch is being processed now; this commit is queued to follow (its worktree and branch are kept)"
   fi
   file="$QUEUE/$(date +%s%N)-${branch//\//-}"
   if [ -n "$body" ]; then cp "$body" "$file.body"; fi
+  if [ -n "$brief" ]; then cp "$brief" "$file.brief" || die "can't store the brief"; fi
+  if [ -n "$kept" ]; then rm -f "$kept"; fi
   printf 'worktree=%s\nbranch=%s\ntype=%s\ndescription=%s\nreview=%s\ntests=%s\n' "$wt" "$branch" "$type" "$desc" "$review" "$tests" > "$file.job"
   EV_REPO="$REPO" EV_BRANCH="$branch" EV_JOB_ID="$(basename "$file")" EV_SHA="$(git -C "$wt" rev-parse HEAD 2>/dev/null)" \
     emit job_queued review:opt="$review" tests:opt="$tests" type="$type"
@@ -207,9 +237,10 @@ failjob() {
   echo "$(date '+%F %T') FAILED $BRANCH: $3 (log: $LOG)" | tee -a "$RESULTS"
   mv "$JOB.job" "$RQ/failed/" 2>/dev/null
   if [ -f "$JOB.body" ]; then mv "$JOB.body" "$RQ/failed/"; fi
+  if [ -f "$JOB.brief" ]; then mv "$JOB.brief" "$RQ/failed/"; fi
   return 1
 }
-finishjob() { mv "$JOB.job" "$RQ/done/"; rm -f "$JOB.body"; }
+finishjob() { mv "$JOB.job" "$RQ/done/"; rm -f "$JOB.body"; if [ -f "$JOB.brief" ]; then mv "$JOB.brief" "$RQ/done/"; fi; }
 # review_result <name> <output file> <exit code> <kind> <level>: logs a review.sh run, and adds to $problems why it failed.
 review_result() {
   local out file
@@ -272,6 +303,7 @@ process() {
   # 2. Review the code and the tests, in fresh sessions at the same time, before the e2e run is spent on it.
   local tests code_pid="" tests_pid="" code_out="" tests_out="" judge_out="" problems="" findings="" found=() found_kinds="" judged
   level="$(field review "$1")"; tests="$(field tests "$1")"
+  local brief=""; if [ -f "$JOB.brief" ]; then brief="$JOB.brief"; fi
   if [ "$level" = none ]; then
     echo "   not reviewed (queued with --review none)" | tee -a "$LOG"; level=""
   elif [ "${PR_QUEUE_REVIEW:-}" != 0 ] || [ -n "$level" ]; then
@@ -291,13 +323,13 @@ process() {
     if [ -n "$level" ]; then
       echo "   reviewing $(git rev-parse --short HEAD) (/code-review $level)" | tee -a "$LOG"
       emit review_started kind=code level="$level"
-      REVIEW_DIR="$REVIEWS" REVIEW_SKIP_TESTS="${tests:+1}" "$HERE/review.sh" "$wt" "$level" >"$code_out" 2>&1 &
+      REVIEW_DIR="$REVIEWS" REVIEW_SKIP_TESTS="${tests:+1}" REVIEW_BRIEF="$brief" "$HERE/review.sh" "$wt" "$level" >"$code_out" 2>&1 &
       code_pid=$!
     fi
     if [ -n "$tests" ]; then
       echo "   reviewing the tests of $(git rev-parse --short HEAD)" | tee -a "$LOG"
       emit review_started kind=tests level:opt=
-      REVIEW_DIR="$REVIEWS" "$HERE/review.sh" --tests "$wt" >"$tests_out" 2>&1 &
+      REVIEW_DIR="$REVIEWS" REVIEW_BRIEF="$brief" "$HERE/review.sh" --tests "$wt" >"$tests_out" 2>&1 &
       tests_pid=$!
     fi
     if [ -n "$code_pid" ]; then wait "$code_pid"; review_rc=$?; review_result review "$code_out" "$review_rc" code "$level"; fi
@@ -314,7 +346,7 @@ process() {
       echo "   judging the findings (review.sh --judge)" | tee -a "$LOG"
       emit review_started kind=judge level:opt=
       judge_out="$(mktemp)"
-      REVIEW_DIR="$REVIEWS" "$HERE/review.sh" --judge "$wt" "${found[@]}" >"$judge_out" 2>&1 &
+      REVIEW_DIR="$REVIEWS" REVIEW_BRIEF="$brief" "$HERE/review.sh" --judge "$wt" "${found[@]}" >"$judge_out" 2>&1 &
       wait $!; review_rc=$?
       trap - INT TERM HUP
       judged="$(cat "$judge_out")"; rm -f "$judge_out"; printf '%s\n' "$judged" >> "$LOG"

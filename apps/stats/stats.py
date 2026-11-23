@@ -15,6 +15,8 @@ Sources, all in $PR_QUEUE_DIR (default ${XDG_STATE_HOME:-~/.local/state}/pr-queu
   it rules on in findings.source: code for "[code review #N]", tests for "[test review #N]"; never their
   text), the mutation line and the verdict; the sidecar .json next to it, when there is one, has the
   authoritative numbers (and tests_skipped, else the -notests in a code review's name).
+- the brief sidecars in $BRIEF_DIR (default briefs/), written by review.sh --plan: only their session id, which
+  makes that session a planner. Briefs are not reviews: they stay out of the reviews table and its costs.
 - results.log files (repos/*/results.log and the old single queue's): FAILED, MERGED and READY lines fill in
   the rounds of the time before a repo had events.
 - Claude Code's transcripts in --projects DIR (default ${CLAUDE_CONFIG_DIR:-~/.claude}/projects): */*.jsonl, one
@@ -45,7 +47,8 @@ and v_cost_per_merged_branch (the agents' estimated cost, from the transcripts, 
 cost, from the review files, per merged branch). These count a subagent toward its parent's role.
 v_escaped_defects: each branch the queue merged, and the fix or revert within 14 days that touched its files.
 v_flaky_checks: each failed CI check run, and when checks passed with no new commits (from the events).
-Session roles: code review, test review, judge or suite for a session a review sidecar names; subagent for a subagent's file
+Session roles: code review, test review, judge or suite for a session a review sidecar names; planner for a
+session a brief sidecar names; subagent for a subagent's file
 (sessions.role_eff rolls it up into its parent's role, and a subagent of the main session that worked in a
 worktree into agent); for an sdk-cli session in a worktree without a sidecar, the review's kind if a review of
 its branch without a sidecar was written within 5 minutes after the session ended (the reviews from before the
@@ -731,10 +734,21 @@ def where(name, place, known):
     return repo, place == "dir" and repo != name
 
 
+def plan_sessions(state):
+    """The session ids the brief sidecars (review.sh --plan) name."""
+    bdir = os.environ.get("BRIEF_DIR") or os.path.join(state, "briefs")
+    out = set()
+    for p in glob.glob(os.path.join(glob.escape(bdir), "*.json")):
+        d = load_sidecar(p)
+        if d and d.get("kind") == "plan" and isinstance(d.get("session_id"), str):
+            out.add(d["session_id"])
+    return out
+
+
 def classify_sessions(db, state):
     """Every session's repo, role, rolled-up role and message count, again. Roles: a session a review sidecar
-    names gets that review's kind; a subagent's file, subagent; an sdk-cli session in a worktree that has no
-    sidecar, and ended at most 5 minutes before a review of its branch without one was written, that review's
+    names gets that review's kind; one a brief sidecar names, planner; a subagent's file, subagent; an sdk-cli
+    session in a worktree that has no sidecar, and ended at most 5 minutes before a review of its branch without one was written, that review's
     kind (each review goes to the session that ended last before it, each session takes one; a session still
     running when the review was written is no review); else an sdk-cli session in a worktree, agent; a cli session in a checkout, main; anything else
     (cli in a worktree, a temp dir), other.
@@ -742,6 +756,7 @@ def classify_sessions(db, state):
     the main session started cd's into its worktree), else of its first cwd (link = cwd). Its rolled-up role
     (role_eff) is its parent's, except that a subagent of a main session that worked in a worktree is an agent."""
     known = known_repos(state)
+    planners = plan_sessions(state)
     by_session = {}
     unnamed = []  # (branch, finished epoch, review id, kind) of the reviews no sidecar ties to a session
     for rid, kind, sess, branch, finished in db.execute(
@@ -773,6 +788,8 @@ def classify_sessions(db, state):
         if sid in by_session:
             review_id, kind = by_session[sid]
             role = ROLE_BY_KIND.get(kind, "review")
+        elif sid in planners:
+            role = "planner"
         elif parent:
             role = "subagent"
         elif entry == "sdk-cli" and in_worktree:

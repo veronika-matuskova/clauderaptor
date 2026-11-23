@@ -532,11 +532,11 @@ echo "-- transcripts: roles, repo and branch"
 SQ="SELECT role, ifnull(repo,''), ifnull(worktree,''), ifnull(branch,''), ifnull(parent_session,''), msgs FROM sessions WHERE session_id"
 assert_contains "sdk-cli in a worktree: agent, linked by cwd and gitBranch" "$(q "$SQ = 's-agent'")" "agent|app|app-feat-x|feat/x||1"
 assert_contains "a subagent's file: subagent, linked to its parent" "$(q "$SQ = 's-agent:agent-a1'")" "subagent|app|app-feat-x|feat/x|s-agent|1"
-assert_contains "a test review's sidecar session: review" "$(q "$SQ = 's-review'")" "review|app"
+assert_contains "a test review's sidecar session: test review" "$(q "$SQ = 's-review'")" "test review|app"
 assert_contains "a judge's sidecar session: judge" "$(q "$SQ = 's-judge'")" "judge|app"
 assert_contains "a suite audit's sidecar session: suite" "$(q "$SQ = 's-suite'")" "suite|app"
-assert_contains "no sidecar, ended as a review of its branch was written: review" \
-  "$(q "SELECT role, review_id FROM sessions WHERE session_id = 's-oldrev'")" "review|feat-x-abcabcabcabc-medium.md"
+assert_contains "no sidecar, ended as a code review of its branch was written: code review" \
+  "$(q "SELECT role, review_id FROM sessions WHERE session_id = 's-oldrev'")" "code review|feat-x-abcabcabcabc-medium.md"
 assert_contains "a session still running when a review of its branch was written stays an agent" \
   "$(q "SELECT role, ifnull(review_id,'none') FROM sessions WHERE session_id = 's-long'")" "agent|none"
 assert_contains "a session that ended after a review of its branch was written stays an agent" \
@@ -544,7 +544,7 @@ assert_contains "a session that ended after a review of its branch was written s
 assert_contains "a review written 301 s after a session ended is not its" \
   "$(q "SELECT role, ifnull(review_id,'none') FROM sessions WHERE session_id = 's-gap'")" "agent|none"
 assert_contains "of two reviews written after a session ended, the nearer one is its" \
-  "$(q "SELECT role, review_id FROM sessions WHERE session_id = 's-near'")" "review|feat-u-eeeeeeeeeeee-tests.md"
+  "$(q "SELECT role, review_id FROM sessions WHERE session_id = 's-near'")" "test review|feat-u-eeeeeeeeeeee-tests.md"
 assert_contains "cli in the main checkout: main" "$(q "$SQ = 's-main'")" "main|app|app|main"
 assert_contains "cli in a main checkout under repos/: main" "$(q "$SQ = 's-main2'")" "main|app|app|main"
 assert_contains "cli in a worktree: other" "$(q "$SQ = 's-cliwt'")" "other|app"
@@ -552,7 +552,7 @@ assert_contains "sdk-cli in a temp dir: other" "$(q "$SQ = 's-tmp'")" "other|||m
 assert_contains "sdk-cli in a <repo>-* folder outside repos/: agent" "$(q "$SQ = 's-side'")" "agent|app|app-side|feat/z"
 assert_contains "the first cwd, branch and entrypoint count" "$(q "$SQ = 's-move'")" "agent|app|app-feat-x|feat/x"
 RE="SELECT role, role_eff, ifnull(repo,''), ifnull(worktree,''), ifnull(branch,''), link FROM sessions WHERE session_id"
-assert_contains "a review's subagent rolls up into review" "$(q "$RE = 's-review:agent-r2'")" "subagent|review|app|app-feat-x|feat/x|worktree"
+assert_contains "a test review's subagent rolls up into test review" "$(q "$RE = 's-review:agent-r2'")" "subagent|test review|app|app-feat-x|feat/x|worktree"
 assert_contains "a main session's subagent in a worktree: its most frequent worktree and branch, rolled up into agent" \
   "$(q "$RE = 's-main:agent-m1'")" "subagent|agent|app|app-feat-x|feat/x|worktree"
 assert_contains "a main session's subagent in the main checkout stays main" "$(q "$RE = 's-main:agent-m2'")" "subagent|main|app|app|main|cwd"
@@ -584,14 +584,16 @@ assert_contains "tokens by role: agent, with its subagent and the main session's
   "$(q "SELECT sessions, subagent_sessions, msgs, tokens_in, tokens_out, tokens_cache_w, tokens_cache_r, cost_usd_est, subagent_cost_usd_est, unpriced_msgs FROM v_tokens_by_role WHERE role = 'agent' AND repo = 'app'")" \
   "3|2|3|3000000|100000|200000|1000000|11.6|4.1|0"
 assert "tokens by role: no subagent row once rolled up" test "$(q "SELECT COUNT(*) FROM v_tokens_by_role WHERE role = 'subagent'")" -eq 0
-got="$(q "SELECT role, sessions, subagent_sessions, tokens, subagent_tokens, subagent_token_share, cost_usd_est, subagent_cost_usd_est, subagent_cost_share FROM v_subagent_share WHERE role = 'review'")"
-# cost: r1 (10*4 + 20*20 + 30*5 + 40*0.2) + o1 (5*4 + 5*20 + 5*5 + 5*0.2) + r2 (100*4) = 598 + 146 + 400 per MTok
-assert_contains "subagent share of a role's tokens and cost" "$got" "review|3|1|220|100|0.4545|0.0011|0.0004|0.3497"
+SS="SELECT role, sessions, subagent_sessions, tokens, subagent_tokens, subagent_token_share, cost_usd_est, subagent_cost_usd_est, subagent_cost_share FROM v_subagent_share WHERE role"
+# test review: r1 (10*4 + 20*20 + 30*5 + 40*0.2) + its subagent r2 (100*4) = 598 + 400 per MTok
+assert_contains "subagent share of a role's tokens and cost" "$(q "$SS = 'test review'")" "test review|2|1|200|100|0.5|0.001|0.0004|0.4008"
+# code review, apart from the test review: o1 (5*4 + 5*20 + 5*5 + 5*0.2) = 146 per MTok, no subagent
+assert_contains "the code review is a role of its own" "$(q "$SS = 'code review'")" "code review|1|0|20|0|0.0|0.0001|"
 assert_contains "tokens by role: unpriced messages counted" "$(q "SELECT ifnull(cost_usd_est,'null'), unpriced_msgs FROM v_tokens_by_role WHERE role = 'main'")" "0.0|1"
 assert_contains "cache hit rate: cache reads / all input" "$(q "SELECT tokens_cache_r, tokens_input, cache_hit_rate FROM v_cache_hit_rate WHERE role = 'agent'")" \
   "1000000|4200000|0.2381"
 assert "cache hit rate: per rolled-up role, no subagent row" \
-  test "$(q "SELECT group_concat(role) FROM (SELECT role FROM v_cache_hit_rate ORDER BY role)")" = "agent,judge,main,review,suite"
+  test "$(q "SELECT group_concat(role) FROM (SELECT role FROM v_cache_hit_rate ORDER BY role)")" = "agent,code review,judge,main,suite,test review"
 assert_contains "cost per merged branch: agent and its subagent (est.), review and judge from the review files" \
   "$(q "SELECT repo, branch, job_id, agent_sessions, agent_cost_usd_est, review_cost_usd, judge_cost_usd FROM v_cost_per_merged_branch")" \
   "app|feat/x|mx|3|11.6|1.5|0.25"
@@ -635,7 +637,7 @@ assert_contains "and the others are read" "$out" "6 transcripts read"
 Q6() { DB2="$DB6" q "$1"; }
 assert_contains "the review goes to the session that ended last before it" \
   "$(Q6 "SELECT group_concat(session_id || ':' || role || ':' || ifnull(review_id,''), ' ') FROM (SELECT * FROM sessions WHERE session_id IN ('s6-agent', 's6-rev') ORDER BY session_id)")" \
-  "s6-agent:agent: s6-rev:review:feat-r-999999999999-medium.md"
+  "s6-agent:agent: s6-rev:code review:feat-r-999999999999-medium.md"
 got="$(Q6 "SELECT job_id, agent_sessions, agent_cost_usd_est, review_cost_usd, ifnull(judge_cost_usd,'none') FROM v_cost_per_merged_branch ORDER BY merged_at")"
 assert_contains "first merge: only what came before it" "$got" "r-m1|1|4.0|1.0|none"
 assert_contains "second merge: only what came since the first" "$got" "r-m2|1|8.0|0.7|0.2"

@@ -38,7 +38,7 @@ and v_cost_per_merged_branch (the agents' estimated cost, from the transcripts, 
 cost, from the review files, per merged branch). These count a subagent toward its parent's role.
 v_escaped_defects: each branch the queue merged, and the fix or revert within 14 days that touched its files.
 v_flaky_checks: each failed CI check run, and when checks passed with no new commits (from the events).
-Session roles: review, judge or suite for a session a review sidecar names; subagent for a subagent's file
+Session roles: code review, test review, judge or suite for a session a review sidecar names; subagent for a subagent's file
 (sessions.role_eff rolls it up into its parent's role, and a subagent of the main session that worked in a
 worktree into agent); for an sdk-cli session in a worktree without a sidecar, the review's kind if a review of
 its branch without a sidecar was written within 5 minutes after the session ended (the reviews from before the
@@ -699,7 +699,7 @@ def ingest_transcript(db, path, sid, parent):
     return new
 
 
-ROLE_BY_KIND = {"code": "review", "tests": "review", "judge": "judge", "suite": "suite"}
+ROLE_BY_KIND = {"code": "code review", "tests": "test review", "judge": "judge", "suite": "suite"}
 
 
 def repo_of_name(name, known):

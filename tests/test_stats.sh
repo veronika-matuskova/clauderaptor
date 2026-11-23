@@ -586,6 +586,15 @@ assert_contains "a main session's subagent in a worktree: its most frequent work
 assert_contains "a main session's subagent in the main checkout stays main" "$(q "$RE = 's-main:agent-m2'")" "subagent|main|app|app|main|cwd"
 assert_contains "a subagent whose parent has no transcript stays subagent" "$(q "$RE = 's-ghost:agent-g'")" "subagent|subagent|app|app|main|cwd"
 assert_contains "a planner's subagent rolls up into planner" "$(q "$RE = 's-plan:agent-p1'")" "subagent|planner|app|app|main|cwd"
+# BRIEF_DIR moves the briefs: the planner is found there, not in $PR_QUEUE_DIR/briefs.
+BD="$TMP/briefs-elsewhere"; mkdir -p "$BD" "$TMP/state-nobriefs"
+cp "$S4/briefs/app-abcabcabcabc-20261110-113000-AbCd.json" "$BD/"
+PR_QUEUE_DIR="$TMP/state-nobriefs" BRIEF_DIR="$BD" ingest "$TMP/out/briefdir.db" >/dev/null
+assert_contains "BRIEF_DIR: a brief sidecar there makes its session a planner" \
+  "$(DB2="$TMP/out/briefdir.db" q "$SQ = 's-plan'")" "planner|"
+PR_QUEUE_DIR="$TMP/state-nobriefs" ingest "$TMP/out/nobriefs.db" >/dev/null
+assert_contains "without a brief sidecar the same session is no planner" \
+  "$(DB2="$TMP/out/nobriefs.db" q "$SQ = 's-plan'")" "other|"
 assert_contains "an agent's subagent rolls up into agent" "$(q "$RE = 's-agent:agent-a1'")" "subagent|agent|app|app-feat-x|feat/x"
 assert_contains "the lines per place of a subagent" "$(q "SELECT group_concat(worktree || ':' || branch || ':' || lines, ',') FROM (SELECT * FROM session_places WHERE session_id = 's-main:agent-m1' ORDER BY worktree, lines)")" \
   "app:main:1,app-feat-q:feat/q:2,app-feat-x:feat/x:1,app-feat-x:feat/x:2"

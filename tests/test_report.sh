@@ -641,6 +641,10 @@ cp "$MS" "$TMP/out/ms6r.db"; sql "$TMP/out/ms6r.db" "UPDATE reviews SET finished
 report --db "$TMP/out/ms6r.db" --out "$TMP/out/ms6r.html" >/dev/null
 assert_contains "A6: a review without a job written before: before" "$(msec "$TMP/out/ms6r.html")" \
   "Mutation share of the test reviews' categorised findings 76% (n=25) not enough data (n=0) Mutation findings per test review 2.7 (n=7) not enough data (n=0)"
+cp "$MS" "$TMP/out/msq.db"; sql "$TMP/out/msq.db" "INSERT INTO jobs (job_id, repo, branch, round, queued, started, ended, outcome) VALUES
+ ('q1', 'app', 'feat/q1', 1, '2026-11-10T11:00:00.000Z', '2026-11-10T12:00:00.000Z', '2026-11-10T12:50:00.000Z', 'merged');"
+assert_contains "A6: queued before the milestone, started at it: after (started comes before queued)" "$(fp "$TMP/out/msq.db")" \
+  "First-pass yield 67% (n=6) not enough data (n=2)"
 # A branch merged before the milestone and made again under the same name: its new round 1 starts a new cycle.
 cp "$MS" "$TMP/out/msre.db"; sql "$TMP/out/msre.db" "INSERT INTO jobs (job_id, repo, branch, round, started, ended, outcome) VALUES
  ('x1', 'app', 'feat/x', 1, '2026-11-09T08:00:00.000Z', '2026-11-09T09:00:00.000Z', 'merged'),

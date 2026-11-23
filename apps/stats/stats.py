@@ -11,7 +11,8 @@ Sources, all in $PR_QUEUE_DIR (default ${XDG_STATE_HOME:-~/.local/state}/pr-queu
   stopped. A last line without its newline is left for the next run; a new file (another inode) or a shorter
   one is read again from the start.
 - the review files in $REVIEW_DIR (default reviews/): the numbers in each .md's header, its findings (number,
-  severity, category, file and line, and a judge's ruling: confirmed, downgraded or rejected; never their
+  severity, category, file and line, and a judge's ruling: confirmed, downgraded or rejected, with the review
+  it rules on in findings.source: code for "[code review #N]", tests for "[test review #N]"; never their
   text), the mutation line and the verdict; the sidecar .json next to it, when there is one, has the
   authoritative numbers (and tests_skipped, else the -notests in a code review's name).
 - results.log files (repos/*/results.log and the old single queue's): FAILED, MERGED and READY lines fill in
@@ -26,6 +27,12 @@ Sources, all in $PR_QUEUE_DIR (default ${XDG_STATE_HOME:-~/.local/state}/pr-queu
 - git, in each repo's main checkout (repos/<repo>/checkout): main's first-parent commits (sha, time, subject,
   the files changed, and the queue branch it merged, if known), and the commits that touched the rules
   (claude/rules/**, CLAUDE.md, scripts/queue/review.sh, claude/agents/**). Read again on every run.
+- milestones.json, next to this script (or $STATS_MILESTONES_FILE, for tests): the milestones, moments that split
+  the stats into before and after (report.py's "Before and after"). A JSON list of {"name": ..., "repo": ...,
+  "commit": ...}; to add one, append an entry once its commit is on the repo's main. Read again on every run
+  into milestones (name, repo, sha, ts): ts is that commit's time on main (main_commits), NULL while it isn't on
+  main yet. A missing file means no milestones; a file that doesn't parse, or an entry without a name, repo or
+  commit, is skipped with a "stats: milestones: ..." warning, and the rest of the ingest goes on.
 meta's last_ingest is the time of the last ingest.
 Ingesting the same files again changes nothing. A db of an older schema version gets the new columns, and its
 review files are read again to fill them.
@@ -38,7 +45,7 @@ and v_cost_per_merged_branch (the agents' estimated cost, from the transcripts, 
 cost, from the review files, per merged branch). These count a subagent toward its parent's role.
 v_escaped_defects: each branch the queue merged, and the fix or revert within 14 days that touched its files.
 v_flaky_checks: each failed CI check run, and when checks passed with no new commits (from the events).
-Session roles: review, judge or suite for a session a review sidecar names; subagent for a subagent's file
+Session roles: code review, test review, judge or suite for a session a review sidecar names; subagent for a subagent's file
 (sessions.role_eff rolls it up into its parent's role, and a subagent of the main session that worked in a
 worktree into agent); for an sdk-cli session in a worktree without a sidecar, the review's kind if a review of
 its branch without a sidecar was written within 5 minutes after the session ended (the reviews from before the
@@ -60,7 +67,7 @@ import subprocess
 import sys
 import time
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -76,7 +83,7 @@ CREATE TABLE IF NOT EXISTS reviews (
   tests_skipped INTEGER);
 CREATE TABLE IF NOT EXISTS findings (
   review_id TEXT NOT NULL, n INTEGER NOT NULL, sev_norm TEXT, sev_raw TEXT, category TEXT, path TEXT, line INTEGER,
-  ruling TEXT, PRIMARY KEY (review_id, n));
+  ruling TEXT, source TEXT, PRIMARY KEY (review_id, n));
 CREATE TABLE IF NOT EXISTS ingest_state (path TEXT PRIMARY KEY, inode INTEGER, size INTEGER, offset INTEGER, mtime REAL);
 CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT PRIMARY KEY, role TEXT, repo TEXT, worktree TEXT, branch TEXT, cwd_hash TEXT, place TEXT,
@@ -104,6 +111,7 @@ CREATE TABLE IF NOT EXISTS main_commit_files (repo TEXT NOT NULL, sha TEXT NOT N
   PRIMARY KEY (repo, sha, path));
 CREATE TABLE IF NOT EXISTS rule_changes (
   repo TEXT NOT NULL, sha TEXT NOT NULL, ts TEXT, subject TEXT, PRIMARY KEY (repo, sha));
+CREATE TABLE IF NOT EXISTS milestones (name TEXT NOT NULL, repo TEXT NOT NULL, sha TEXT NOT NULL, ts TEXT);
 """
 
 # Dropped and made again on every run, so that a new version's views replace an old db's.
@@ -252,10 +260,12 @@ NUM_RE = re.compile(r"^\s?(?:\*\*)?(\d+)[.)]\s+(.*)$")
 TAGS_RE = re.compile(r"^((?:\[[^\]]+\]\s*)+)")
 CODE_SEV_RE = re.compile(r"^[\s*_]*(?:severity:\s*)?[\s*_]*(" + SEV_WORDS + r")\b", re.I)
 JUDGE_TAG_RE = re.compile(r"^(confirmed|downgraded|rejected)\b\s*(.*)$", re.I)
+SOURCE_TAG_RE = re.compile(r"^(code|test) review #\d+$", re.I)  # a judge's "[code review #1]": the finding's source
 
 
 def finding_from(rest, numbered):
-    """(sev_raw, category, judge ruling, path, line) of a finding line's text after its number, or None if it isn't one."""
+    """(sev_raw, category, judge ruling, path, line, source) of a finding line's text after its number, or None if it
+    isn't one. source: code or tests, from a judge's "[code review #N]" or "[test review #N]" tag, else None."""
     path = line = None
     pm = PATH_RE.search(rest)
     if pm:
@@ -263,9 +273,12 @@ def finding_from(rest, numbered):
     tm = TAGS_RE.match(rest)
     if tm:  # test-review / judge style: "[must-fix] [mutation] path:line: ..."
         tags = re.findall(r"\[([^\]]+)\]", tm.group(1))
-        sev = cat = ruling = None
+        sev = cat = ruling = source = None
         for t in tags:
             j = JUDGE_TAG_RE.match(t.strip())
+            sm = SOURCE_TAG_RE.match(t.strip())
+            if source is None and sm:
+                source = "code" if sm.group(1).lower() == "code" else "tests"
             if ruling is None and sev is None and j:
                 ruling, sev = j.group(1).lower(), j.group(2).strip().lower() or None
             elif sev is None and re.fullmatch(SEV_WORDS, t.strip(), re.I):
@@ -274,7 +287,7 @@ def finding_from(rest, numbered):
                 cat = t.strip().lower()
         if sev is None and cat is None and ruling is None:
             return None
-        return sev, cat, ruling, path, line
+        return sev, cat, ruling, path, line, source
     cm = CODE_SEV_RE.match(rest)
     if not cm:
         return None
@@ -284,7 +297,7 @@ def finding_from(rest, numbered):
     cat = None
     if sev.startswith("breaks") or re.search(r"breaks (?:a|the) (?:repo )?rule", rest[:80], re.I):
         cat = "rule"
-    return sev, cat, None, path, line
+    return sev, cat, None, path, line, None
 
 
 def parse_review_md(path):
@@ -526,9 +539,10 @@ def ingest_reviews(db, rdir):
         db.execute("INSERT OR REPLACE INTO reviews (%s) VALUES (%s)" % (", ".join(cols), ", ".join("?" * len(cols))),
                    [row[c] for c in cols])
         db.execute("DELETE FROM findings WHERE review_id = ?", (row["id"],))
-        for n, (sev, cat, ruling, fpath, fline) in enumerate(findings, 1):
-            db.execute("INSERT INTO findings (review_id, n, sev_norm, sev_raw, category, ruling, path, line) "
-                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (row["id"], n, sev_norm(sev), sev, cat, ruling, fpath, fline))
+        for n, (sev, cat, ruling, fpath, fline, source) in enumerate(findings, 1):
+            db.execute("INSERT INTO findings (review_id, n, sev_norm, sev_raw, category, ruling, path, line, source) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                       (row["id"], n, sev_norm(sev), sev, cat, ruling, fpath, fline, source))
         for p, st in ((md, st_md), (sc, st_sc)):
             if st:
                 save_state(db, p, st, st.st_size)
@@ -699,7 +713,7 @@ def ingest_transcript(db, path, sid, parent):
     return new
 
 
-ROLE_BY_KIND = {"code": "review", "tests": "review", "judge": "judge", "suite": "suite"}
+ROLE_BY_KIND = {"code": "code review", "tests": "test review", "judge": "judge", "suite": "suite"}
 
 
 def repo_of_name(name, known):
@@ -1182,6 +1196,50 @@ def ingest_git(db, state):
     return done, n_commits, n_rules
 
 
+# --- milestones: moments that split the stats into before and after ------------------------------------------
+
+def milestones_file():
+    return os.environ.get("STATS_MILESTONES_FILE") or os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "milestones.json")
+
+
+def ingest_milestones(db, path):
+    """milestones, again, from the milestones file: a JSON list of {"name", "repo", "commit"}. Each one's ts is
+    the time of that commit on the repo's main (main_commits, from ingest_git; a commit may be a unique prefix of
+    at least 7 hex digits), or NULL while it isn't on main. A missing file means none. Returns the warnings: a
+    file that doesn't parse, or isn't a list, is skipped; so is an entry without a name, repo or commit."""
+    db.execute("DELETE FROM milestones")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return []
+    except OSError as ex:
+        return ["cannot read %s: %s" % (path, ex.strerror or ex)]
+    try:
+        items = json.loads(text)
+    except ValueError as ex:
+        return ["%s does not parse, skipped: %s" % (path, ex)]
+    if not isinstance(items, list):
+        return ["%s is not a list of milestones, skipped" % path]
+    warnings = []
+    for i, m in enumerate(items):
+        fields = [m.get(k) if isinstance(m, dict) else None for k in ("name", "repo", "commit")]
+        if not all(isinstance(f, str) and f.strip() for f in fields):
+            warnings.append("entry %d of %s has no name, repo or commit, skipped" % (i + 1, path))
+            continue
+        name, repo, commit = (f.strip() for f in fields)
+        commit = commit.lower()
+        if not re.fullmatch(r"[0-9a-f]{7,40}", commit):
+            warnings.append("entry %d of %s: commit %r is not a commit sha, skipped" % (i + 1, path, commit))
+            continue
+        found = db.execute("SELECT ts FROM main_commits WHERE repo = ? AND substr(sha, 1, ?) = ?",
+                           (repo, len(commit), commit)).fetchall()
+        db.execute("INSERT INTO milestones (name, repo, sha, ts) VALUES (?, ?, ?, ?)",
+                   (name, repo, commit, found[0][0] if len(found) == 1 else None))
+    return warnings
+
+
 # --- db -------------------------------------------------------------------------------------------------------
 
 def default_db():
@@ -1205,9 +1263,10 @@ def work_tree_of(path):
 
 MIGRATIONS = {2: [("reviews", "tests_skipped", "INTEGER"), ("findings", "ruling", "TEXT")],
               3: [("jobs", "found", "TEXT")],
-              5: [("sessions", "branch_eff", "TEXT")]}
+              5: [("sessions", "branch_eff", "TEXT")],
+              6: [("findings", "source", "TEXT")]}
 # Version 4 adds tables only (sessions, usage_msgs, usage_daily, prices): SCHEMA makes them. Version 5 also adds
-# meta, checks, main_commits, main_commit_files and rule_changes.
+# meta, checks, main_commits, main_commit_files and rule_changes; version 6 milestones.
 
 
 def migrate(db):
@@ -1257,6 +1316,7 @@ def ingest(dbpath, projects=None):
         classify_sessions(db, state)
         unpriced = rebuild_usage(db)
         git_repos, git_commits, git_rules = ingest_git(db, state)
+        milestone_warnings = ingest_milestones(db, milestones_file())
         db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_ingest', ?)", (iso(time.time()),))
     counts = {t: db.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
               for t in ("events_raw", "jobs", "reviews", "findings", "sessions", "usage_msgs")}
@@ -1270,6 +1330,8 @@ def ingest(dbpath, projects=None):
     print("stats: git: %d main commits and %d rule changes from %d repos" % (git_commits, git_rules, git_repos))
     if unpriced:
         print("stats: no price for %s: their cost is null" % ", ".join(unpriced))
+    for w in milestone_warnings:
+        print("stats: milestones: " + w, file=sys.stderr)
     if skipped:
         print("stats: skipped %d transcripts that could not be read (%s)"
               % (sum(skipped.values()), ", ".join("%s %d" % kv for kv in sorted(skipped.items()))))

@@ -140,6 +140,10 @@ assert_contains "judge: confirmed, its severity" "$got" "1|important|blocker||co
 assert_contains "judge: downgraded" "$got" "2|minor|other||downgraded|cfg/r.yml|73"
 assert_contains "judge: rejected, no severity" "$got" "3||other||rejected|lib/c.py|30"
 assert_contains "judge: critical is a blocker" "$got" "4|critical|blocker||confirmed|tests/t.js|104"
+assert "A1: the judge's source tags: code review, test review; no category" \
+  test "$(q "SELECT group_concat(n || ':' || ifnull(source, '-') || ':' || ifnull(category, '-') || ':' || ruling, ' ') FROM (SELECT * FROM findings WHERE review_id = 'feat-a-111111111111-judge.md' ORDER BY n)")" \
+  = "1:code:-:confirmed 2:tests:-:downgraded 3:code:-:rejected 4:tests:-:confirmed"
+assert "the reviewers' findings have no source" test "$(q "SELECT COUNT(*) FROM findings f JOIN reviews r ON r.id = f.review_id WHERE r.kind != 'judge' AND f.source IS NOT NULL")" -eq 0
 assert "reviewers' findings have no ruling" test "$(q "SELECT COUNT(*) FROM findings f JOIN reviews r ON r.id = f.review_id WHERE r.kind != 'judge' AND f.ruling IS NOT NULL")" -eq 0
 
 C="SELECT kind, ifnull(level,''), verdict, cost_usd, duration_s, ifnull(mut_tried,''), ifnull(mut_caught,''), ifnull(mut_survived,'') FROM reviews WHERE id"
@@ -313,7 +317,7 @@ assert_contains "judge rulings: confirmed" "$got" "confirmed|2|0.5|0.5"
 assert_contains "judge rulings: downgraded" "$got" "downgraded|1|0.25|0.5"
 assert_contains "judge rulings: rejected" "$got" "rejected|1|0.25|0.5"
 assert_contains "cost by kind and level" "$(q "SELECT kind, level, reviews, cost_usd FROM v_cost_by_kind_level WHERE kind = 'code' AND level = 'high'")" "code|high|1|1.3"
-assert "schema version recorded once" test "$(q "SELECT COUNT(*) || ':' || MAX(version) FROM schema_version")" = "1:5"
+assert "schema version recorded once" test "$(q "SELECT COUNT(*) || ':' || MAX(version) FROM schema_version")" = "1:6"
 
 echo "-- a version 1 db is migrated"
 DB2="$TMP/out/v1.db"
@@ -336,12 +340,26 @@ d = sqlite3.connect(sys.argv[2])
 c.executemany("INSERT INTO ingest_state VALUES (?, ?, ?, ?, ?)", d.execute("SELECT * FROM ingest_state"))
 c.commit()' "$DB2" "$DB"
 ingest "$DB2" >/dev/null
-assert "migrated: version 5" test "$(q "SELECT group_concat(version) FROM schema_version")" = 5
+assert "migrated: version 6" test "$(q "SELECT group_concat(version) FROM schema_version")" = 6
 assert "migrated: jobs.found added and filled" test "$(q "SELECT COUNT(*) FROM jobs WHERE found = 'code,tests'")" -eq 1
 assert "migrated: review files read again, rulings filled" test "$(q "SELECT COUNT(*) FROM findings WHERE ruling = 'confirmed'")" -eq 2
 assert "migrated: tests_skipped filled" test "$(q "SELECT tests_skipped FROM reviews WHERE id = 'feat-c-444444444444-low.md'")" = 1
 assert "migrated: the views are the new ones" test "$(q "SELECT group_concat(DISTINCT kind) FROM v_findings_by_severity")" = "code,tests"
 unset DB2
+
+echo "-- a version 5 db is migrated: the judge's sources filled"
+DB5="$TMP/out/v5.db"; cp "$DB" "$DB5"
+python3 -I -B -c 'import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.executescript("ALTER TABLE findings DROP COLUMN source; DROP TABLE milestones; DELETE FROM schema_version; "
+  "INSERT INTO schema_version VALUES (5);")
+c.commit()' "$DB5"
+assert "the v5 db has no source column" test "$(DB2="$DB5" q "SELECT COUNT(*) FROM pragma_table_info('findings') WHERE name = 'source'")" -eq 0
+ingest "$DB5" >/dev/null
+assert "A2: migrated from 5: version 6" test "$(DB2="$DB5" q "SELECT group_concat(version) FROM schema_version")" = 6
+assert "A2: findings.source exists" test "$(DB2="$DB5" q "SELECT COUNT(*) FROM pragma_table_info('findings') WHERE name = 'source'")" -eq 1
+assert "A2: the judge file read again, its sources filled" test "$(DB2="$DB5" q "SELECT group_concat(n || ':' || ifnull(source, '-'), ' ') FROM (SELECT * FROM findings WHERE review_id = 'feat-a-111111111111-judge.md' ORDER BY n)")" = "1:code 2:tests 3:code 4:tests"
+assert "A2: and the milestones table made" test "$(DB2="$DB5" q "SELECT COUNT(*) FROM milestones")" -eq 0
 
 echo "-- linking reviews to jobs, sidecar-only reviews, a branch in two repos"
 S2="$TMP/state2"; R2="$S2/reviews"; DB2="$TMP/out/links.db"
@@ -532,11 +550,11 @@ echo "-- transcripts: roles, repo and branch"
 SQ="SELECT role, ifnull(repo,''), ifnull(worktree,''), ifnull(branch,''), ifnull(parent_session,''), msgs FROM sessions WHERE session_id"
 assert_contains "sdk-cli in a worktree: agent, linked by cwd and gitBranch" "$(q "$SQ = 's-agent'")" "agent|app|app-feat-x|feat/x||1"
 assert_contains "a subagent's file: subagent, linked to its parent" "$(q "$SQ = 's-agent:agent-a1'")" "subagent|app|app-feat-x|feat/x|s-agent|1"
-assert_contains "a test review's sidecar session: review" "$(q "$SQ = 's-review'")" "review|app"
+assert_contains "a test review's sidecar session: test review" "$(q "$SQ = 's-review'")" "test review|app"
 assert_contains "a judge's sidecar session: judge" "$(q "$SQ = 's-judge'")" "judge|app"
 assert_contains "a suite audit's sidecar session: suite" "$(q "$SQ = 's-suite'")" "suite|app"
-assert_contains "no sidecar, ended as a review of its branch was written: review" \
-  "$(q "SELECT role, review_id FROM sessions WHERE session_id = 's-oldrev'")" "review|feat-x-abcabcabcabc-medium.md"
+assert_contains "no sidecar, ended as a code review of its branch was written: code review" \
+  "$(q "SELECT role, review_id FROM sessions WHERE session_id = 's-oldrev'")" "code review|feat-x-abcabcabcabc-medium.md"
 assert_contains "a session still running when a review of its branch was written stays an agent" \
   "$(q "SELECT role, ifnull(review_id,'none') FROM sessions WHERE session_id = 's-long'")" "agent|none"
 assert_contains "a session that ended after a review of its branch was written stays an agent" \
@@ -544,7 +562,7 @@ assert_contains "a session that ended after a review of its branch was written s
 assert_contains "a review written 301 s after a session ended is not its" \
   "$(q "SELECT role, ifnull(review_id,'none') FROM sessions WHERE session_id = 's-gap'")" "agent|none"
 assert_contains "of two reviews written after a session ended, the nearer one is its" \
-  "$(q "SELECT role, review_id FROM sessions WHERE session_id = 's-near'")" "review|feat-u-eeeeeeeeeeee-tests.md"
+  "$(q "SELECT role, review_id FROM sessions WHERE session_id = 's-near'")" "test review|feat-u-eeeeeeeeeeee-tests.md"
 assert_contains "cli in the main checkout: main" "$(q "$SQ = 's-main'")" "main|app|app|main"
 assert_contains "cli in a main checkout under repos/: main" "$(q "$SQ = 's-main2'")" "main|app|app|main"
 assert_contains "cli in a worktree: other" "$(q "$SQ = 's-cliwt'")" "other|app"
@@ -552,7 +570,7 @@ assert_contains "sdk-cli in a temp dir: other" "$(q "$SQ = 's-tmp'")" "other|||m
 assert_contains "sdk-cli in a <repo>-* folder outside repos/: agent" "$(q "$SQ = 's-side'")" "agent|app|app-side|feat/z"
 assert_contains "the first cwd, branch and entrypoint count" "$(q "$SQ = 's-move'")" "agent|app|app-feat-x|feat/x"
 RE="SELECT role, role_eff, ifnull(repo,''), ifnull(worktree,''), ifnull(branch,''), link FROM sessions WHERE session_id"
-assert_contains "a review's subagent rolls up into review" "$(q "$RE = 's-review:agent-r2'")" "subagent|review|app|app-feat-x|feat/x|worktree"
+assert_contains "a test review's subagent rolls up into test review" "$(q "$RE = 's-review:agent-r2'")" "subagent|test review|app|app-feat-x|feat/x|worktree"
 assert_contains "a main session's subagent in a worktree: its most frequent worktree and branch, rolled up into agent" \
   "$(q "$RE = 's-main:agent-m1'")" "subagent|agent|app|app-feat-x|feat/x|worktree"
 assert_contains "a main session's subagent in the main checkout stays main" "$(q "$RE = 's-main:agent-m2'")" "subagent|main|app|app|main|cwd"
@@ -584,14 +602,16 @@ assert_contains "tokens by role: agent, with its subagent and the main session's
   "$(q "SELECT sessions, subagent_sessions, msgs, tokens_in, tokens_out, tokens_cache_w, tokens_cache_r, cost_usd_est, subagent_cost_usd_est, unpriced_msgs FROM v_tokens_by_role WHERE role = 'agent' AND repo = 'app'")" \
   "3|2|3|3000000|100000|200000|1000000|11.6|4.1|0"
 assert "tokens by role: no subagent row once rolled up" test "$(q "SELECT COUNT(*) FROM v_tokens_by_role WHERE role = 'subagent'")" -eq 0
-got="$(q "SELECT role, sessions, subagent_sessions, tokens, subagent_tokens, subagent_token_share, cost_usd_est, subagent_cost_usd_est, subagent_cost_share FROM v_subagent_share WHERE role = 'review'")"
-# cost: r1 (10*4 + 20*20 + 30*5 + 40*0.2) + o1 (5*4 + 5*20 + 5*5 + 5*0.2) + r2 (100*4) = 598 + 146 + 400 per MTok
-assert_contains "subagent share of a role's tokens and cost" "$got" "review|3|1|220|100|0.4545|0.0011|0.0004|0.3497"
+SS="SELECT role, sessions, subagent_sessions, tokens, subagent_tokens, subagent_token_share, cost_usd_est, subagent_cost_usd_est, subagent_cost_share FROM v_subagent_share WHERE role"
+# test review: r1 (10*4 + 20*20 + 30*5 + 40*0.2) + its subagent r2 (100*4) = 598 + 400 per MTok
+assert_contains "subagent share of a role's tokens and cost" "$(q "$SS = 'test review'")" "test review|2|1|200|100|0.5|0.001|0.0004|0.4008"
+# code review, apart from the test review: o1 (5*4 + 5*20 + 5*5 + 5*0.2) = 146 per MTok, no subagent
+assert_contains "the code review is a role of its own" "$(q "$SS = 'code review'")" "code review|1|0|20|0|0.0|0.0001|"
 assert_contains "tokens by role: unpriced messages counted" "$(q "SELECT ifnull(cost_usd_est,'null'), unpriced_msgs FROM v_tokens_by_role WHERE role = 'main'")" "0.0|1"
 assert_contains "cache hit rate: cache reads / all input" "$(q "SELECT tokens_cache_r, tokens_input, cache_hit_rate FROM v_cache_hit_rate WHERE role = 'agent'")" \
   "1000000|4200000|0.2381"
 assert "cache hit rate: per rolled-up role, no subagent row" \
-  test "$(q "SELECT group_concat(role) FROM (SELECT role FROM v_cache_hit_rate ORDER BY role)")" = "agent,judge,main,review,suite"
+  test "$(q "SELECT group_concat(role) FROM (SELECT role FROM v_cache_hit_rate ORDER BY role)")" = "agent,code review,judge,main,suite,test review"
 assert_contains "cost per merged branch: agent and its subagent (est.), review and judge from the review files" \
   "$(q "SELECT repo, branch, job_id, agent_sessions, agent_cost_usd_est, review_cost_usd, judge_cost_usd FROM v_cost_per_merged_branch")" \
   "app|feat/x|mx|3|11.6|1.5|0.25"
@@ -635,7 +655,7 @@ assert_contains "and the others are read" "$out" "6 transcripts read"
 Q6() { DB2="$DB6" q "$1"; }
 assert_contains "the review goes to the session that ended last before it" \
   "$(Q6 "SELECT group_concat(session_id || ':' || role || ':' || ifnull(review_id,''), ' ') FROM (SELECT * FROM sessions WHERE session_id IN ('s6-agent', 's6-rev') ORDER BY session_id)")" \
-  "s6-agent:agent: s6-rev:review:feat-r-999999999999-medium.md"
+  "s6-agent:agent: s6-rev:code review:feat-r-999999999999-medium.md"
 got="$(Q6 "SELECT job_id, agent_sessions, agent_cost_usd_est, review_cost_usd, ifnull(judge_cost_usd,'none') FROM v_cost_per_merged_branch ORDER BY merged_at")"
 assert_contains "first merge: only what came before it" "$got" "r-m1|1|4.0|1.0|none"
 assert_contains "second merge: only what came since the first" "$got" "r-m2|1|8.0|0.7|0.2"
@@ -719,7 +739,7 @@ c.execute("DELETE FROM ingest_state WHERE path LIKE ?", ("transcript:%",))
 c.commit()' "$DB3"
 PR_QUEUE_DIR="$S4" ingest "$DB3" >/dev/null
 DB2="$DB3"
-assert "migrated: version 5" test "$(q "SELECT group_concat(version) FROM schema_version")" = 5
+assert "migrated: version 6" test "$(q "SELECT group_concat(version) FROM schema_version")" = 6
 assert "migrated: the sessions are read" test "$(q "SELECT COUNT(*) FROM sessions")" -eq 20
 assert_contains "migrated: the views work" "$(q "SELECT agent_cost_usd_est FROM v_cost_per_merged_branch")" "11.6"
 unset DB2 PROJ
@@ -789,7 +809,7 @@ c.executescript("DROP VIEW v_cost_per_merged_branch; DROP VIEW v_escaped_defects
   "DROP TABLE main_commit_files; DROP TABLE rule_changes; DELETE FROM schema_version; INSERT INTO schema_version VALUES (4);")
 c.commit()' "$DB4"
 PROJ="$P8" PR_QUEUE_DIR="$S8" ingest "$DB4" >/dev/null
-assert "migrated from 4: version 5" test "$(DB2="$DB4" q "SELECT group_concat(version) FROM schema_version")" = 5
+assert "migrated from 4: version 6" test "$(DB2="$DB4" q "SELECT group_concat(version) FROM schema_version")" = 6
 assert_contains "migrated from 4: branch_eff filled, the view works" \
   "$(DB2="$DB4" q "SELECT group_concat(branch || ':' || agent_sessions, ' ') FROM (SELECT * FROM v_cost_per_merged_branch ORDER BY branch)")" "feat/e:1 feat/q:1"
 
@@ -841,6 +861,45 @@ assert "rule changes: the short sha" test "$(Q9 "SELECT sha FROM rule_changes WH
 assert "escaped: the queue's merged branches; a fix within 14 days on their files; a revert; not a chore, nor a fix 17 days later" \
   test "$(Q9 "SELECT group_concat(branch || ':' || ifnull(fixed_by, '-'), ' ') FROM (SELECT * FROM v_escaped_defects ORDER BY branch)")" \
   = "feat/x:$FIXX feat/y:- feat/z:$REV fix/x-bug:-"
+echo "-- milestones"
+MF="$TMP/milestones.json"; ZW="$(git -C "$G" log --format=%H -1 side)"
+printf '[{"name": "y <b>", "repo": "app", "commit": "%s"}, {"name": "fix", "repo": "app", "commit": "%s"},
+  {"name": "side", "repo": "app", "commit": "%s"}, {"name": "other repo", "repo": "lib", "commit": "%s"},
+  {"name": "short", "repo": "app", "commit": "%s"}]\n' "${Y:0:7}" "${FIXX^^}" "$ZW" "$Y" "${Y:0:6}" > "$MF"
+out="$(STATS_MILESTONES_FILE="$MF" PR_QUEUE_DIR="$S9" ingest "$DB9")"; rc=$?
+assert "milestones: exit 0" test "$rc" -eq 0
+assert "A3: a commit on main gets its time there (a short or upper-case sha too); off main, or another repo's: NULL" \
+  test "$(Q9 "SELECT group_concat(name || '|' || sha || '|' || ifnull(ts, '-'), ', ') FROM milestones")" \
+  = "y <b>|${Y:0:7}|2026-11-03T09:00:00.000Z, fix|$FIXX|2026-11-05T09:00:00.000Z, side|$ZW|-, other repo|$Y|-"
+assert_contains "a sha shorter than 7: skipped, with a warning" "$out" "stats: milestones: entry 5 of $MF: commit '${Y:0:6}' is not a commit sha, skipped"
+echo '[{"name": "x", "repo": "app"}, {"name": "ok", "repo": "app", "commit": "'"$Y"'"}, "str", {"name": "", "repo": "app", "commit": "'"$Y"'"}]' > "$MF"
+out="$(STATS_MILESTONES_FILE="$MF" PR_QUEUE_DIR="$S9" ingest "$DB9")"; rc=$?
+assert "A4: an entry without a commit: exit 0" test "$rc" -eq 0
+assert_contains "A4: and a warning for it" "$out" "stats: milestones: entry 1 of $MF has no name, repo or commit, skipped"
+assert_contains "A4: one for an entry that isn't an object" "$out" "stats: milestones: entry 3 of $MF has no name, repo or commit, skipped"
+assert_contains "A4: one for an empty name" "$out" "stats: milestones: entry 4 of $MF has no name, repo or commit, skipped"
+assert "A4: the other entry is read" test "$(Q9 "SELECT group_concat(name, ',') FROM milestones")" = ok
+assert "A4: and the other tables are filled" test "$(Q9 "SELECT COUNT(*) FROM main_commits")" -eq 9
+assert_contains "A4: the ingest's summary is printed" "$out" "git: 9 main commits and 5 rule changes from 1 repos"
+echo '[{"name": "x", "repo": "app", "commit": ' > "$MF"
+out="$(STATS_MILESTONES_FILE="$MF" PR_QUEUE_DIR="$S9" ingest "$DB9")"; rc=$?
+assert "A4: a file that doesn't parse: exit 0" test "$rc" -eq 0
+assert_contains "A4: a warning that it doesn't parse" "$out" "stats: milestones: $MF does not parse, skipped"
+assert "A4: no milestones" test "$(Q9 "SELECT COUNT(*) FROM milestones")" -eq 0
+assert "A4: the other tables filled" test "$(Q9 "SELECT (SELECT COUNT(*) FROM main_commits) || ':' || (SELECT COUNT(*) FROM jobs)")" = "9:4"
+echo '{"name": "x"}' > "$MF"
+out="$(STATS_MILESTONES_FILE="$MF" PR_QUEUE_DIR="$S9" ingest "$DB9")"
+assert_contains "not a list: a warning" "$out" "stats: milestones: $MF is not a list of milestones, skipped"
+echo '[{"name": "ok", "repo": "app", "commit": "'"$Y"'"}]' > "$MF"
+STATS_MILESTONES_FILE="$MF" PR_QUEUE_DIR="$S9" ingest "$DB9" >/dev/null
+out="$(STATS_MILESTONES_FILE="$TMP/no-such.json" PR_QUEUE_DIR="$S9" ingest "$DB9")"; rc=$?
+assert "A4: a missing file: exit 0" test "$rc" -eq 0
+assert_not_contains "A4: a missing file: no warning" "$out" "milestones"
+assert "A4: a missing file: no milestones (the old ones are gone)" test "$(Q9 "SELECT COUNT(*) FROM milestones")" -eq 0
+assert "A4: a missing file: the other tables filled" test "$(Q9 "SELECT COUNT(*) FROM main_commits")" -eq 9
+assert "the committed milestones.json is a list" python3 -I -c 'import json, sys; sys.exit(not isinstance(json.load(open(sys.argv[1])), list))' "$ROOT/apps/stats/milestones.json"
+out="$(PR_QUEUE_DIR="$S9" ingest "$DB9")"
+assert_not_contains "the committed file: no warning" "$out" "milestones"
 # git that fails only on the rules log: the repo keeps its rows, and the ingest goes on.
 mkdir -p "$TMP/gitstub"
 # shellcheck disable=SC2016  # the stub's own $a and $@, not this script's

@@ -12,8 +12,9 @@
 # - missing reference (hard): a file reference that isn't in the commit's tree. That is a token with a slash
 #   and an extension (dir/x.sh), a slash and a first folder that is at the commit's top level (scripts/queue),
 #   or no slash and a common file extension (a.js, README.md; not Node.js and the like). A token without a slash
-#   matches a file of that name anywhere in the tree, one with a slash a path that ends with it. A file:line
-#   (a.js:120, a.js:10-20) past the file's last line. A backticked `name()`, or a test_<word> token, that
+#   matches a file of that name anywhere in the tree, one with a slash a path that ends with it (of path#anchor,
+#   the path; Markdown emphasis around a token is dropped). A file:line (a.js:120, a.js:10-20) past the file's
+#   last line. A backticked `name()`, or a test_<word> token, that
 #   git grep doesn't find at the commit.
 # - missing proof (hard): a criterion line (A<n>: ... proven by X, or A<n>: ... X) whose proof X isn't found at
 #   the commit: after "proven by", up to the end of its clause, every "quoted name", test_<word>, file:line (checked
@@ -34,10 +35,11 @@
 # What it doesn't check: whether a claim is true beyond these (no session, no "too good to be true"), numbers,
 # whether proof was added by the branch, and runs outside the queue (no record, soft).
 # References it leaves alone (never flagged): absolute paths, ~/ paths, $VAR or ${...} paths, ../ paths, URLs;
-# tokens with a placeholder or glob (<...>, ..., *); options (-x); and every reference on a line whose prose (not
-# its code spans or paths) says it is new or to be added ("new", "add", "adds", "to add", "will add", "create", "creates"; not "added" or
-# "created") or that it is in another repo ("another repo", "other repo", "target repo", "outside the repo"). A
-# criterion's proof on such a line is still checked.
+# tokens with a placeholder or glob (<...>, ..., *); git ranges (main..HEAD); options (-x); ~~struck-out~~ text;
+# and every reference on a line whose prose (not its code spans or paths) says it is new or to be added ("new",
+# "add", "adds", "to add", "will add", "create", "creates"; not "added" or "created") or that it is in another repo
+# ("another repo", "other repo", "target repo", "outside the repo"). A criterion's proof on such a line is still
+# checked.
 #
 # Output: one line per flag, "<hard|soft> <category> (line <n>): <the claim> — <why>", <n> the line in the
 # input, then "Flags: <h> hard, <s> soft". Exit 0 = no flags, 1 = soft flags only, 2 = a hard flag,
@@ -133,7 +135,7 @@ FILELINE_RE = re.compile(r"^(.+?):(\d+)(?:-(\d+)|:\d+)?$")
 TEST_RE = re.compile(r"(?<![\w/.\-])test_\w+(?![\w/\-]|\.\w)")
 FUNC_RE = re.compile(r"^(?:[A-Za-z_][\w$]*(?:\.|::))*([A-Za-z_][\w$]*)\(\)$")
 CRIT_RE = re.compile(r"^[\s>*+\-]*[*_`]*A(\d+)[*_`]*\s*:")
-NOT_PROVEN_NONE_RE = re.compile(r"not proven[*_`]*\s*:\s*[*_`]*none\b", re.I)
+NOT_PROVEN_NONE_RE = re.compile(r"not proven\s*[*_`]*\s*:\s*[*_`]*\s*none\b", re.I)
 PROVEN_BY_RE = re.compile(r"proven by\b(.*)", re.I)
 # The end of the proof after "proven by": a ;, a sentence's full stop (not e.g. or i.e.), or a dash between clauses.
 PROOF_END_RE = re.compile(r";|(?<!\be\.g)(?<!\bi\.e)\.(?:\s|$)| [—–-] ")
@@ -146,15 +148,31 @@ TESTS_PASS_RE = re.compile(r"(?<!e2e\s)(?<!end-to-end\s)\btests?\s+(?:all\s+)?(?
 WEASEL_RE = re.compile(r"\b(should work|probably|seems to|robust|comprehensive)\b", re.I)
 CLAIM_RE = re.compile(r"\b(done|fixed|fixes|works|working|passing|passes|passed|proven|complete|completed|implemented|resolved)\b", re.I)
 
-def clean(word):
-    """A word without its sentence punctuation: trailing .,;:!?, quotes and emphasis, leading quotes and emphasis
-    (not a leading dot: .github/x and ../x keep it). ./x is x."""
-    word = word.rstrip(".,;:!?*_\"'").lstrip("*_\"'").strip()
+def clean(word, code=False):
+    """A word without its sentence punctuation and Markdown: trailing .,;:!?, quotes, * and ~~ on either side,
+    and _ only in a pair around the word (_a.js_; __init__.py and _config.yml keep theirs). A leading dot stays
+    (.github/x, ../x). In a code span only trailing .,;: go. Then ./x is x, and path#anchor is path."""
+    if code:
+        word = word.strip().rstrip(".,;:")
+    else:
+        while True:
+            before = word
+            word = word.strip().rstrip(".,;:!?\"'").lstrip("\"'").strip("*")
+            if word.startswith("~~") or word.endswith("~~"):
+                word = word.removeprefix("~~").removesuffix("~~")
+            for mark in ("__", "_"):
+                if len(word) > 2 * len(mark) and word.startswith(mark) and word.endswith(mark):
+                    word = word[len(mark):-len(mark)]
+                    break
+            if word == before:
+                break
+    if "#" in word[1:]:
+        word = word.split("#", 1)[0]
     return word[2:] if word.startswith("./") else word
 
 def skipped(tok):
     return (not tok or tok.startswith(("/", "~", "$", "-", "../")) or "$" in tok or "://" in tok
-            or any(c in tok for c in "<>*…") or "..." in tok)
+            or any(c in tok for c in "<>*…") or ".." in tok)
 
 def file_like(tok):
     """A path (without :line) that is meant as a file in the repo."""
@@ -178,8 +196,10 @@ def words(line):
         code = i % 2 == 1
         if code:
             spans.append(seg)
+        else:
+            seg = re.sub(r"~~.*?~~", " ", seg)   # struck-out text is no claim
         for w in SPLIT_RE.split(seg):
-            w = clean(w)
+            w = clean(w, code)
             if w:
                 out.append((w, code))
     return out, spans
@@ -209,7 +229,7 @@ def proofs_after(tail):
     first_word = None
     for i, seg in enumerate(tail.split("`")):
         code = i % 2 == 1
-        for w in (clean(x) for x in SPLIT_RE.split(seg)):
+        for w in (clean(x, code) for x in SPLIT_RE.split(seg)):
             if not w or skipped(w):
                 continue
             fm = FILELINE_RE.match(w)

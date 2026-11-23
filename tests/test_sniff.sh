@@ -14,10 +14,12 @@ EOF
 chmod +x "$TMP/bin/claude"
 export PATH="$TMP/bin:$PATH" STATS_EVENTS_FILE="$TMP/ev/none.jsonl"
 
-# The fixture: a.js (120 lines) defines load(); tests/test_x.sh has test_bar; .github/workflows/ci.yml. The second commit adds later.sh and
+# The fixture: a.js (120 lines) defines load(); tests/test_x.sh has test_bar; .github/workflows/ci.yml,
+# pkg/__init__.py, _config.yml, README.md. The second commit adds later.sh and
 # nonl.txt (3 lines, no final newline).
 R="$TMP/repo"; git init -q -b main "$R"; mkdir -p "$R/tests" "$R/scripts/queue" "$R/.github/workflows"
 echo 'on: push' > "$R/.github/workflows/ci.yml"
+mkdir -p "$R/pkg"; touch "$R/pkg/__init__.py" "$R/_config.yml"; echo '# readme' > "$R/README.md"
 { echo "function load() {}"; for i in $(seq 2 120); do echo "// line $i"; done; } > "$R/a.js"
 printf 'test_bar() { :; }\n' > "$R/tests/test_x.sh"
 echo 'echo x' > "$R/scripts/queue/kept.sh"
@@ -70,6 +72,28 @@ sn 'Changed scripts/queue and scripts/nope.'
 assert_not_contains "a folder at the commit isn't flagged" "$out" "scripts/queue —"
 assert_contains "a folder that isn't there is flagged" "$out" "hard missing reference (line 1): scripts/nope — scripts/nope isn't in the tree"
 assert_contains "folders: one flag" "$out" "Flags: 1 hard, 0 soft"
+sn 'Changed `__init__.py`, pkg/__init__.py, `_config.yml` and _config.yml.'
+assert_contains "names with leading underscores keep them: no flag" "$out" "Flags: 0 hard, 0 soft"
+sn 'Edited *a.js*, _a.js_, **a.js**, __a.js__ and ~~gone.js~~.'
+assert_contains "Markdown emphasis around a path is dropped; struck-out text isn't checked" "$out" "Flags: 0 hard, 0 soft"
+sn 'Edited _gone.js_ and **gone2.js**.'
+assert_contains "a path in _emphasis_ is still checked" "$out" "hard missing reference (line 1): gone.js"
+assert_contains "a path in **bold** is still checked" "$out" "hard missing reference (line 1): gone2.js"
+sn 'See [the readme](README.md), [x](gone.md), [y](https://x.y/a.md) and [z](#anchor).'
+assert_contains "a link's target is checked" "$out" "hard missing reference (line 1): gone.md"
+assert_contains "links: only the missing target is flagged" "$out" "Flags: 1 hard, 0 soft"
+sn 'See README.md#use and gone2.md#x and #123.'
+assert_contains "path#anchor: the path is checked" "$out" "hard missing reference (line 1): gone2.md — gone2.md isn't in the tree"
+assert_contains "path#anchor: only the missing path is flagged" "$out" "Flags: 1 hard, 0 soft"
+sn 'Ran `tool --config=README.md` and `tool --out=gone.txt` and key=a.js.'
+assert_contains "--flag=path: the path is checked" "$out" "hard missing reference (line 1): gone.txt"
+assert_contains "--flag=path, key=value: only the missing path is flagged" "$out" "Flags: 1 hard, 0 soft"
+sn 'Ran git log origin/main..HEAD, `git diff main...feat` and `git log a8ec..bb25`.'
+assert_contains "git ranges aren't paths: no flag" "$out" "Flags: 0 hard, 0 soft"
+sn 'Compared HEAD~1, HEAD^, origin/main~2, v1.2.3, 24.11.0, python3.11, @scope/pkg and @types/node.'
+assert_contains "revs, versions and npm scopes aren't paths: no flag" "$out" "Flags: 0 hard, 0 soft"
+sn 'Wrote C:\Users\x\gone.txt and C:/Users/x/gone.txt.'
+assert_contains "Windows paths aren't checked" "$out" "Flags: 0 hard, 0 soft"
 sn 'Proof in test_nothere and test_bar.'
 assert_contains "test_<word> not found is flagged" "$out" "hard missing reference (line 1): test_nothere"
 assert_not_contains "test_<word> found isn't flagged" "$out" "test_bar —"
@@ -145,6 +169,12 @@ sn $'- A1: adds a flag, proven by test_missing'
 assert_contains "a criterion with a marker word: its proof is still checked" "$out" "hard missing proof (line 1): - A1: adds a flag, proven by test_missing — A1's proof test_missing isn't found"
 sn $'- A1: covered in test_missing.'
 assert_contains "a criterion's test_<word> at the end of a sentence is checked" "$out" "hard missing proof (line 1): - A1: covered in test_missing. — A1's proof test_missing isn't found"
+sn $'- A1: done\n\n**Not proven:** none'
+assert_contains "a bold **Not proven:** none is read" "$out" "hard missing proof (line 1): - A1: done — Not proven: none (line 3), but A1 names no test"
+sn $'- A1: done\n\n__Not proven:__ none'
+assert_contains "a bold __Not proven:__ none is read" "$out" "hard missing proof (line 1): - A1: done — Not proven: none (line 3), but A1 names no test"
+sn $'**A1:** proven by test_gone'
+assert_contains "a bold **A1:** label is a criterion" "$out" "hard missing proof (line 1): **A1:** proven by test_gone — A1's proof test_gone isn't found"
 sn $'Not proven: none\n- A1: did a thing\n  see test_bar'
 assert_contains "Not proven: none: the proof on a continuation line counts" "$out" "Flags: 0 hard, 0 soft"
 sn $'Not proven: none\n- A1: did a thing\n\n  see test_bar'

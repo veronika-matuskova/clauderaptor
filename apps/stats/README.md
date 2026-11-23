@@ -66,6 +66,8 @@ on main, and run `raptor-stats` (or Refresh):
 
     [{"name": "test rules (17a-17c)", "repo": "clauderaptor", "commit": "<sha of the last merge>"}]
 
+An optional `"note"` says in a sentence what changed there, for people reading the file; the stats don't read it.
+
 Its time is that commit's time on the repo's main; until the commit is there, the report lists it as "not on main
 yet". A branch counts by when its first round started (the round-1 job's start, else its queue time, else its
 end), so a branch started before the milestone stays "before" even when it merges after it; its reviews count

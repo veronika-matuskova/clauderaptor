@@ -566,6 +566,98 @@ touch -d '2026-10-30 07:15' "$OLD"
 report --db "$OLD" --out "$TMP/out/old-meta.html" >/dev/null
 assert_contains "no meta table: the db file's time, said so" "$(text "$TMP/out/old-meta.html")" "Last ingested: 2026-10-30 07:15 (the db file's time)."
 
+echo "-- before and after: the milestones"
+# One milestone at 2026-11-10 12:00 (its name hostile) and one not on main yet. Merged branches: b1 started 1 s
+# before it, b2 exactly at it; b3's round 1 started before it, its round 2 after; b4 has no started (queued
+# before, ended after), b5 only an ended (before); b6 and b7 (rounds 1 and 2) the day before. Test reviews:
+# 5 of b6 (3 mutation and 1 empty finding each, and one finding without a category), 1 of b3's round 2 (2
+# mutation), 1 without a job written after the milestone (2 mutation, 1 missing); a code review's mutation finding
+# doesn't count. The judge: of b6, 6 test-review rulings (3 confirmed), 5 code-review (1 confirmed), 1 of no
+# source; of b2, 2 test-review confirmed, 1 code-review rejected.
+MS="$TMP/out/milestones.db"; cp "$EMPTY" "$MS"
+sql "$MS" "
+INSERT INTO jobs (job_id, repo, branch, round, queued, started, ended, outcome) VALUES
+ ('b1', 'app', 'feat/b1', 1, NULL, '2026-11-10T11:59:59.000Z', '2026-11-10T12:30:00.000Z', 'merged'),
+ ('b2', 'app', 'feat/b2', 1, NULL, '2026-11-10T12:00:00.000Z', '2026-11-10T12:40:00.000Z', 'merged'),
+ ('b3a', 'app', 'feat/b3', 1, NULL, '2026-11-10T11:00:00.000Z', '2026-11-10T11:30:00.000Z', 'failed'),
+ ('b3b', 'app', 'feat/b3', 2, NULL, '2026-11-10T13:00:00.000Z', '2026-11-10T13:40:00.000Z', 'merged'),
+ ('b4', 'tool', 'feat/b4', 1, '2026-11-10T11:30:00.000Z', NULL, '2026-11-10T12:30:00.000Z', 'merged'),
+ ('b5', 'tool', 'feat/b5', 1, NULL, NULL, '2026-11-10T11:45:00.000Z', 'merged'),
+ ('b6', 'tool', 'feat/b6', 1, NULL, '2026-11-09T10:00:00.000Z', '2026-11-09T11:00:00.000Z', 'merged'),
+ ('b7a', 'app', 'feat/b7', 1, NULL, '2026-11-09T09:00:00.000Z', '2026-11-09T09:30:00.000Z', 'failed'),
+ ('b7b', 'app', 'feat/b7', 2, NULL, '2026-11-09T10:00:00.000Z', '2026-11-09T10:30:00.000Z', 'merged');
+WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i WHERE n < 5)
+INSERT INTO reviews (id, job_id, kind, finished) SELECT 'tr' || n, 'b6', 'tests', '2026-11-09T11:00:00.000Z' FROM i;
+INSERT INTO reviews (id, job_id, kind, finished) VALUES ('tr6', 'b3b', 'tests', '2026-11-10T13:30:00.000Z'),
+ ('trA', NULL, 'tests', '2026-11-10T12:30:00.000Z'), ('c1', 'b6', 'code', '2026-11-09T11:00:00.000Z'),
+ ('j1', 'b6', 'judge', '2026-11-09T11:00:00.000Z'), ('j2', 'b2', 'judge', '2026-11-10T12:50:00.000Z');
+WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i WHERE n < 4)
+INSERT INTO findings (review_id, n, sev_norm, category) SELECT r.id, i.n, 'major', CASE WHEN i.n <= 3 THEN 'mutation' ELSE 'empty' END
+ FROM i, reviews r WHERE r.job_id = 'b6' AND r.kind = 'tests';
+INSERT INTO findings (review_id, n, sev_norm, category) VALUES ('tr1', 5, 'major', NULL), ('tr6', 1, 'major', 'mutation'),
+ ('tr6', 2, 'major', 'mutation'), ('trA', 1, 'major', 'mutation'), ('trA', 2, 'major', 'mutation'),
+ ('trA', 3, 'major', 'missing'), ('c1', 1, 'major', 'mutation');
+WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i WHERE n < 12)
+INSERT INTO findings (review_id, n, sev_norm, ruling, source) SELECT 'j1', n, 'blocker',
+ CASE WHEN n <= 3 OR n IN (7, 12) THEN 'confirmed' WHEN n <= 6 THEN 'downgraded' ELSE 'rejected' END,
+ CASE WHEN n <= 6 THEN 'tests' WHEN n <= 11 THEN 'code' END FROM i;
+INSERT INTO findings (review_id, n, sev_norm, ruling, source) VALUES ('j2', 1, 'blocker', 'confirmed', 'tests'),
+ ('j2', 2, 'blocker', 'confirmed', 'tests'), ('j2', 3, 'blocker', 'rejected', 'code');
+INSERT INTO milestones (name, repo, sha, ts) VALUES
+ ('<script>alert(9)</script>', 'app', 'abcdef1234567890', '2026-11-10T12:00:00.000Z'), ('later', 'app', '1234567abc', NULL);"
+# msec <html file>: the visible text of the Before and after section
+msec() { text "$1" | grep -o 'Before and after .* Cost and tokens'; }
+out="$(report --db "$MS" --out "$TMP/out/ms.html")"; rc=$?
+assert "milestones: exits 0" test "$rc" -eq 0
+MT="$(msec "$TMP/out/ms.html")"; MH="$(cat "$TMP/out/ms.html")"
+assert_contains "A7: the milestone, its repo, short commit and time" "$MT" "<script>alert(9)</script> app abcdef1, 2026-11-10 12:00 Before After"
+assert_contains "A7: mutation share, before (17 of 22 categorised) and after (n=3)" "$MT" \
+  "Mutation share of the test reviews' categorised findings 77% (n=22) not enough data (n=3)"
+assert_contains "A7: mutation findings per test review (17 in 6; 1 after)" "$MT" "Mutation findings per test review 2.8 (n=6) not enough data (n=1)"
+assert_contains "A7: the judge confirms test-review findings" "$MT" "Judge confirms: test-review findings 50% (n=6) not enough data (n=2)"
+assert_contains "A7: the judge confirms code-review findings" "$MT" "Judge confirms: code-review findings 20% (n=5) not enough data (n=1)"
+# A5, A6: before b1, b3 (by its round 1), b4 (queued), b5 (ended), b6, b7; after b2 only.
+assert_contains "A5, A6, A7: first-pass yield, 4 of 6 before, 1 after" "$MT" "First-pass yield 67% (n=6) not enough data (n=1)"
+assert_contains "A9: a milestone not on main yet" "$MT" "later app 1234567 not on main yet"
+assert_contains "the section comes after Review value" "$(grep -o '<section id="[a-z-]*"' "$TMP/out/ms.html" | tr '\n' ' ')" \
+  '<section id="review-value" <section id="milestones" <section id="tokens"'
+assert_not_contains "A10: the name's tag is escaped" "$MH" "<script>alert(9)"
+assert_contains "A10: as text" "$MH" "&lt;script&gt;alert(9)&lt;/script&gt;"
+# fp <db>: the first-pass yield row of its first milestone
+fp() { report --db "$1" --out "$TMP/out/fp.html" >/dev/null; msec "$TMP/out/fp.html" | grep -o 'First-pass yield [^A-Z]*' | head -1; }
+cp "$MS" "$TMP/out/ms5.db"; sql "$TMP/out/ms5.db" "UPDATE jobs SET started = '2026-11-10T12:00:00.001Z' WHERE job_id = 'b2';"
+assert_contains "A5: started 1 ms after: still after" "$(fp "$TMP/out/ms5.db")" "First-pass yield 67% (n=6) not enough data (n=1)"
+sql "$TMP/out/ms5.db" "UPDATE jobs SET started = '2026-11-10T11:59:59.999Z' WHERE job_id = 'b2';"
+assert_contains "A5: started 1 ms before: before" "$(fp "$TMP/out/ms5.db")" "First-pass yield 71% (n=7) not enough data (n=0)"
+cp "$MS" "$TMP/out/ms6.db"; sql "$TMP/out/ms6.db" "UPDATE jobs SET queued = '2026-11-10T12:10:00.000Z' WHERE job_id = 'b4';
+UPDATE jobs SET ended = '2026-11-10T12:20:00.000Z' WHERE job_id = 'b5';"
+assert_contains "A6: queued and ended after: both after" "$(fp "$TMP/out/ms6.db")" "First-pass yield not enough data (n=4) not enough data (n=3)"
+cp "$MS" "$TMP/out/ms6r.db"; sql "$TMP/out/ms6r.db" "UPDATE reviews SET finished = '2026-11-10T11:00:00.000Z' WHERE id = 'trA';"
+report --db "$TMP/out/ms6r.db" --out "$TMP/out/ms6r.html" >/dev/null
+assert_contains "A6: a review without a job written before: before" "$(msec "$TMP/out/ms6r.html")" \
+  "Mutation share of the test reviews' categorised findings 76% (n=25) not enough data (n=0) Mutation findings per test review 2.7 (n=7) not enough data (n=0)"
+echo "-- before and after: two milestones"
+M2="$TMP/out/ms2.db"; cp "$MS" "$M2"
+sql "$M2" "INSERT INTO jobs (job_id, repo, branch, round, started, ended, outcome) VALUES
+ ('b8', 'app', 'feat/b8', 1, '2026-11-10T15:00:00.000Z', '2026-11-10T15:30:00.000Z', 'merged');"
+assert_contains "A8: one milestone: a branch started later is in its after" "$(fp "$M2")" "First-pass yield 67% (n=6) not enough data (n=2)"
+sql "$M2" "INSERT INTO milestones (name, repo, sha, ts) VALUES ('second', 'tool', 'fedcba9876', '2026-11-10T14:00:00.000Z');"
+report --db "$M2" --out "$TMP/out/ms2.html" >/dev/null
+M2T="$(msec "$TMP/out/ms2.html")"
+assert_contains "A8: the first's after ends at the second" "$M2T" "First-pass yield 67% (n=6) not enough data (n=1) second"
+assert_contains "A8: the second's before starts at the first, its after has the later branch" "$M2T" \
+  "second tool fedcba9, 2026-11-10 14:00 Before After Mutation share of the test reviews' categorised findings not enough data (n=3) not enough data (n=0)"
+assert_contains "A8: the second's first-pass yield" "$M2T" "First-pass yield not enough data (n=1) not enough data (n=1) later"
+echo "-- before and after: no milestones, an old db"
+out="$(report --db "$EMPTY" --out "$TMP/out/nomil.html")"; rc=$?
+assert "A9: no milestones: exits 0" test "$rc" -eq 0
+assert_contains "A9: no milestones: says where to add one" "$(msec "$TMP/out/nomil.html")" \
+  "Before and after No milestones yet: add one to apps/stats/milestones.json. Cost and tokens"
+cp "$EMPTY" "$TMP/out/nomt.db"; sql "$TMP/out/nomt.db" "DROP TABLE milestones;"
+out="$(report --db "$TMP/out/nomt.db" --out "$TMP/out/nomt.html")"; rc=$?
+assert "A9: a db without the milestones table: exits 0" test "$rc" -eq 0
+assert_contains "A9: and says no data yet" "$(msec "$TMP/out/nomt.html")" "Before and after no data yet Cost and tokens"
+
 echo "-- file URLs"
 py() { python3 -I -B -c 'import importlib.util, sys
 spec = importlib.util.spec_from_file_location("r", sys.argv[1]); r = importlib.util.module_from_spec(spec)

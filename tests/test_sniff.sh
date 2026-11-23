@@ -337,10 +337,17 @@ bs "$(brief '- Change `c.js`, `d.js:12`, `db/migrations/009.sql`, test_old and t
 for n in "c.js — c.js isn't in the tree" "d.js:12 — d.js isn't in the tree" "db/migrations/009.sql —" "test_old — git grep doesn't find test_old" "test_new — git grep doesn't find test_new"; do
   assert_contains "A4: given as existing code in Requirements: ${n%% *} flagged" "$out" "hard missing reference (line 7): $n"
 done
-for m in "e.g." "for example" "a stub" "such as" "like"; do
+for m in "e.g." "for example" "a stub" "an example" "a fixture"; do
   bs "$(brief "- Names $m \`c.js\`."$'\n''- `c.js` again.' "$OK_CRIT")"
   assert "fixture marker \"$m\": the name is known on every line" test "$out" = "Flags: 0 hard, 0 soft"
 done
+# Only the approved markers count (fixture, stub, example, for example, e.g.): not like, such as, stubbed, examples.
+for m in "like" "such as" "stubbed" "examples"; do
+  bs "$(brief "- Names $m \`c.js\`." "$OK_CRIT")"
+  assert_contains "\"$m\" isn't a fixture marker: the name is checked" "$out" "hard missing reference (line 7): c.js — c.js isn't in the tree"
+done
+bs "$(brief '- Change `export()` in `a.js`, like before.' '- A1: ok. Check: `git grep -n export`')" --commit "$C1"
+assert_contains "\"like\" doesn't turn off the left-out check of its line" "$out" "hard left out (line 7): \`export()\` — \`export()\` is also called from \`b.js:12\`"
 bs "$(brief '- Nothing.' '- A1: in a fixture where `c.js` calls it. Check: `tests/test_a.sh`')"
 assert "a fixture marker before a criterion's Check: its names are known" test "$out" = "Flags: 0 hard, 0 soft"
 bs "$(brief '- Nothing.' '- A1: it runs. Check: the fixture `tests/gone.sh`')"
@@ -356,6 +363,12 @@ bs "$(brief '- Nothing.' $'- A1: a list:\n  - one\n\n  Check: `tests/test_a.sh`'
 assert "a Check indented under a blank line is the criterion's" test "$out" = "Flags: 0 hard, 0 soft"
 bs "$(brief '- Nothing.' $'- A1: a list:\n  - one\n\nCheck: `tests/test_a.sh`')"
 assert_contains "a line after a blank line, not indented, isn't the criterion's" "$out" "hard no real check (line 10): - A1: a list: — A1 has no Check"
+bs "$(brief $'- Before:\n  ```bash\n  # old behaviour\n  ```\n- Change `export()` in `a.js`.' '- A1: ok. Check: `git grep -n export`')" --commit "$C1"
+assert_contains "a # comment in a fenced block isn't a heading: Requirements go on after it" "$out" "hard left out (line 11): \`export()\` — \`export()\` is also called from \`b.js:12\`"
+bs "$(brief $'~~~\n# not a heading\n```\n~~~\n- Change `export()` in `a.js`.' '- A1: ok. Check: `git grep -n export`')" --commit "$C1"
+assert_contains "a ~~~ fence ends only at ~~~, not at \`\`\`" "$out" "hard left out (line 11): \`export()\`"
+bs "$(brief '- Nothing.' $'- A1: a list:\n  ```\n  # a comment\n  ```\n  Check: `tests/test_a.sh`')"
+assert "a # comment in a fenced block doesn't end a criterion" test "$out" = "Flags: 0 hard, 0 soft"
 bs "$(brief '- Nothing.' $'- A1: a list:\n## Out\nCheck: `tests/test_a.sh`')"
 assert_contains "a heading ends the criterion" "$out" "A1 has no Check"
 bs "$(brief '- Nothing.' $'- A1: a list:\n  - one\n\n\n  Check: `tests/test_a.sh`')"

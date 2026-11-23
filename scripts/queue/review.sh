@@ -400,12 +400,15 @@ if [ "$mode" = plan ]; then
     grep -qE '^[[:space:]]*[-*][[:space:]]+(\*\*)?A1\b' "$1" || m+=", the criteria A1…"
     echo "$m"
   }
-  # sniff <brief> <output file>: sniff.sh in brief mode at the planned commit. Returns its exit code (0, 1 or
-  # 2), or 4 with the reason in why when it didn't run.
+  # sniff <brief> <output file>: sniff.sh in brief mode at the planned commit, on a copy of the brief whose
+  # first line, the title this script adds ("# Brief for <repo> at <sha> (...)"), is blank: it is no claim of
+  # the planner's (a repo named like a file, chart.js, isn't a missing reference), and line numbers stay the same.
+  # Returns its exit code (0, 1 or 2), or 4 with the reason in why when it didn't run.
   sniff() {
     local r
     if [ ! -f "$HERE/sniff.sh" ]; then why="$HERE/sniff.sh is missing"; return 4; fi
-    bash "$HERE/sniff.sh" "$1" --brief --repo "$wt" --commit "$sha" >"$2" 2>"$2.err"; r=$?
+    { echo; tail -n +2 "$1"; } > "$2.in"
+    bash "$HERE/sniff.sh" "$2.in" --brief --repo "$wt" --commit "$sha" >"$2" 2>"$2.err"; r=$?
     case "$r" in 0|1|2) return "$r" ;; esac
     why="sniff.sh exited $r"; if [ -s "$2.err" ]; then why+=": $(head -1 "$2.err")"; fi
     return 4

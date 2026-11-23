@@ -46,7 +46,8 @@
 # - missing reference (hard), as above, except that the names the brief adds or calls fixtures count as known on
 #   every line: the references on a line (outside Acceptance criteria) whose prose has a marker word above, or
 #   "fixture", "stub", "example", "for example" or "e.g.". A criterion (its line and the lines under it, also
-#   indented ones after a blank line, up to the next criterion or heading), and the rest of Acceptance criteria,
+#   indented ones after a blank line, up to the next criterion or heading; a "# line" in a ``` or ~~~ fenced code
+#   block is no heading, there or for the sections), and the rest of Acceptance criteria,
 #   are checked only in its Check: its files and file:lines, not its test names or name()s (planned tests).
 # - no real check (hard): a criterion with no "Check:", or whose Check names nothing that can run: a file at the
 #   commit or one the brief adds, a `command` whose first word is such a file or a program command -v finds, or
@@ -342,7 +343,8 @@ not_proven_none = [n for n, line in enumerate(lines) if NOT_PROVEN_NONE_RE.searc
 
 
 # --- brief mode (--brief) ---
-FIXTURE_RE = re.compile(r"\b(fixtures?|stubs?|stubbed|examples?|for example|such as|like)\b", re.I)
+FIXTURE_RE = re.compile(r"\b(fixture|stub|example|for example)\b", re.I)
+FENCE_RE = re.compile(r"^\s*(```|~~~)")
 EG_RE = re.compile(r"(?<!\w)e\.g\.", re.I)
 HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.*?)\s*$")
 CHECK_RE = re.compile(r"[*_`]*\bcheck\s*[*_`]*\s*:[*_`]*", re.I)
@@ -406,9 +408,21 @@ def blob_lines(path):
     return blob_cache[path]
 
 def brief_sniff():
-    section, cur = [], ""
+    # heading[i]: line i is a heading, not a "# comment" in a ``` or ~~~ fenced code block (fence lines included)
+    heading, fence = [], None
     for line in lines:
-        m = HEADING_RE.match(line)
+        fm = FENCE_RE.match(line)
+        if fence is None and fm:
+            fence = fm.group(1); heading.append(False)
+        elif fence is not None:
+            if fm and fm.group(1) == fence:
+                fence = None
+            heading.append(False)
+        else:
+            heading.append(bool(HEADING_RE.match(line)))
+    section, cur = [], ""
+    for i, line in enumerate(lines):
+        m = HEADING_RE.match(line) if heading[i] else None
         if m:
             cur = m.group(1).strip("*_: ").lower()
         section.append(cur)
@@ -422,7 +436,7 @@ def brief_sniff():
             cur = ["A" + m.group(1), i, [i]]; blocks.append(cur); block_of[i] = cur; gap = False
         elif cur is None:
             continue
-        elif HEADING_RE.match(line):
+        elif heading[i]:
             cur = None
         elif not line.strip():
             if gap:

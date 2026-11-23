@@ -867,6 +867,16 @@ assert "A18: REVIEW_MODEL: the round" test "$(arg_after --model "$STUB/calls/2.a
 assert "A18: REVIEW_EFFORT: the first call" test "$(arg_after --effort "$STUB/calls/1.args")" = max
 assert "A18: REVIEW_EFFORT: the round" test "$(arg_after --effort "$STUB/calls/2.args")" = max
 
+# review.sh's title line is no claim of the planner's: a repo named like a file (lib.js) isn't a missing reference.
+J="$TMP/lib.js"; git init -q -b main "$J"; cp "$P/a.js" "$P/b.js" "$J/"; git -C "$J" add -A; git -C "$J" commit -q -m one
+pbrief '`b.js` stays.' > "$STUB/result"; out="$(rv --plan "$J" "$TMP/request.md")"; jfile="$(saved_of "$out")"
+assert_contains "a repo named like a file: the title names it" "$(head -1 "$jfile")" "# Brief for lib.js at "
+assert_contains "a repo named like a file: no flag from the title" "$(cat "${jfile%.md}-sniff.md")" "Flags: 0 hard, 0 soft"
+assert "a repo named like a file: no round" test "$(cat "$STUB/calls/n")" = 1
+assert_contains "a repo named like a file: exit 0" "$out" "exit=0"
+pbrief nothing > "$STUB/result"; pbrief nothing > "$STUB/result2"; out="$(pv)"
+assert_contains "the title isn't sniffed, the other line numbers stay" "$out" "hard left out, unanswered (line 9): \`export()\`"
+
 pbrief nothing | sed 's/Check: `git grep -n export`/Check: by hand, manually/; s/^- nothing$/- `b.js` stays./' > "$STUB/result"
 out="$(pv)"; pfile="$(saved_of "$out")"
 assert "A23: soft flags only: one call" test "$(cat "$STUB/calls/n")" = 1
@@ -895,7 +905,7 @@ C="$TMP/copy"; mkdir -p "$C/queue"; cp "$ROOT/scripts/queue/review.sh" "$ROOT/sc
 cp "$ROOT/scripts/capped.sh" "$C/"
 cat > "$C/queue/sniff.sh" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$@" > "$STUB/sniff-args"
+printf '%s\n' "$@" > "$STUB/sniff-args"; cp "$1" "$STUB/sniff-input"
 rc="$(cat "$STUB/sniff_rc" 2>/dev/null || echo 0)"
 [ "$rc" = 0 ] && echo "Flags: 0 hard, 0 soft"
 [ "$rc" = 0 ] || echo "sniff: boom" >&2
@@ -903,12 +913,13 @@ exit "$rc"
 EOF
 cv() { rm -rf "$STUB/calls" "$STUB/sniff-args"; PATH="$TMP/bin:$PATH" bash "$C/queue/review.sh" "$@" 2>&1; echo "exit=$?"; }
 out="$(cv --plan "$P" "$TMP/request.md")"; pfile="$(saved_of "$out")"
-assert "A15: sniff.sh gets the brief, --brief, --repo and --commit" test "$(cat "$STUB/sniff-args")" = "$pfile
---brief
+assert "A15: sniff.sh gets --brief, --repo and --commit" test "$(tail -n +2 "$STUB/sniff-args")" = "--brief
 --repo
 $P
 --commit
 $psha"
+assert "sniff.sh gets the brief with its title line blank, the other lines in place" test "$(cat "$STUB/sniff-input")" = "$(echo; tail -n +2 "$pfile")"
+assert_contains "the brief file keeps its title" "$(head -1 "$pfile")" "# Brief for prepo at $psha"
 echo 4 > "$STUB/sniff_rc"; out="$(cv --plan "$P" "$TMP/request.md")"; pfile="$(saved_of "$out")"
 assert_contains "A25: sniff.sh exits 4: the note and its reason" "$out" "note: the brief's sniff didn't run: sniff.sh exited 4: sniff: boom"
 assert_contains "A25: exit 4: the brief is still printed" "$out" "## Requirements"

@@ -14,9 +14,10 @@ EOF
 chmod +x "$TMP/bin/claude"
 export PATH="$TMP/bin:$PATH" STATS_EVENTS_FILE="$TMP/ev/none.jsonl"
 
-# The fixture: a.js (120 lines) defines load(); tests/test_x.sh has test_bar. The second commit adds later.sh and
+# The fixture: a.js (120 lines) defines load(); tests/test_x.sh has test_bar; .github/workflows/ci.yml. The second commit adds later.sh and
 # nonl.txt (3 lines, no final newline).
-R="$TMP/repo"; git init -q -b main "$R"; mkdir -p "$R/tests" "$R/scripts/queue"
+R="$TMP/repo"; git init -q -b main "$R"; mkdir -p "$R/tests" "$R/scripts/queue" "$R/.github/workflows"
+echo 'on: push' > "$R/.github/workflows/ci.yml"
 { echo "function load() {}"; for i in $(seq 2 120); do echo "// line $i"; done; } > "$R/a.js"
 printf 'test_bar() { :; }\n' > "$R/tests/test_x.sh"
 echo 'echo x' > "$R/scripts/queue/kept.sh"
@@ -57,6 +58,12 @@ sn $'Calls `save()`.\nCalls `load()`.'
 assert_contains "A4: save() not found is flagged" "$out" "hard missing reference (line 1): save() — git grep doesn't find save"
 assert_not_contains "A4: load() not flagged" "$out" "load()"
 assert_contains "A4: one hard flag" "$out" "Flags: 1 hard, 0 soft"
+sn 'Changed .github/workflows/ci.yml, `.github/workflows/ci.yml` and ./a.js.'
+assert_contains "a dotfolder path and ./x that exist: no flag" "$out" "Flags: 0 hard, 0 soft"
+sn 'Wrote ./missing/x.sh.'
+assert_contains "./x that isn't there is flagged" "$out" "hard missing reference (line 1): missing/x.sh — missing/x.sh isn't in the tree"
+sn 'Covered by test_missing.'
+assert_contains "a test_<word> at the end of a sentence is checked" "$out" "hard missing reference (line 1): test_missing — git grep doesn't find test_missing"
 sn 'Proof in test_nothere and test_bar.'
 assert_contains "test_<word> not found is flagged" "$out" "hard missing reference (line 1): test_nothere"
 assert_not_contains "test_<word> found isn't flagged" "$out" "test_bar —"
@@ -69,6 +76,8 @@ for m in "Will add" "This adds" "To create" "It creates" "A new file:" "Lives in
   sn "$m \`scripts/queue/nothere.sh\`."
   assert_contains "marker \"$m\": a missing file on that line isn't flagged" "$out" "Flags: 0 hard, 0 soft"
 done
+sn 'See ../other/missing.sh and `../x/y.sh`.'
+assert_contains "../ paths aren't flagged" "$out" "Flags: 0 hard, 0 soft"
 sn 'Added `scripts/queue/new.sh`.'
 assert_contains "\"added\" isn't a marker: still checked" "$out" "hard missing reference (line 1): scripts/queue/new.sh"
 
@@ -81,6 +90,19 @@ assert "A3: exit 2" test "$rc" = 2
 sn $'- A1: proven by "line 7"\n- A2: proven by "no such line anywhere"'
 assert_not_contains "a quoted proof found at the commit: no flag" "$out" "(line 1)"
 assert_contains "a quoted proof not at the commit: hard missing proof" "$out" "hard missing proof (line 2): - A2: proven by \"no such line anywhere\" — A2's proof no such line anywhere isn't found"
+sn $'- A1: proven by `bash tests/test_x.sh`'
+assert_contains "a backticked command as proof: its test file is checked, found: no flag" "$out" "Flags: 0 hard, 0 soft"
+sn $'- A1: proven by `bash tests/test_gone.sh -v`'
+assert_contains "a backticked command as proof: its test file missing: hard missing proof" "$out" "hard missing proof (line 1): - A1: proven by \`bash tests/test_gone.sh -v\` — A1's proof tests/test_gone.sh isn't found"
+assert_contains "a backticked command as proof: one flag" "$out" "Flags: 1 hard, 0 soft"
+sn $'- A1: adds a flag, proven by test_missing'
+assert_contains "a criterion with a marker word: its proof is still checked" "$out" "hard missing proof (line 1): - A1: adds a flag, proven by test_missing — A1's proof test_missing isn't found"
+sn $'- A1: covered in test_missing.'
+assert_contains "a criterion's test_<word> at the end of a sentence is checked" "$out" "hard missing proof (line 1): - A1: covered in test_missing. — A1's proof test_missing isn't found"
+sn $'Not proven: none\n- A1: did a thing\n  see test_bar'
+assert_contains "Not proven: none: the proof on a continuation line counts" "$out" "Flags: 0 hard, 0 soft"
+sn $'Not proven: none\n- A1: did a thing\n\n  see test_bar'
+assert_contains "Not proven: none: a line after a blank line isn't part of the criterion" "$out" "hard missing proof (line 2): - A1: did a thing — Not proven: none (line 1), but A1 names no test"
 sn $'- A1: the gate, in tests/nothere.sh'
 assert_contains "a criterion's test file that isn't there is missing proof" "$out" "hard missing proof (line 1)"
 sn $'- A1: proven by test_bar\n- A3: it works\n\nNot proven: none'
@@ -158,6 +180,9 @@ assert_contains "A12: not a checkout: message on stderr" "$err" "not a git check
 err="$(bash "$S" "$TMP/in.md" --repo "$R" --commit deadbeef 2>&1 >/dev/null)"; rc=$?
 assert "A12: unknown commit: exit 4" test "$rc" = 4
 assert_contains "A12: unknown commit: message on stderr" "$err" "no such commit"
+err="$(bash "$S" - --repo "$R" 2>&1 >/dev/null <&-)"; rc=$?
+assert "an error in the sniff itself (stdin closed): exit 4, not 1" test "$rc" = 4
+assert_contains "an error in the sniff itself: message on stderr" "$err" "the sniff failed"
 err="$(bash "$S" --repo "$R" 2>&1 >/dev/null)"; rc=$?
 assert "bad arguments: exit 4" test "$rc" = 4
 

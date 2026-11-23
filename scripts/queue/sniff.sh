@@ -16,8 +16,9 @@
 #   (a.js:120, a.js:10-20) past the file's last line. A backticked `name()`, or a test_<word> token, that
 #   git grep doesn't find at the commit.
 # - missing proof (hard): a criterion line (A<n>: ... proven by X, or A<n>: ... X) whose proof X isn't found at
-#   the commit: X is the token after "proven by" (a test file, a test_<word>, a "quoted name" or a word), else
-#   the line's test_<word> tokens and test files. And a "Not proven: none" line while a criterion (its line and
+#   the commit: X is the token after "proven by" (a test file, a test_<word>, a "quoted name", a word, or the
+#   test files and test_<word>s in a `backticked command`), else the line's test_<word> tokens and test files.
+#   It is checked whatever marker words (below) the line has. And a "Not proven: none" line while a criterion (its line and
 #   the lines under it, up to the next criterion or a blank line) names no test, no file:line and no backticked
 #   command.
 # - run that didn't happen: by the commit's full sha, exact match only (an agent's commit isn't mapped to the
@@ -33,11 +34,13 @@
 # References it leaves alone (never flagged): absolute paths, ~/ paths, $VAR or ${...} paths, ../ paths, URLs;
 # tokens with a placeholder or glob (<...>, ..., *); options (-x); and every reference on a line whose prose (not
 # its code spans or paths) says it is new or to be added ("new", "add", "adds", "to add", "will add", "create", "creates"; not "added" or
-# "created") or that it is in another repo ("another repo", "other repo", "target repo", "outside the repo").
+# "created") or that it is in another repo ("another repo", "other repo", "target repo", "outside the repo"). A
+# criterion's proof on such a line is still checked.
 #
 # Output: one line per flag, "<hard|soft> <category> (line <n>): <the claim> — <why>", <n> the line in the
 # input, then "Flags: <h> hard, <s> soft". Exit 0 = no flags, 1 = soft flags only, 2 = a hard flag,
-# 4 = the sniff didn't run (bad arguments, a missing file, not a checkout, an unknown commit; the reason on stderr).
+# 4 = the sniff didn't run (bad arguments, a missing file, not a checkout, an unknown commit, or an error in the
+# sniff itself; the reason on stderr).
 set -uo pipefail
 die() { echo "sniff: $*" >&2; exit 4; }
 usage="usage: sniff.sh <file or -> [--repo <checkout>] [--commit <rev>]"
@@ -59,7 +62,15 @@ sha="$(git -C "$top" rev-parse -q --verify "${rev:-HEAD}^{commit}" 2>/dev/null)"
 events="${STATS_EVENTS_FILE:-${PR_QUEUE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/pr-queue}/events.jsonl}"
 
 code="$(cat <<'PY'
-import json, os, re, subprocess, sys
+import json, os, re, subprocess, sys, traceback
+
+# An error in the sniff must never pass for a result: Python exits 1 on an uncaught exception, which is
+# "soft flags only" here. Exit 5 instead, which the shell turns into 4 ("the sniff didn't run").
+def crashed(kind, value, tb):
+    traceback.print_exception(kind, value, tb)
+    sys.stderr.flush()
+    os._exit(5)
+sys.excepthook = crashed
 
 top, sha, events_file, input_path = sys.argv[1:5]
 short = sha[:12]
@@ -117,7 +128,7 @@ NEW_RE = re.compile(r"\b(new|add|adds|create|creates)\b", re.I)
 ELSEWHERE_RE = re.compile(r"\b(another|other|target) repo\b|\boutside the repo\b", re.I)
 SPLIT_RE = re.compile(r"[\s\[\]()\"',|=]+")
 FILELINE_RE = re.compile(r"^(.+?):(\d+)(?:-(\d+)|:\d+)?$")
-TEST_RE = re.compile(r"(?<![\w/.\-])test_\w+(?![\w./\-])")
+TEST_RE = re.compile(r"(?<![\w/.\-])test_\w+(?![\w/\-]|\.\w)")
 FUNC_RE = re.compile(r"^(?:[A-Za-z_][\w$]*(?:\.|::))*([A-Za-z_][\w$]*)\(\)$")
 CRIT_RE = re.compile(r"^[\s>*+\-]*[*_`]*A(\d+)[*_`]*\s*:")
 NOT_PROVEN_NONE_RE = re.compile(r"not proven[*_`]*\s*:\s*[*_`]*none\b", re.I)
@@ -130,7 +141,10 @@ WEASEL_RE = re.compile(r"\b(should work|probably|seems to|robust|comprehensive)\
 CLAIM_RE = re.compile(r"\b(done|fixed|fixes|works|working|passing|passes|passed|proven|complete|completed|implemented|resolved)\b", re.I)
 
 def clean(word):
-    return word.strip(".,;:!?*_\"'").strip()
+    """A word without its sentence punctuation: trailing .,;:!?, quotes and emphasis, leading quotes and emphasis
+    (not a leading dot: .github/x and ../x keep it). ./x is x."""
+    word = word.rstrip(".,;:!?*_\"'").lstrip("*_\"'").strip()
+    return word[2:] if word.startswith("./") else word
 
 def skipped(tok):
     return (not tok or tok.startswith(("/", "~", "$", "-", "../")) or "$" in tok or "://" in tok
@@ -244,7 +258,7 @@ for n, line in enumerate(lines, 1):
     proof_flagged = set()
 
     # missing proof: a criterion's proof that isn't at the commit
-    if CRIT_RE.match(line) and not leave:
+    if CRIT_RE.match(line):
         crit = "A" + CRIT_RE.match(line).group(1)
         m = PROVEN_BY_RE.search(line)
         proofs = []
@@ -252,6 +266,15 @@ for n, line in enumerate(lines, 1):
             p = m.group(1)
             if p.startswith('"'):
                 proofs.append(("quoted", p.strip('"')))
+            elif p.startswith("`") and len(p.strip("`").split()) > 1:
+                # a command: its test names and files are the proof (a command with none has nothing to check)
+                for w in (clean(x) for x in SPLIT_RE.split(p.strip("`"))):
+                    if skipped(w):
+                        continue
+                    if TEST_RE.fullmatch(w):
+                        proofs.append(("test", w))
+                    elif file_like(w):
+                        proofs.append(("file", w))
             else:
                 p = clean(p.strip("`"))
                 if not skipped(p):

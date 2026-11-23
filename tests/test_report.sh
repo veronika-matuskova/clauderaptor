@@ -577,7 +577,7 @@ echo "-- before and after: the milestones"
 # 5 of b6 (3 mutation and 1 empty finding each, and one finding without a category), 1 of b3's round 2 (2
 # mutation), 1 without a job written after the milestone (2 mutation, 1 missing); a code review's mutation finding
 # doesn't count. The judge: of b6, 6 test-review rulings (3 confirmed), 5 code-review (1 confirmed), 1 of no
-# source; of b2, 2 test-review confirmed, 1 code-review rejected.
+# source; of b2, 2 test-review confirmed, 1 code-review rejected. Both milestones have a note, the first's hostile.
 MS="$TMP/out/milestones.db"; cp "$EMPTY" "$MS"
 sql "$MS" "
 INSERT INTO jobs (job_id, repo, branch, round, queued, started, ended, outcome) VALUES
@@ -607,16 +607,22 @@ INSERT INTO findings (review_id, n, sev_norm, ruling, source) SELECT 'j1', n, 'b
  CASE WHEN n <= 6 THEN 'tests' WHEN n <= 11 THEN 'code' END FROM i;
 INSERT INTO findings (review_id, n, sev_norm, ruling, source) VALUES ('j2', 1, 'blocker', 'confirmed', 'tests'),
  ('j2', 2, 'blocker', 'confirmed', 'tests'), ('j2', 3, 'blocker', 'rejected', 'code');
-INSERT INTO milestones (name, repo, sha, ts) VALUES
- ('<script>alert(9)</script>', 'app', 'abcdef1234567890', '2026-11-10T12:00:00.000Z'), ('later', 'app', '1234567abc', NULL);"
+INSERT INTO milestones (name, repo, sha, ts, note) VALUES
+ ('<script>alert(9)</script>', 'app', 'abcdef1234567890', '2026-11-10T12:00:00.000Z', 'what <i>x</i> changed'),
+ ('later', 'app', '1234567abc', NULL, 'not merged yet');"
 # msec <html file>: the visible text of the Before and after section, and nothing else
 msec() { python3 -I -B -c 'import html, re, sys
 s = re.search(r"<section id=\"milestones\".*?</section>", open(sys.argv[1]).read(), flags=re.S).group(0)
 print(html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", s))).strip())' "$1"; }
+# subs <html file>: how many <p class="sub"> the Before and after section has (its intro and the notes)
+subs() { python3 -I -B -c 'import re, sys
+s = re.search(r"<section id=\"milestones\".*?</section>", open(sys.argv[1]).read(), flags=re.S).group(0)
+print(s.count("<p class=\"sub\">"))' "$1"; }
 out="$(report --db "$MS" --out "$TMP/out/ms.html")"; rc=$?
 assert "milestones: exits 0" test "$rc" -eq 0
 MT="$(msec "$TMP/out/ms.html")"; MH="$(cat "$TMP/out/ms.html")"
-assert_contains "A7: the milestone, its repo, short commit and time" "$MT" "<script>alert(9)</script> app abcdef1, 2026-11-10 12:00 Before After"
+assert_contains "A7: the milestone, its repo, short commit and time; note A7: its note after them, before the table" "$MT" \
+  "<script>alert(9)</script> app abcdef1, 2026-11-10 12:00 what <i>x</i> changed Before After"
 assert_contains "A7: mutation share, before (17 of 22 categorised) and after (n=3)" "$MT" \
   "Mutation share of the test reviews' categorised findings 77% (n=22) not enough data (n=3)"
 assert_contains "A7: mutation findings per test review (17 in 6; 1 after)" "$MT" "Mutation findings per test review 2.8 (n=6) not enough data (n=1)"
@@ -624,11 +630,26 @@ assert_contains "A7: the judge confirms test-review findings" "$MT" "Judge confi
 assert_contains "A7: the judge confirms code-review findings" "$MT" "Judge confirms: code-review findings 20% (n=5) not enough data (n=1)"
 # A5, A6: before b1, b3 (by its round 1), b4 (queued), b5 (ended), b6, b7; after b2 only.
 assert_contains "A5, A6, A7: first-pass yield, 4 of 6 before, 1 after" "$MT" "First-pass yield 67% (n=6) not enough data (n=1)"
-assert_contains "A9: a milestone not on main yet" "$MT" "later app 1234567 not on main yet"
+assert_contains "A9: a milestone not on main yet; note A9: with its note" "$MT" "later app 1234567 not merged yet not on main yet"
 assert_contains "the section comes after Review value" "$(grep -o '<section id="[a-z-]*"' "$TMP/out/ms.html" | tr '\n' ' ')" \
   '<section id="review-value" <section id="milestones" <section id="tokens"'
 assert_not_contains "A10: the name's tag is escaped" "$MH" "<script>alert(9)"
 assert_contains "A10: as text" "$MH" "&lt;script&gt;alert(9)&lt;/script&gt;"
+assert_not_contains "note A8: the note's tag is escaped" "$MH" "<i>x</i>"
+assert_contains "note A8: as text" "$MH" "&lt;i&gt;x&lt;/i&gt;"
+assert "note A10: the intro and one note per milestone with one" test "$(subs "$TMP/out/ms.html")" -eq 3
+# A db whose milestones have no note column (schema 6, not ingested since): the milestones, without notes.
+MN="$TMP/out/msnonote.db"; cp "$MS" "$MN"
+sql "$MN" "ALTER TABLE milestones RENAME TO m7; CREATE TABLE milestones (name TEXT NOT NULL, repo TEXT NOT NULL,
+ sha TEXT NOT NULL, ts TEXT); INSERT INTO milestones SELECT name, repo, sha, ts FROM m7; DROP TABLE m7;"
+assert "the copy has no note column" test "$(python3 -I -B -c 'import sqlite3, sys
+print(sqlite3.connect(sys.argv[1]).execute("SELECT COUNT(*) FROM pragma_table_info(\"milestones\") WHERE name = \"note\"").fetchone()[0])' "$MN")" -eq 0
+out="$(report --db "$MN" --out "$TMP/out/msnonote.html")"; rc=$?
+assert "note A11: no note column: exits 0" test "$rc" -eq 0
+MNT="$(msec "$TMP/out/msnonote.html")"
+assert_contains "note A11: the milestone, without a note" "$MNT" "<script>alert(9)</script> app abcdef1, 2026-11-10 12:00 Before After"
+assert_contains "note A11: the one not on main yet, without a note" "$MNT" "later app 1234567 not on main yet"
+assert "note A11: no note element" test "$(subs "$TMP/out/msnonote.html")" -eq 1
 # fp <db>: the first-pass yield row of its first milestone
 fp() { report --db "$1" --out "$TMP/out/fp.html" >/dev/null; msec "$TMP/out/fp.html" | grep -o 'First-pass yield [^A-Z]*' | head -1; }
 cp "$MS" "$TMP/out/ms5.db"; sql "$TMP/out/ms5.db" "UPDATE jobs SET started = '2026-11-10T12:00:00.001Z' WHERE job_id = 'b2';"
@@ -660,6 +681,7 @@ assert_contains "A8: one milestone: a branch started later is in its after" "$(f
 sql "$M2" "INSERT INTO milestones (name, repo, sha, ts) VALUES ('second', 'tool', 'fedcba9876', '2026-11-10T14:00:00.000Z');"
 report --db "$M2" --out "$TMP/out/ms2.html" >/dev/null
 M2T="$(msec "$TMP/out/ms2.html")"
+assert "note A10: a milestone without a note has no note element" test "$(subs "$TMP/out/ms2.html")" -eq 3
 assert_contains "A8: the first's after ends at the second" "$M2T" "First-pass yield 67% (n=6) not enough data (n=1) second"
 assert_contains "A8: the second's before starts at the first, its after has the later branch" "$M2T" \
   "second tool fedcba9, 2026-11-10 14:00 Before After Mutation share of the test reviews' categorised findings not enough data (n=3) not enough data (n=0)"

@@ -31,10 +31,12 @@ Sources, all in $PR_QUEUE_DIR (default ${XDG_STATE_HOME:-~/.local/state}/pr-queu
   (claude/rules/**, CLAUDE.md, scripts/queue/review.sh, claude/agents/**). Read again on every run.
 - milestones.json, next to this script (or $STATS_MILESTONES_FILE, for tests): the milestones, moments that split
   the stats into before and after (report.py's "Before and after"). A JSON list of {"name": ..., "repo": ...,
-  "commit": ...}; to add one, append an entry once its commit is on the repo's main. Read again on every run
-  into milestones (name, repo, sha, ts): ts is that commit's time on main (main_commits), NULL while it isn't on
-  main yet. A missing file means no milestones; a file that doesn't parse, or an entry without a name, repo or
-  commit, is skipped with a "stats: milestones: ..." warning, and the rest of the ingest goes on.
+  "commit": ...}, each with an optional "note" (a sentence on what changed there); to add one, append an entry
+  once its commit is on the repo's main. Read again on every run into milestones (name, repo, sha, ts, note): ts
+  is that commit's time on main (main_commits), NULL while it isn't on main yet; note is the note stripped, NULL
+  when it is missing or empty. A missing file means no milestones; a file that doesn't parse, or an entry
+  without a name, repo or commit, is skipped with a "stats: milestones: ..." warning, and the rest of the ingest
+  goes on. A note that isn't a string is dropped with a warning, and its entry is kept.
 meta's last_ingest is the time of the last ingest.
 Ingesting the same files again changes nothing. A db of an older schema version gets the new columns, and its
 review files are read again to fill them.
@@ -70,7 +72,7 @@ import subprocess
 import sys
 import time
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -114,7 +116,8 @@ CREATE TABLE IF NOT EXISTS main_commit_files (repo TEXT NOT NULL, sha TEXT NOT N
   PRIMARY KEY (repo, sha, path));
 CREATE TABLE IF NOT EXISTS rule_changes (
   repo TEXT NOT NULL, sha TEXT NOT NULL, ts TEXT, subject TEXT, PRIMARY KEY (repo, sha));
-CREATE TABLE IF NOT EXISTS milestones (name TEXT NOT NULL, repo TEXT NOT NULL, sha TEXT NOT NULL, ts TEXT);
+CREATE TABLE IF NOT EXISTS milestones (name TEXT NOT NULL, repo TEXT NOT NULL, sha TEXT NOT NULL, ts TEXT,
+  note TEXT);
 """
 
 # Dropped and made again on every run, so that a new version's views replace an old db's.
@@ -1221,10 +1224,12 @@ def milestones_file():
 
 
 def ingest_milestones(db, path):
-    """milestones, again, from the milestones file: a JSON list of {"name", "repo", "commit"}. Each one's ts is
-    the time of that commit on the repo's main (main_commits, from ingest_git; a commit may be a unique prefix of
-    at least 7 hex digits), or NULL while it isn't on main. A missing file means none. Returns the warnings: a
-    file that doesn't parse, or isn't a list, is skipped; so is an entry without a name, repo or commit."""
+    """milestones, again, from the milestones file: a JSON list of {"name", "repo", "commit"}, each with an
+    optional "note". Each one's ts is the time of that commit on the repo's main (main_commits, from ingest_git;
+    a commit may be a unique prefix of at least 7 hex digits), or NULL while it isn't on main; its note is the
+    note stripped, or NULL when it is missing or empty. A missing file means none. Returns the warnings: a file
+    that doesn't parse, or isn't a list, is skipped; so is an entry without a name, repo or commit. A note that
+    isn't a string is dropped (NULL), and its entry is kept."""
     db.execute("DELETE FROM milestones")
     try:
         with open(path, encoding="utf-8") as fh:
@@ -1250,10 +1255,16 @@ def ingest_milestones(db, path):
         if not re.fullmatch(r"[0-9a-f]{7,40}", commit):
             warnings.append("entry %d of %s: commit %r is not a commit sha, skipped" % (i + 1, path, commit))
             continue
+        note = m.get("note")
+        if isinstance(note, str):
+            note = note.strip() or None
+        elif "note" in m:
+            warnings.append("entry %d of %s: note is not a string, dropped" % (i + 1, path))
+            note = None
         found = db.execute("SELECT ts FROM main_commits WHERE repo = ? AND substr(sha, 1, ?) = ?",
                            (repo, len(commit), commit)).fetchall()
-        db.execute("INSERT INTO milestones (name, repo, sha, ts) VALUES (?, ?, ?, ?)",
-                   (name, repo, commit, found[0][0] if len(found) == 1 else None))
+        db.execute("INSERT INTO milestones (name, repo, sha, ts, note) VALUES (?, ?, ?, ?, ?)",
+                   (name, repo, commit, found[0][0] if len(found) == 1 else None, note))
     return warnings
 
 
@@ -1281,9 +1292,10 @@ def work_tree_of(path):
 MIGRATIONS = {2: [("reviews", "tests_skipped", "INTEGER"), ("findings", "ruling", "TEXT")],
               3: [("jobs", "found", "TEXT")],
               5: [("sessions", "branch_eff", "TEXT")],
-              6: [("findings", "source", "TEXT")]}
+              6: [("findings", "source", "TEXT")],
+              7: [("milestones", "note", "TEXT")]}
 # Version 4 adds tables only (sessions, usage_msgs, usage_daily, prices): SCHEMA makes them. Version 5 also adds
-# meta, checks, main_commits, main_commit_files and rule_changes; version 6 milestones.
+# meta, checks, main_commits, main_commit_files and rule_changes; version 6 milestones; version 7 milestones.note.
 
 
 def migrate(db):

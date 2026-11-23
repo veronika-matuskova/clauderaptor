@@ -28,7 +28,9 @@ count together. A branch counts by its cycle's start (its jobs since its last me
 else queued, else ended), and so do its reviews; a review without a job counts by its finished time. A start at
 or after the milestone's time is after. Milestones are sorted by time: before runs from the previous milestone
 (or the beginning of the data), after to the next one (or now). A milestone not on main yet is listed without
-numbers; a db without the milestones table shows "no data yet".
+numbers; a db without the milestones table shows "no data yet". A milestone's note (milestones.note, from its
+"note" in milestones.json) is shown as text under its heading; a db whose milestones table has no note column yet
+(schema 6, not ingested since) shows the milestones without notes.
 The cost-and-tokens section reads stats.py's transcript views (v_tokens_by_role, v_cache_hit_rate,
 v_subagent_share, v_cost_per_merged_branch) and says "no data yet" while a db doesn't have them.
 The first section, "Queue now", isn't from the db: at render time it reads the queue's own files in $PR_QUEUE_DIR
@@ -540,7 +542,9 @@ def s_milestones(db):
     """Before and after each milestone (stats.py's milestones, from apps/stats/milestones.json)."""
     if not db.has("milestones"):
         return section("Before and after", '<p class="empty">no data yet</p>', "milestones")
-    ms = db.q("SELECT name, repo, sha, ts FROM milestones ORDER BY ts IS NULL, ts, name")
+    # A schema 6 db has no note column until its next ingest: its milestones, without notes.
+    note_col = "note" if any(c[1] == "note" for c in db.q("PRAGMA table_info(milestones)")) else "NULL"
+    ms = db.q("SELECT name, repo, sha, ts, %s FROM milestones ORDER BY ts IS NULL, ts, name" % note_col)
     if not ms:
         return section("Before and after", '<p class="empty">No milestones yet: add one to '
                        'apps/stats/milestones.json.</p>', "milestones")
@@ -550,16 +554,17 @@ def s_milestones(db):
             'one (or now).</p>']
     nums = milestone_numbers(db)
     timed = [m[3] for m in ms if m[3]]
-    for name, repo, sha, ts in ms:
+    for name, repo, sha, ts, note in ms:
+        note_p = '<p class="sub">%s</p>' % e(note) if note else ""
         if not ts:
-            body.append('<h3>%s <span class="n">%s %s</span></h3><p class="empty">not on main yet</p>'
-                        % (e(name), e(repo), e(sha[:7])))
+            body.append('<h3>%s <span class="n">%s %s</span></h3>%s<p class="empty">not on main yet</p>'
+                        % (e(name), e(repo), e(sha[:7]), note_p))
             continue
         lo = max((t for t in timed if t < ts), default=None)
         hi = min((t for t in timed if t > ts), default=None)
         before, after = period_cells(nums, lo, ts), period_cells(nums, ts, hi)
-        body.append('<h3>%s <span class="n">%s %s, %s</span></h3>' % (
-            e(name), e(repo), e(sha[:7]), e(ts[:16].replace("T", " "))))
+        body.append('<h3>%s <span class="n">%s %s, %s</span></h3>%s' % (
+            e(name), e(repo), e(sha[:7]), e(ts[:16].replace("T", " ")), note_p))
         body.append(table(["", "Before", "After"], [(r, b, a) for r, b, a in zip(MILESTONE_ROWS, before, after)]))
     return section("Before and after", "".join(body), "milestones")
 

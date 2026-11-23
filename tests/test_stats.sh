@@ -319,7 +319,7 @@ assert_contains "judge rulings: confirmed" "$got" "confirmed|2|0.5|0.5"
 assert_contains "judge rulings: downgraded" "$got" "downgraded|1|0.25|0.5"
 assert_contains "judge rulings: rejected" "$got" "rejected|1|0.25|0.5"
 assert_contains "cost by kind and level" "$(q "SELECT kind, level, reviews, cost_usd FROM v_cost_by_kind_level WHERE kind = 'code' AND level = 'high'")" "code|high|1|1.3"
-assert "schema version recorded once" test "$(q "SELECT COUNT(*) || ':' || MAX(version) FROM schema_version")" = "1:6"
+assert "schema version recorded once" test "$(q "SELECT COUNT(*) || ':' || MAX(version) FROM schema_version")" = "1:7"
 
 echo "-- a version 1 db is migrated"
 DB2="$TMP/out/v1.db"
@@ -342,7 +342,7 @@ d = sqlite3.connect(sys.argv[2])
 c.executemany("INSERT INTO ingest_state VALUES (?, ?, ?, ?, ?)", d.execute("SELECT * FROM ingest_state"))
 c.commit()' "$DB2" "$DB"
 ingest "$DB2" >/dev/null
-assert "migrated: version 6" test "$(q "SELECT group_concat(version) FROM schema_version")" = 6
+assert "migrated: version 7" test "$(q "SELECT group_concat(version) FROM schema_version")" = 7
 assert "migrated: jobs.found added and filled" test "$(q "SELECT COUNT(*) FROM jobs WHERE found = 'code,tests'")" -eq 1
 assert "migrated: review files read again, rulings filled" test "$(q "SELECT COUNT(*) FROM findings WHERE ruling = 'confirmed'")" -eq 2
 assert "migrated: tests_skipped filled" test "$(q "SELECT tests_skipped FROM reviews WHERE id = 'feat-c-444444444444-low.md'")" = 1
@@ -358,10 +358,27 @@ c.executescript("ALTER TABLE findings DROP COLUMN source; DROP TABLE milestones;
 c.commit()' "$DB5"
 assert "the v5 db has no source column" test "$(DB2="$DB5" q "SELECT COUNT(*) FROM pragma_table_info('findings') WHERE name = 'source'")" -eq 0
 ingest "$DB5" >/dev/null
-assert "A2: migrated from 5: version 6" test "$(DB2="$DB5" q "SELECT group_concat(version) FROM schema_version")" = 6
+assert "A2: migrated from 5: version 7" test "$(DB2="$DB5" q "SELECT group_concat(version) FROM schema_version")" = 7
 assert "A2: findings.source exists" test "$(DB2="$DB5" q "SELECT COUNT(*) FROM pragma_table_info('findings') WHERE name = 'source'")" -eq 1
 assert "A2: the judge file read again, its sources filled" test "$(DB2="$DB5" q "SELECT group_concat(n || ':' || ifnull(source, '-'), ' ') FROM (SELECT * FROM findings WHERE review_id = 'feat-a-111111111111-judge.md' ORDER BY n)")" = "1:code 2:tests 3:code 4:tests"
 assert "A2: and the milestones table made" test "$(DB2="$DB5" q "SELECT COUNT(*) FROM milestones")" -eq 0
+
+echo "-- a version 6 db is migrated: milestones get their note"
+DB6="$TMP/out/v6.db"; cp "$DB" "$DB6"
+python3 -I -B -c 'import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.executescript("DROP TABLE milestones; CREATE TABLE milestones (name TEXT NOT NULL, repo TEXT NOT NULL, "
+  "sha TEXT NOT NULL, ts TEXT); UPDATE findings SET source = NULL; DELETE FROM schema_version; "
+  "INSERT INTO schema_version VALUES (6);")
+c.commit()' "$DB6"
+assert "the v6 db has no note column" test "$(DB2="$DB6" q "SELECT COUNT(*) FROM pragma_table_info('milestones') WHERE name = 'note'")" -eq 0
+echo '[{"name": "six", "repo": "app", "commit": "abcdef1", "note": "six to seven"}]' > "$TMP/m6.json"
+out="$(STATS_MILESTONES_FILE="$TMP/m6.json" ingest "$DB6")"; rc=$?
+assert "note A5: migrated from 6: exit 0" test "$rc" -eq 0
+assert "note A5: migrated from 6: version 7" test "$(DB2="$DB6" q "SELECT group_concat(version) FROM schema_version")" = 7
+assert "note A5: milestones.note exists" test "$(DB2="$DB6" q "SELECT COUNT(*) FROM pragma_table_info('milestones') WHERE name = 'note'")" -eq 1
+assert "note A5: the milestones file's note is filled" test "$(DB2="$DB6" q "SELECT ifnull(note, '-') FROM milestones WHERE name = 'six'")" = "six to seven"
+assert "note A5: the review files read again, the judge's sources filled" test "$(DB2="$DB6" q "SELECT group_concat(n || ':' || ifnull(source, '-'), ' ') FROM (SELECT * FROM findings WHERE review_id = 'feat-a-111111111111-judge.md' ORDER BY n)")" = "1:code 2:tests 3:code 4:tests"
 
 echo "-- linking reviews to jobs, sidecar-only reviews, a branch in two repos"
 S2="$TMP/state2"; R2="$S2/reviews"; DB2="$TMP/out/links.db"
@@ -761,7 +778,7 @@ c.execute("DELETE FROM ingest_state WHERE path LIKE ?", ("transcript:%",))
 c.commit()' "$DB3"
 PR_QUEUE_DIR="$S4" ingest "$DB3" >/dev/null
 DB2="$DB3"
-assert "migrated: version 6" test "$(q "SELECT group_concat(version) FROM schema_version")" = 6
+assert "migrated: version 7" test "$(q "SELECT group_concat(version) FROM schema_version")" = 7
 assert "migrated: the sessions are read" test "$(q "SELECT COUNT(*) FROM sessions")" -eq 22
 assert_contains "migrated: the views work" "$(q "SELECT agent_cost_usd_est FROM v_cost_per_merged_branch")" "11.6"
 unset DB2 PROJ
@@ -831,7 +848,7 @@ c.executescript("DROP VIEW v_cost_per_merged_branch; DROP VIEW v_escaped_defects
   "DROP TABLE main_commit_files; DROP TABLE rule_changes; DELETE FROM schema_version; INSERT INTO schema_version VALUES (4);")
 c.commit()' "$DB4"
 PROJ="$P8" PR_QUEUE_DIR="$S8" ingest "$DB4" >/dev/null
-assert "migrated from 4: version 6" test "$(DB2="$DB4" q "SELECT group_concat(version) FROM schema_version")" = 6
+assert "migrated from 4: version 7" test "$(DB2="$DB4" q "SELECT group_concat(version) FROM schema_version")" = 7
 assert_contains "migrated from 4: branch_eff filled, the view works" \
   "$(DB2="$DB4" q "SELECT group_concat(branch || ':' || agent_sessions, ' ') FROM (SELECT * FROM v_cost_per_merged_branch ORDER BY branch)")" "feat/e:1 feat/q:1"
 
@@ -912,6 +929,30 @@ assert "A4: the other tables filled" test "$(Q9 "SELECT (SELECT COUNT(*) FROM ma
 echo '{"name": "x"}' > "$MF"
 out="$(STATS_MILESTONES_FILE="$MF" PR_QUEUE_DIR="$S9" ingest "$DB9")"
 assert_contains "not a list: a warning" "$out" "stats: milestones: $MF is not a list of milestones, skipped"
+# Notes: a string is stored stripped; none, an empty one or a blank one is NULL, without a warning.
+printf '[{"name": "n1", "repo": "app", "commit": "%s", "note": "  a sentence <b>  "},
+  {"name": "n2", "repo": "app", "commit": "%s"}, {"name": "n3", "repo": "app", "commit": "%s", "note": ""},
+  {"name": "n4", "repo": "app", "commit": "%s", "note": "   "}]\n' "$Y" "$Y" "$Y" "$Y" > "$MF"
+out="$(STATS_MILESTONES_FILE="$MF" PR_QUEUE_DIR="$S9" ingest "$DB9")"; rc=$?
+assert "notes: exit 0" test "$rc" -eq 0
+assert "note A1: a string note is stored, stripped" test "$(Q9 "SELECT ifnull(note, '-') FROM milestones WHERE name = 'n1'")" = "a sentence <b>"
+assert "note A2: no note, an empty one, a blank one: NULL" \
+  test "$(Q9 "SELECT group_concat(name || ':' || ifnull(note, '-'), ' ') FROM (SELECT * FROM milestones WHERE name <> 'n1' ORDER BY name)")" = "n2:- n3:- n4:-"
+assert_not_contains "note A2: and no note warning" "$out" "note is not a string"
+# A note that isn't a string: dropped with a warning, its entry kept; an entry skipped for its commit (none, or
+# not a sha) gets no note warning.
+printf '[{"name": "n5", "repo": "app", "commit": "%s", "note": 5}, {"name": "n6", "repo": "app", "commit": "%s", "note": null},
+  {"name": "n7", "repo": "app", "note": 5}, {"name": "n8", "repo": "app", "commit": "zzzzzzz", "note": 5}]\n' "$Y" "$Y" > "$MF"
+out="$(STATS_MILESTONES_FILE="$MF" PR_QUEUE_DIR="$S9" ingest "$DB9")"; rc=$?
+assert "note A3: a note that isn't a string: exit 0" test "$rc" -eq 0
+assert_contains "note A3: a number: a warning" "$out" "stats: milestones: entry 1 of $MF: note is not a string, dropped"
+assert_contains "note A3: null: a warning" "$out" "stats: milestones: entry 2 of $MF: note is not a string, dropped"
+assert "note A3: both entries read, their notes NULL" \
+  test "$(Q9 "SELECT group_concat(name || ':' || ifnull(note, '-'), ' ') FROM (SELECT * FROM milestones ORDER BY name)")" = "n5:- n6:-"
+assert_contains "note A4: an entry without a commit: its warning" "$out" "stats: milestones: entry 3 of $MF has no name, repo or commit, skipped"
+assert_not_contains "note A4: and no note warning for it" "$out" "entry 3 of $MF: note"
+assert_contains "note A4: a commit that isn't a sha: its warning" "$out" "stats: milestones: entry 4 of $MF: commit 'zzzzzzz' is not a commit sha, skipped"
+assert_not_contains "note A4: and no note warning for it" "$out" "entry 4 of $MF: note"
 echo '[{"name": "ok", "repo": "app", "commit": "'"$Y"'"}]' > "$MF"
 STATS_MILESTONES_FILE="$MF" PR_QUEUE_DIR="$S9" ingest "$DB9" >/dev/null
 out="$(STATS_MILESTONES_FILE="$TMP/no-such.json" PR_QUEUE_DIR="$S9" ingest "$DB9")"; rc=$?
@@ -922,6 +963,11 @@ assert "A4: a missing file: the other tables filled" test "$(Q9 "SELECT COUNT(*)
 assert "the committed milestones.json is a list" python3 -I -c 'import json, sys; sys.exit(not isinstance(json.load(open(sys.argv[1])), list))' "$ROOT/apps/stats/milestones.json"
 out="$(STATS_MILESTONES_FILE="" PR_QUEUE_DIR="$S9" ingest "$DB9")"
 assert_not_contains "the committed file: no warning" "$out" "milestones"
+notes="$(python3 -I -c 'import json, sys
+print("|".join(m["note"].strip() for m in json.load(open(sys.argv[1])) if isinstance(m.get("note"), str) and m["note"].strip()))' "$ROOT/apps/stats/milestones.json")"
+assert "note A13: the committed file has a note" test -n "$notes"
+assert "note A13: the committed file: its notes are stored" \
+  test "$(Q9 "SELECT group_concat(note, '|') FROM (SELECT note FROM milestones WHERE note IS NOT NULL ORDER BY rowid)")" = "$notes"
 # git that fails only on the rules log: the repo keeps its rows, and the ingest goes on.
 mkdir -p "$TMP/gitstub"
 # shellcheck disable=SC2016  # the stub's own $a and $@, not this script's

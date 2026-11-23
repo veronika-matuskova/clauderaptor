@@ -470,13 +470,13 @@ assert "returns without waiting for Edge (it sleeps 5 s)" test $(((t1 - t0) / 10
 assert_contains "says it opens it" "$out" "opening it in an Edge app window"
 assert "Edge started" wait_argv
 want="--app=file://wsl.localhost/Ubuntu${TMP}/my%20stats/report.html
---user-data-dir=\\\\wsl.localhost\\Ubuntu${TMP//\//\\}\\users\\alice\\AppData\\Local\\clauderaptor-stats\\edge-profile
+--user-data-dir=\\\\wsl.localhost\\Ubuntu${TMP//\//\\}\\users\\alice\\AppData\\Local\\clauderaptor-stats\\stats-profile
 --no-first-run
 --no-default-browser-check"
 got="$(cat "$EDGE_ARGV")"
 assert "the exact argv: app URL (escaped), its own profile, the flags" test "$got" = "$want"
 [ "$got" = "$want" ] || printf '       got:  %s\n       want: %s\n' "$got" "$want"
-assert "the profile folder is made" test -d "$TMP/users/alice/AppData/Local/clauderaptor-stats/edge-profile"
+assert "the profile folder is made" test -d "$TMP/users/alice/AppData/Local/clauderaptor-stats/stats-profile"
 assert "the report is written too" test -f "$SP/report.html"
 rm -f "$EDGE_ARGV"
 mkdir -p "$TMP/users/bob/AppData/Local/Microsoft/Edge" "$TMP/users/carol/Documents"
@@ -488,7 +488,7 @@ assert "and starts no Edge" test ! -e "$EDGE_ARGV"
 out="$(edge --out "$SP/report.html" --open --windows-user bob)"; rc=$?
 assert "--windows-user picks one" test "$rc" -eq 0
 assert "Edge started for bob" wait_argv
-assert_contains "with bob's profile" "$(cat "$EDGE_ARGV")" "\\users\\bob\\AppData\\Local\\clauderaptor-stats\\edge-profile"
+assert_contains "with bob's profile" "$(cat "$EDGE_ARGV")" "\\users\\bob\\AppData\\Local\\clauderaptor-stats\\stats-profile"
 rm -f "$EDGE_ARGV"
 out="$(CLAUDERAPTOR_WINDOWS_USER=alice edge --out "$SP/report.html" --open)"; rc=$?
 assert "CLAUDERAPTOR_WINDOWS_USER picks one" test "$rc" -eq 0

@@ -50,7 +50,7 @@ assert "a server runs" test -n "$pid" -a -e "/proc/$pid"
 assert_contains "and says so" "$out" "report: serving it at http://127.0.0.1:$port/ (pid $pid;"
 assert "Edge started" wait_argv
 assert_contains "with the server's page as an app" "$(cat "$EDGE_ARGV")" "--app=http://127.0.0.1:$port/?k="
-assert_contains "and bob's profile" "$(cat "$EDGE_ARGV")" "\\users\\bob\\AppData\\Local\\clauderaptor-stats\\edge-profile"
+assert_contains "and bob's profile" "$(cat "$EDGE_ARGV")" "\\users\\bob\\AppData\\Local\\clauderaptor-stats\\stats-profile"
 tk="$(sed -n 's/^--app=.*?k=//p' "$EDGE_ARGV")"
 page="$(python3 -I -B -c 'import http.client, sys
 c = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=20); c.request("GET", "/?k=" + sys.argv[2])

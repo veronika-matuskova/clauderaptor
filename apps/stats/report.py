@@ -16,7 +16,7 @@ The file has a Refresh button that stays hidden: serve.py serves the page with a
 nonce) that shows it and asks serve.py, on 127.0.0.1 only, to ingest and rebuild. raptor-stats goes through
 serve.py; report.py --open opens the plain file, without Refresh.
 --open then opens it in an Edge app window with its own profile (under WSL: msedge.exe through interop, the
-Windows user's %LOCALAPPDATA%\\clauderaptor-stats\\edge-profile). The Windows user is the only one under
+Windows user's %LOCALAPPDATA%\\clauderaptor-stats\\stats-profile). The Windows user is the only one under
 /mnt/c/Users with an Edge folder; with several, name yours (--windows-user or $CLAUDERAPTOR_WINDOWS_USER).
 Outside WSL it prints the report's path instead. $STATS_EDGE overrides msedge.exe's path and
 $STATS_WINDOWS_USERS_DIR /mnt/c/Users (for tests).
@@ -67,7 +67,9 @@ TOP_REASON_SHARE = 0.40
 
 EDGE = "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
 EDGE_FOLDER = ("AppData", "Local", "Microsoft", "Edge")
-PROFILE_FOLDER = ("AppData", "Local", "clauderaptor-stats", "edge-profile")
+# Edge names an app window's taskbar ID after the URL's host and path (not its port) and this folder's name, so
+# the name differs from skydeck's edge-profile: with the same name both windows share one taskbar button.
+PROFILE_FOLDER = ("AppData", "Local", "clauderaptor-stats", "stats-profile")
 HERE = os.path.dirname(os.path.realpath(__file__))
 
 

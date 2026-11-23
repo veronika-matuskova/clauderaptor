@@ -363,7 +363,7 @@ assert "the server runs" alive "$P1"
 assert "Edge started" wait_argv
 argv="$(cat "$EDGE_ARGV")"
 assert_contains "with a ticket link to the server" "$argv" "--app=http://127.0.0.1:$PORT/?k="
-assert_contains "and the app's profile" "$argv" "--user-data-dir=\\\\wsl.localhost\\Ubuntu${TMP//\//\\}\\users\\alice\\AppData\\Local\\clauderaptor-stats\\edge-profile"
+assert_contains "and the app's profile" "$argv" "--user-data-dir=\\\\wsl.localhost\\Ubuntu${TMP//\//\\}\\users\\alice\\AppData\\Local\\clauderaptor-stats\\stats-profile"
 assert_not_contains "never the token" "$argv" "$TOKEN"
 assert_not_contains "nor in the output" "$out" "$TOKEN"
 tk1="$(sed -n 's/^--app=.*?k=//p' "$EDGE_ARGV")"

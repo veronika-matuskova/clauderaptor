@@ -701,7 +701,7 @@ ss 'Plain.' --session --author reviewer
 assert "A8: requests don't change the exit code (no flags: 0)" test "$rc" = 0
 assert_contains "A8: requests are numbered in order" "$out" "Request 2 to reviewer: Two. | missing: y"
 assert_contains "'No.' is no too-good flag" "$out" "Flags: 0 hard, 0 soft"
-for v in 'no — just a rename' 'no: n/a' 'no, a rename' 'no - a rename'; do
+for v in 'no — just a rename' 'no: n/a' 'no, a rename' 'no - a rename' 'no; a rename' 'no – a rename'; do
   printf '%s\n' "Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: $v" 'Claims: 1' 'Requests: 0' > "$TMP/session-result"
   ss 'Plain.' --session --author reviewer
   assert "A12: 'too good to be true: $v' is no flag" test "$out" = "Flags: 0 hard, 0 soft"
@@ -862,7 +862,7 @@ printf '1. Answered 1: yes — ok\nAnswered: 1\n' > "$TMP/session-result"
 ss 'Answer 1: a.js:100.' --answer "$TMP/earlier.txt"
 assert "a numbered Answered line is read" test "$out" = "Flags: 0 hard, 0 soft"
 printf 'Answered 1: yes — a.js:100 has it\nAnswered: 1\n' > "$TMP/session-result"
-for a in '**Answer 1**: the measurement is at a.js:100.' '**Answer 1:** the measurement is at a.js:100.' '1. Answer 1: the measurement is at a.js:100.'; do
+for a in '**Answer 1**: the measurement is at a.js:100.' '**Answer 1:** the measurement is at a.js:100.' '1. Answer 1: the measurement is at a.js:100.' '1) Answer 1: the measurement is at a.js:100.'; do
   ss "$a" --answer "$TMP/earlier.txt"
   assert "A13: an answer block that starts '${a%%:*}…' is read: no flag" test "$out" = "Flags: 0 hard, 0 soft"
   assert "A13: '${a%%:*}…': exit 0" test "$rc" = 0

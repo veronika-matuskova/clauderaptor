@@ -994,6 +994,29 @@ assert "A7: no Request line in the sniff file's Flags" test -z "$(sed -n '/^## F
 assert "A7: no Request line in the output" test -z "$(grep '^Request' <<<"$out")"
 assert_contains "A7: and the answer stands" "$out" "exit=0"
 
+# A file named only in an Answer block is no scope decision: the left-out flag of the brief stays.
+printf 'Answered 1: yes — a.js:1 has it\nAnswered: 1\n' > "$STUB/answer_result"; pbrief nothing > "$STUB/result"
+{ pbrief nothing; printf '\n## Answers\n\nAnswer 1: export is defined at a.js:1, and b.js:12 calls it.\n'; } > "$STUB/result2"
+out="$(pv)"; pfile="$(saved_of "$out")"
+assert_contains "b.js named only in ## Answers: the left-out flag stays" "$out" "hard left out, unanswered (line 9): \`export()\` — $LEFT"
+assert_contains "b.js named only in ## Answers: 1 hard flag left" "$out" "the brief's sniff has 1 hard flag left"
+assert_not_contains "b.js named only in ## Answers: the answer itself is fine" "$out" "unsupported after one round"
+{ pbrief '`b.js` stays.'; printf '\n## Answers\n\nAnswer 1: export is defined at a.js:1, and b.js:12 calls it.\n'; } > "$STUB/result2"
+out="$(pv)"; pfile="$(saved_of "$out")"
+assert_contains "b.js named in the brief part: no flag left" "$(cat "${pfile%.md}-sniff.md")" "Flags: 0 hard, 0 soft"
+assert_contains "b.js named in the brief part: exit 0" "$out" "exit=0"
+# The heading that splits the answer: "## Answers" in any case, and nothing else on its line.
+pbrief '`b.js` stays.' > "$STUB/result"
+{ pbrief '`b.js` stays.'; printf '\n## answers\n\nAnswer 1: export is defined at a.js:1.\n'; } > "$STUB/result2"
+out="$(pv)"; pfile="$(saved_of "$out")"
+assert "## answers (lower case) splits: the brief ends with its Verdict line" test "$(tail -1 "$pfile")" = "Verdict: ready"
+assert_contains "## answers (lower case): the answers in the sniff file" "$(cat "${pfile%.md}-sniff.md")" $'## The planner\'s answers\n\nAnswer 1: export is defined at a.js:1.'
+{ pbrief '`b.js` stays.'; printf '\n## Answers and more\n\nAnswer 1: export is defined at a.js:1.\n'; } > "$STUB/result2"
+out="$(pv)"; pfile="$(saved_of "$out")"
+assert "## Answers and more doesn't split: the whole answer is the brief" test "$(tail -n +3 "$pfile")" = "$(cat "$STUB/result2")"
+assert_contains "## Answers and more: no answers in the sniff file" "$(cat "${pfile%.md}-sniff.md")" $'## The planner\'s answers\n\nnone'
+assert_contains "## Answers and more: the Answer block is still checked" "$out" "exit=0"
+
 # A round with no Request: the whole answer is the brief, as in part 2, even with a "## Answers" section.
 mv "$STUB/sniff_result" "$TMP/sniff_result.a4"; pbrief nothing > "$STUB/result"
 out="$(pv)"; pfile="$(saved_of "$out")"

@@ -67,9 +67,11 @@
 # a "Request <n> to planner:" line, every flag (but a too-good-to-be-true one: its Request asks for the
 # evidence) and every Request go back to the planner's session, once (claude --resume, the same model, effort,
 # limit and tools): the planner answers with the whole revised brief, then a "## Answers" section with an
-# "Answer <n>:" block for each Request. The part before "## Answers" replaces the brief if it passes the same
-# checks. The whole answer is sniffed again: with --answer <the first sniff's output>, if there were Requests
-# (a Request not answered with evidence is a hard "unsupported after one round" flag), else with --brief alone.
+# "Answer <n>:" block for each Request. The part before "## Answers" (a heading of that text alone, any case)
+# replaces the brief if it passes the same checks, and is sniffed again with --brief. If there were Requests,
+# the whole answer is also checked with --answer <the first sniff's output>: a Request not answered with
+# evidence adds a hard "unsupported after one round" flag (a file named only in an Answer block names nothing
+# for the brief's own checks).
 # There is never a second round. The hard flags left are marked "unanswered", and exit 1 with "the brief's
 # sniff has <n> hard flag(s) left". If the round can't run or its answer fails the checks, the first brief
 # stays, a note says why, and each Request counts as a hard flag left ("unanswered (request <n>)"). The sniff's
@@ -569,10 +571,13 @@ print(b.get("result") or "")
           elif ! case "$(verdict "$scratch/answer-brief.md")" in ready|questions) true ;; *) false ;; esac; then
             reason="the planner's answer has no verdict"
           else
-            if [ "${#rq[@]}" -gt 0 ]; then
-              sniff "$scratch/answer.md" "$scratch/second" --answer "$scratch/first" --author planner; s=$?
-            else
-              sniff "$scratch/answer-brief.md" "$scratch/second"; s=$?
+            # The brief's flags come from the brief part alone: a file named only in an Answer block is no
+            # scope decision. The whole answer, with its Answer blocks, is checked with --answer, and only
+            # its "unsupported after one round" flags are added.
+            sniff "$scratch/answer-brief.md" "$scratch/second"; s=$?
+            if [ "$s" -ne 4 ] && [ "${#rq[@]}" -gt 0 ]; then
+              sniff "$scratch/answer.md" "$scratch/answered" --answer "$scratch/first" --author planner; s=$?
+              grep '^hard unsupported after one round ' "$scratch/answered" >> "$scratch/second"
             fi
             if [ "$s" -eq 4 ]; then reason="the sniff of the planner's answer didn't run: $why"
             else

@@ -113,15 +113,19 @@ python3 -I -c 'import json, sys; print(json.dumps({"result": "important: a.txt:1
 EOF
 # powershell.exe (the keep-awake helper): it's here from the start, so that no test runs the real one (on WSL
 # it's on PATH). It logs its pid in $TQ/awake.pids and its arguments in $TQ/awake.args (one line per start),
-# ignores INT, TERM and HUP, and ends only on stdin's EOF, then logs its pid in $TQ/awake.ended. With
-# $TQ/awake_fail it prints "interop off" to stderr and exits 1 at once.
+# ignores INT, TERM and HUP, and ends only on stdin's EOF, then logs its pid in $TQ/awake.ended. It logs
+# "start <pid>" and "end <pid>" in $TQ/awake.seq, and the files its open fds point to in $TQ/awake.fds. With
+# $TQ/awake_fail it prints "interop off" to stderr and exits 1 at once; with $TQ/awake_slow it takes 0.5 s to end
+# after the EOF, as the real one can.
 cat > "$TQ/bin/powershell.exe" <<'EOF'
 #!/usr/bin/env bash
-echo "$$" >> "$TQ/awake.pids"; printf '%s\n' "$*" >> "$TQ/awake.args"
+echo "$$" >> "$TQ/awake.pids"; printf '%s\n' "$*" >> "$TQ/awake.args"; echo "start $$" >> "$TQ/awake.seq"
+for f in /proc/$$/fd/*; do readlink "$f"; done >> "$TQ/awake.fds" 2>/dev/null
 if [ -f "$TQ/awake_fail" ]; then echo "interop off" >&2; exit 1; fi
 trap '' INT TERM HUP
 while read -r _; do :; done
-echo "$$" >> "$TQ/awake.ended"
+if [ -f "$TQ/awake_slow" ]; then sleep 0.5; fi
+echo "end $$" >> "$TQ/awake.seq"; echo "$$" >> "$TQ/awake.ended"
 EOF
 chmod +x "$TQ/bin/"*
 
@@ -154,7 +158,8 @@ mkwt() {
 reset_pr() {
   rm -f "$TQ/pr_state" "$TQ/pr_body" "$TQ/pr_branch" "$TQ/checks_seq" "$TQ/e2e_fail" "$TQ/merge_fail" "$TQ/head_lag" "$TQ/on_checks" \
     "$TQ/verdict" "$TQ/tests_verdict" "$TQ/judge_verdict" "$TQ/judge_hang" "$TQ/claude_fail" "$TQ/sync" "$TQ"/started-* "$TQ/sync.log" \
-    "$TQ/e2e_nopass" "$TQ/push_reject" "$TQ/awake.pids" "$TQ/awake.args" "$TQ/awake.ended" "$TQ/awake_fail"
+    "$TQ/e2e_nopass" "$TQ/push_reject" "$TQ/awake.pids" "$TQ/awake.args" "$TQ/awake.ended" "$TQ/awake_fail" \
+    "$TQ/awake.seq" "$TQ/awake.fds" "$TQ/awake_slow"
   : > "$TQ/gh.log"; : > "$TQ/created.log"; : > "$TQ/npm.log"; : > "$TQ/claude.log"
 }
 # code_reviews / test_reviews: the review sessions claude.log shows since the last reset
@@ -721,7 +726,8 @@ rm -f "$RQ"/running/*
 
 # --- the keep-awake helper (the powershell.exe stub): one per job, held while it runs, released when it ends ---
 # A job that merges: the helper's arguments, and it is alive during e2e (on_e2e notes it in $TQ/awake_held).
-reset_pr; rm -f "$TQ/awake_held"; mkwt awake
+# The helper takes 0.5 s to end: the runner waits for it.
+reset_pr; rm -f "$TQ/awake_held"; touch "$TQ/awake_slow"; mkwt awake
 cat > "$TQ/on_e2e" <<'EOF'
 p="$(tail -1 "$TQ/awake.pids")"
 if kill -0 "$p" && [ ! -s "$TQ/awake.ended" ]; then touch "$TQ/awake_held"; fi
@@ -739,6 +745,7 @@ assert "awake: one helper for the job"       test "$(wc -l < "$TQ/awake.pids")" 
 assert "awake: released after a merge"       test "$(cat "$TQ/awake.ended" 2>/dev/null)" = "$(cat "$TQ/awake.pids")"
 assert "awake: its pid is gone after a merge" test -z "$(awake_alive)"
 assert "awake: its output not in a branch log" test ! -e "$RQ/logs/awake.log"
+assert "awake: the helper doesn't hold the runner's lock" test -s "$TQ/awake.fds" -a -z "$(grep 'run\.lock' "$TQ/awake.fds")"
 # A failed job releases it too.
 reset_pr; touch "$TQ/e2e_fail"; mkwt awakefail
 Q add --review none --tests none "$TMP/wt-awakefail" fix "Awake fail" >/dev/null; out="$(Q run)"
@@ -754,6 +761,9 @@ assert_contains "awake: two jobs, the second merged" "$out" "MERGED fix/awake2b"
 assert "awake: two jobs, two helpers"        test "$(wc -l < "$TQ/awake.pids")" = 2
 assert "awake: two jobs, two ended"          test "$(sort "$TQ/awake.ended" 2>/dev/null)" = "$(sort "$TQ/awake.pids")"
 assert "awake: two jobs, none left running"  test -z "$(awake_alive)"
+p1="$(sed -n 1p "$TQ/awake.pids")"; p2="$(sed -n 2p "$TQ/awake.pids")"
+assert "awake: two jobs, the first's helper ended before the second's started" \
+  test "$(paste -sd, "$TQ/awake.seq")" = "start $p1,end $p1,start $p2,end $p2"
 # A kill -9 of the runner's pid alone: the orphaned job goes on (its npm hangs until $TQ/npm_go), but the
 # helper ends, as the job doesn't hold its pipe.
 reset_pr; rm -f "$TQ/npm_pid" "$TQ/npm_go"; touch "$TQ/e2e_fail"; mkwt awakekill
@@ -792,6 +802,12 @@ Q add --review none --tests none "$TMP/wt-awakeoff" fix "Off" >/dev/null; out="$
 assert "awake=0: no helper"                  test ! -e "$TQ/awake.pids"
 assert_not_contains "awake=0: no line"       "$out" "powershell.exe not found"
 assert_contains "awake=0: merged"            "$out" "MERGED fix/awakeoff"
+# Off, and without powershell.exe on PATH: no line either.
+reset_pr; mkwt awakeoffnops
+Q add --review none --tests none "$TMP/wt-awakeoffnops" fix "Off" >/dev/null
+out="$(PR_QUEUE_AWAKE=0 PATH="$nops_path" bash "$ROOT/scripts/queue/pr-queue.sh" run </dev/null 2>&1)"
+assert_not_contains "awake=0, no powershell.exe: no line" "$out" "powershell.exe not found"
+assert_contains "awake=0, no powershell.exe: merged" "$out" "MERGED fix/awakeoffnops"
 # A switch that is neither: run stops, the job stays queued.
 reset_pr; mkwt awakebad
 Q add --review none --tests none "$TMP/wt-awakebad" fix "Bad" >/dev/null; out="$(PR_QUEUE_AWAKE=yes Q run)"; rc=$?

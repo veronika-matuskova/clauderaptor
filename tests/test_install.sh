@@ -96,4 +96,11 @@ git init -q "$SRC"
 assert_contains "announces pre-commit hook" "$(run)" "enabled pre-commit tests"
 assert "core.hooksPath set" test "$(git -C "$SRC" config core.hooksPath)" = .githooks
 
+# Themes saved in /theme land in claude/themes through the link: ignored, except the repo's own
+G="$TMP/ignore"; mkdir -p "$G/claude/themes"; git -C "$G" init -q; cp "$ROOT/.gitignore" "$G/"
+touch "$G/claude/themes/mine.json" "$G/claude/themes/iris-neon-dark.json" "$G/claude/themes/iris-neon-light.json"
+assert "themes: a theme saved in /theme is ignored" git -C "$G" check-ignore -q claude/themes/mine.json
+assert "themes: iris-neon-dark is tracked" bash -c "! git -C '$G' check-ignore -q claude/themes/iris-neon-dark.json"
+assert "themes: iris-neon-light is tracked" bash -c "! git -C '$G' check-ignore -q claude/themes/iris-neon-light.json"
+
 finish

@@ -732,10 +732,12 @@ printf '%s\n' 'Claim (line 1): Plain. | evidence named: none | found: no | too g
 ss 'Plain.' --session --author reviewer
 assert_contains "a count over the Claim lines read: didn't run" "$err" 'sniff: the session didn'"'"'t run: its result says "Claims: 2" but has 1 Claim line'
 assert "a count over: exit 4" test "$rc" = 4
+assert "a count of one line: singular, and the whole message" test "$err" = 'sniff: the session didn'"'"'t run: its result says "Claims: 2" but has 1 Claim line'
 printf '%s\n' 'Claim (line 1): A. | too good to be true: no' 'Claim (line 1): B. | too good to be true: no' 'Claims: 1' > "$TMP/session-result"
 ss 'Plain.' --session --author reviewer
 assert_contains "a count under the Claim lines read: didn't run" "$err" 'its result says "Claims: 1" but has 2 Claim lines'
 assert "a count under: exit 4" test "$rc" = 4
+assert "a count of two lines: plural, and the whole message" test "$err" = 'sniff: the session didn'"'"'t run: its result says "Claims: 1" but has 2 Claim lines'
 printf '%s\n' 'Claims: 5' 'Claim (line 1): A. | too good to be true: no' 'Claims: 1' > "$TMP/session-result"
 ss 'Plain.' --session --author reviewer
 assert "the last count line counts" test "$rc" = 0

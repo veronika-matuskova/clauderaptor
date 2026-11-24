@@ -11,6 +11,11 @@ tasks/*
 # Skills synced from claude.ai (written by Claude Code via the skills symlink)
 claude/skills/synced/
 
+# Themes saved in /theme (Claude Code writes them through the ~/.claude/themes link); only the repo's own are tracked
+claude/themes/*
+!claude/themes/iris-neon-dark.json
+!claude/themes/iris-neon-light.json
+
 # Python bytecode (a review session that imports apps/stats/stats.py would write it)
 __pycache__/
 

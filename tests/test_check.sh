@@ -8,7 +8,7 @@ source "$(dirname "$0")/lib.sh"
 # State next to the stubs: .cpus, .free (df's free KiB), .gh-out (gh logged out), .docker-err (docker info fails).
 setup() {
   D="$TMP/$1"; BIN="$D/bin"; H="$D/home"; R="$D/repo"
-  mkdir -p "$BIN" "$H/.ssh" "$R/scripts/setup" "$D/run/systemd" "$D/systemd" "$D/c" "$R/claude/rules" "$R/claude/skills" "$R/claude/agents"
+  mkdir -p "$BIN" "$H/.ssh" "$R/scripts/setup" "$D/run/systemd" "$D/systemd" "$D/c" "$R/claude/rules" "$R/claude/skills" "$R/claude/agents" "$R/claude/themes"
   cp "$ROOT/scripts/setup/check.sh" "$R/scripts/setup/"
   git init -q "$R"; git -C "$R" config core.hooksPath .githooks
   for c in python3 curl shellcheck claude systemd-run systemctl; do printf '#!/usr/bin/env bash\n' > "$BIN/$c"; done
@@ -38,7 +38,7 @@ EOF
   git config --file "$G" user.name t; git config --file "$G" user.email t@t
   echo key > "$H/.ssh/k.pub"; git config --file "$G" user.signingkey "$H/.ssh/k.pub"; git config --file "$G" commit.gpgsign true; git config --file "$G" gpg.format ssh
   mkdir -p "$H/.claude"; touch "$R/claude/CLAUDE.md" "$R/claude/statusline.py" "$H/.claude/settings.json"
-  for i in CLAUDE.md statusline.py rules skills agents; do ln -s "$R/claude/$i" "$H/.claude/$i"; done
+  for i in CLAUDE.md statusline.py rules skills agents themes; do ln -s "$R/claude/$i" "$H/.claude/$i"; done
 }
 # check [VAR=value...]: runs the copy; OUT gets its output, RC its exit code
 check() {
@@ -138,10 +138,10 @@ assert_contains "dockerdown: shows the error and a hint" "$OUT" \
 # Install: wrong, broken or missing links are listed together
 setup noinstall
 rm "$H/.claude/rules"; mkdir "$H/.claude/rules"; rm "$R/claude/statusline.py"
-ln -sfn "$D/elsewhere" "$H/.claude/agents"; rm "$H/.claude/settings.json"; check
+ln -sfn "$D/elsewhere" "$H/.claude/agents"; rm "$H/.claude/themes" "$H/.claude/settings.json"; check
 assert "noinstall: exits 2" [ "$RC" -eq 2 ]
 assert_contains "noinstall: lists each link" "$OUT" \
-  "FAIL  in $H/.claude: statusline.py is a broken link; rules isn't a link; agents is a broken link: run scripts/setup/install.sh"
+  "FAIL  in $H/.claude: statusline.py is a broken link; rules isn't a link; agents is a broken link; themes isn't a link: run scripts/setup/install.sh"
 assert_contains "noinstall: settings" "$OUT" "FAIL  no $H/.claude/settings.json: run scripts/setup/install.sh"
 setup otherlink; mkdir -p "$D/x/stuff"; ln -sfn "$D/x/stuff" "$H/.claude/skills"; check
 assert_contains "otherlink: a link outside claude/" "$OUT" "skills links to $D/x/stuff"

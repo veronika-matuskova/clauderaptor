@@ -1170,6 +1170,81 @@ for c in nojudge reverr escal judgefail; do
   assert "A5 (4a): $c: no e2e"                    test ! -s "$TQ/npm.log"
 done
 rm -f "$TQ/verdict" "$TQ/tests_verdict" "$TQ/judge_verdict"
+# A hard flag when the judge finds nothing to fix: the job still fails on it.
+reset_pr; mkwt judgeok4a; h="$(s12 judgeok4a)"; sf="$PR_QUEUE_DIR/reviews/fix-judgeok4a-$h-sniff.md"
+echo "needs changes" > "$TQ/verdict"; echo ready > "$TQ/judge_verdict"
+echo 'Sniff: judgeok4a.txt:9 is the fix | judgeok4a.txt:9 | one line' > "$TQ/code_sniff"
+Q add "$TMP/wt-judgeok4a" fix "Judge ok" >/dev/null; out="$(Q run)"
+assert_contains "A4 (4a): the judge found nothing to fix" "$out" "the judge found nothing to fix (judge: "
+assert_contains "A4 (4a): a ready judge: the hard flag still fails the job" "$out" \
+  "FAILED fix/judgeok4a: the sniff of the reviews' requests has 1 hard flag(s) (sniff: $sf)"
+assert_contains "A4 (4a): a ready judge: job_failed review/sniff" "$(ev fix/judgeok4a 'failed()')" "review/sniff"
+assert "A4 (4a): a ready judge: no e2e"          test ! -s "$TQ/npm.log"
+rm -f "$TQ/verdict" "$TQ/judge_verdict"
+# This job's hard flags come from the sniff's own output: a sniff file that can't be written still fails the job.
+reset_pr; mkwt rofile4a; h="$(s12 rofile4a)"; sf="$PR_QUEUE_DIR/reviews/fix-rofile4a-$h-sniff.md"
+mkdir -p "$PR_QUEUE_DIR/reviews"; printf '# Sniff of an earlier job\n' > "$sf"; chmod 444 "$sf"
+echo 'Sniff: rofile4a.txt:99 is the fix | rofile4a.txt:99 | one line' > "$TQ/code_sniff"
+Q add "$TMP/wt-rofile4a" fix "Read-only" >/dev/null; out="$(Q run)"; chmod 644 "$sf"
+assert_contains "A4 (4a): a sniff file that can't be written: says so" "$out" \
+  "   can't write the sniff to $sf; its flags still count for this job"
+assert_contains "A4 (4a): a sniff file that can't be written: the hard flag fails the job" "$out" \
+  "FAILED fix/rofile4a: the sniff of the reviews' requests has 1 hard flag(s) (sniff: $sf)"
+assert "A4 (4a): a sniff file that can't be written: no e2e" test ! -s "$TQ/npm.log"
+# A cut-off block (its Sniffed lines, no Flags: line) wasn't sniffed to the end: the claim is sniffed again.
+reset_pr; mkwt cut4a; h="$(s12 cut4a)"; sf="$PR_QUEUE_DIR/reviews/fix-cut4a-$h-sniff.md"
+printf '## Requests of then (sniff.sh at x)\n\n### The code review: x.md\n\nSniffed 1: cut4a.txt:99 is the fix | cut4a.txt:99 | one line\n' > "$sf"
+echo 'Sniff: cut4a.txt:99 is the fix | cut4a.txt:99 | one line' > "$TQ/code_sniff"
+Q add "$TMP/wt-cut4a" fix "Cut off" >/dev/null; out="$(Q run)"
+assert_not_contains "A10 (4a): a cut-off block: not taken as sniffed" "$out" "already sniffed"
+assert_contains "A10 (4a): a cut-off block: sniffed again" "$out" "sniffing 1 request(s) of the reviews"
+assert_contains "A10 (4a): a cut-off block: its hard flag fails the job" "$out" \
+  "FAILED fix/cut4a: the sniff of the reviews' requests has 1 hard flag(s) (sniff: $sf)"
+# The list forms (numbered, *, +), and only <claim> | <where> in the sniff's input: a bad reference only in
+# <why> is no flag. The sniff's temp folder is removed after it ran.
+reset_pr; mkwt forms4a; h="$(s12 forms4a)"; sf="$PR_QUEUE_DIR/reviews/fix-forms4a-$h-sniff.md"
+rm -rf "$TQ/tmp4a"; mkdir -p "$TQ/tmp4a"
+printf '1. Sniff: forms4a.txt:1 numbered | forms4a.txt:1 | gone.txt:5 is only in why\n* Sniff: forms4a.txt:1 starred | forms4a.txt:1 | a\n+ Sniff: forms4a.txt:1 plussed | forms4a.txt:1 | b\n' > "$TQ/code_sniff"
+Q add "$TMP/wt-forms4a" fix "Forms" >/dev/null; out="$(TMPDIR="$TQ/tmp4a" Q run)"
+assert_contains "A3 (4a): a numbered Sniff: line is sniffed" "$(cat "$sf")" "Sniffed 1: forms4a.txt:1 numbered | forms4a.txt:1 | gone.txt:5 is only in why"
+assert_contains "A3 (4a): a * Sniff: line is sniffed" "$(cat "$sf")" "Sniffed 2: forms4a.txt:1 starred | forms4a.txt:1 | a"
+assert_contains "A3 (4a): a + Sniff: line is sniffed" "$(cat "$sf")" "Sniffed 3: forms4a.txt:1 plussed | forms4a.txt:1 | b"
+assert_contains "A2 (4a): <why> isn't sniffed: no flag for its reference" "$(cat "$sf")" "Flags: 0 hard, 0 soft"
+assert_contains "A2 (4a): <why> isn't sniffed: merged" "$out" "MERGED fix/forms4a"
+assert "A17 (4a): the sniff's temp folder is removed" test -z "$(ls -A "$TQ/tmp4a")"
+# The fallbacks: no temp folder, the Sniff: lines can't be read (python3 fails), sniff.sh fails with no reason.
+# Each only adds a note, and the job goes on.
+mkdir -p "$TQ/failtmp" "$TQ/failpy"; REAL_MKTEMP="$(command -v mktemp)"; REAL_PY="$(command -v python3)"
+# failtmp/mktemp fails for a folder that pr-queue.sh itself asks for (the sniff's), not review.sh's; failpy/python3
+# fails for a program read from stdin (sniff_parse's), as a python3 that is killed would.
+cat > "$TQ/failtmp/mktemp" <<EOS
+#!/usr/bin/env bash
+if [ "\$1" = -d ] && tr '\\0' ' ' < /proc/\$PPID/cmdline | grep -q 'pr-queue\.sh'; then exit 1; fi
+exec "$REAL_MKTEMP" "\$@"
+EOS
+cat > "$TQ/failpy/python3" <<EOS
+#!/usr/bin/env bash
+if [ "\$1" = -I ] && [ "\$2" = - ]; then exit 1; fi
+exec "$REAL_PY" "\$@"
+EOS
+chmod +x "$TQ/failtmp/mktemp" "$TQ/failpy/python3"
+for c in notmp nopy; do
+  reset_pr; mkwt "$c"; echo "Sniff: $c.txt:99 is the fix | $c.txt:99 | one line" > "$TQ/code_sniff"
+  if [ "$c" = notmp ]; then bin="$TQ/failtmp"; want="   the sniff didn't run: can't create a temp folder"
+  else bin="$TQ/failpy"; want="   the sniff didn't run: can't read the reviews' Sniff: lines"; fi
+  Q add "$TMP/wt-$c" fix "Fallback $c" >/dev/null; out="$(PATH="$bin:$PATH" Q run)"
+  assert_contains "A17 (4a): $c: the note" "$out" "$want"
+  assert_not_contains "A17 (4a): $c: no sniff run" "$out" "sniffing"
+  assert_contains "A17 (4a): $c: the job goes on" "$out" "MERGED fix/$c"
+done
+reset_pr; mkwt exit3; echo 'Sniff: exit3.txt:99 is the fix | exit3.txt:99 | one line' > "$TQ/code_sniff"
+rm -rf "$TMP/qcopy"; mkdir -p "$TMP/qcopy"; cp -r "$ROOT/scripts/queue" "$TMP/qcopy/"; cp "$ROOT/scripts/capped.sh" "$TMP/qcopy/"
+printf '#!/usr/bin/env bash\nexit 3\n' > "$TMP/qcopy/queue/sniff.sh"
+Q add "$TMP/wt-exit3" fix "Exit 3" >/dev/null
+out="$(PATH="$TQ/bin:$PATH" bash "$TMP/qcopy/queue/pr-queue.sh" run </dev/null 2>&1)"
+assert_contains "A17 (4a): a sniff.sh that fails with no reason: the exit code" "$out" "   the sniff didn't run: sniff.sh exited 3"
+assert_contains "A17 (4a): a sniff.sh that fails with no reason: the job goes on" "$out" "MERGED fix/exit3"
+rm -rf "$TMP/qcopy"
 # Soft flags only: the job goes on, with one line in the log; a re-queue of the commit (sniffed already) goes on too.
 reset_pr; mkwt softagain; echo fail > "$TQ/checks_seq"
 echo 'Sniff: ran the e2e suite again | the PR body | no run is shown' > "$TQ/code_sniff"
@@ -1206,6 +1281,8 @@ assert_contains "A7 (4a): the third line is refused" "$out" \
 assert_contains "A7 (4a): the first two run" "$(cat "$sf")" "Sniffed 1: limit4a.txt:1 one | limit4a.txt:1 | a
 Sniffed 2: limit4a.txt:1 two | limit4a.txt:1 | b
 Refused (Sniff line 3): limit4a.txt:1 three | limit4a.txt:1 | c — over the limit of 2 per session"
+assert_contains "A9 (4a): the sniff file lists the refused line" "$(cat "$sf")" \
+  "Refused (Sniff line 1): only a claim — give <claim> | <where> | <why>"
 assert_contains "A9 (4a): a line with only a claim is refused" "$out" \
   "sniff: $(revfile limit4a tests.md): Sniff line 1 refused: give <claim> | <where> | <why>"
 assert_contains "A9 (4a): an empty part is refused" "$out" "Sniff line 3 refused: give <claim> | <where> | <why>"
@@ -1226,7 +1303,7 @@ for c in nokey bad; do
   reset_pr; mkwt "conf$c"
   if [ "$c" = nokey ]; then echo 'max_diff_lines=1' > "$TMP/conf-$c.conf"; else echo 'max_sniff_requests=x' > "$TMP/conf-$c.conf"; fi
   echo "Sniff: conf$c.txt:99 is the fix | conf$c.txt:99 | one line" > "$TQ/code_sniff"
-  Q add "$TMP/wt-conf$c" fix "Conf $c" >/dev/null; out="$(SNIFF_CONFIG="$TMP/conf-$c.conf" Q run)"
+  Q add "$TMP/wt-conf$c" fix "Conf $c" >/dev/null; out="$(max_sniff_requests=3 SNIFF_CONFIG="$TMP/conf-$c.conf" Q run)"  # only the file's value counts
   assert_contains "A8 (4a): $c: the log names the key and the file" "$(cat "$RQ/logs/fix/conf$c.log")" \
     "sniff: no valid max_sniff_requests (a whole number of 0 or more) in $TMP/conf-$c.conf: the reviews' Sniff lines are not run"
   assert_not_contains "A8 (4a): $c: no sniff run" "$out" "sniffing"

@@ -315,8 +315,9 @@ stop_reviews() {
 # sniff_parse <max> <conf> <sniff file> <short sha> <dir> <asker>\t<review file>...: reads the review files'
 # Sniff: lines, prints what the log gets, and writes <dir>/in (line k: "<claim> | <where>" of the k-th request
 # to sniff) and <dir>/block (each asker's accepted, refused and already-sniffed requests). <max> is the limit
-# per review, empty if the config has no valid one. Exit 0: requests to sniff; 1: none to sniff; 3: no Sniff:
-# line at all.
+# per review, empty if the config has no valid one. A claim counts as sniffed only in a block of the sniff file
+# that ends with its Flags: line (a cut-off append is sniffed again). Exit 0: requests to sniff; 10: none to
+# sniff; 3: no Sniff: line at all; anything else (a crash): it couldn't read them.
 sniff_parse() {
   python3 -I - "$@" <<'PY'
 import os, re, sys
@@ -325,10 +326,10 @@ pat = re.compile(r'^\s*(?:[-*+]\s+|[0-9]+[.)]\s+)?([*_]*)Sniff[*_]*:[*_]*\s*(.*?
 norm = lambda c: " ".join(c.split())
 seen = set()
 if os.path.isfile(sfile):
-    for l in open(sfile, errors="replace"):
-        m = re.match(r'^Sniffed [0-9]+: (.*?) \| ', l)
-        if m:
-            seen.add(norm(m.group(1)))
+    # Its blocks, one per sniff ("## Requests of ..."): only one with a Flags: line was sniffed to the end.
+    for b in re.split(r'(?m)^## Requests of ', open(sfile, errors="replace").read())[1:]:
+        if re.search(r'(?m)^Flags: ', b):
+            seen.update(norm(c) for c in re.findall(r'(?m)^Sniffed [0-9]+: (.*?) \| ', b))
 asked = []
 for a in sys.argv[6:]:
     label, f = a.split("\t", 1)
@@ -347,7 +348,7 @@ if not asked:
     sys.exit(3)
 if not re.fullmatch(r'[0-9]+', mx):
     print("sniff: no valid max_sniff_requests (a whole number of 0 or more) in %s: the reviews' Sniff lines are not run" % conf)
-    sys.exit(1)
+    sys.exit(10)
 mx = int(mx)
 inputs, block = [], []
 for label, f, reqs in asked:
@@ -377,18 +378,20 @@ with open(os.path.join(tdir, "in"), "w") as o:
     o.write("".join(l + "\n" for l in inputs))
 with open(os.path.join(tdir, "block"), "w") as o:
     o.write("\n".join(block) + "\n")
-sys.exit(0 if inputs else 1)
+sys.exit(0 if inputs else 10)
 PY
 }
 # sniff_reviews <sha> <asker>\t<review file>...: sniffs the reviews' Sniff: requests at the reviewed commit, once
 # per claim and commit, mechanically (sniff.sh, no session), and appends the requests and the flags to the
-# commit's sniff file, $sniff_file. Sets sniff_soft, the soft flags of this run (empty if nothing was sniffed now).
+# commit's sniff file, $sniff_file. Sets sniff_soft and sniff_run_hard, the soft and hard flags of this run (from
+# sniff.sh's own output, so a sniff file that can't be written doesn't drop them; empty soft: nothing was sniffed
+# now), and sniff_prior, the hard flags of the earlier sniffs in the file.
 # A sniff that didn't run only adds a line to the log: it never stalls a branch. Without a Sniff: line, it does
-# nothing. The hard flags count from the whole sniff file (sniff_hard_of), so a re-queue of the same commit, whose
-# claims were already sniffed, still has them.
+# nothing. The job's hard flags are sniff_prior plus sniff_run_hard, so a re-queue of the same commit, whose claims
+# were already sniffed, still has them.
 sniff_reviews() {
   local sha="$1" short max conf="${SNIFF_CONFIG:-$HERE/sniff.conf}" rc n flags reason; shift
-  short="$(git rev-parse --short "$sha")"; sniff_soft=""
+  short="$(git rev-parse --short "$sha")"; sniff_soft=""; sniff_run_hard=0; sniff_prior="$(sniff_hard_of "$sniff_file")"
   # The limit, from the config: sourced in a subshell, so that only the file's value counts.
   # shellcheck source=/dev/null  # a config file, checked by the tests instead
   max="$(unset max_sniff_requests; . "$conf" >/dev/null 2>&1; echo "${max_sniff_requests:-}")"
@@ -397,7 +400,7 @@ sniff_reviews() {
   sed 's/^/   /' "$sniff_tmp/log" | tee -a "$LOG"
   case "$rc" in
     0) ;;
-    1|3) rm -rf "$sniff_tmp"; sniff_tmp=""; return 0 ;;
+    3|10) rm -rf "$sniff_tmp"; sniff_tmp=""; return 0 ;;
     *) echo "   the sniff didn't run: can't read the reviews' Sniff: lines" | tee -a "$LOG"; rm -rf "$sniff_tmp"; sniff_tmp=""; return 0 ;;
   esac
   n="$(wc -l < "$sniff_tmp/in")"
@@ -411,8 +414,10 @@ sniff_reviews() {
   local new=""; if [ ! -s "$sniff_file" ]; then new=1; fi
   { if [ -n "$new" ]; then printf '# Sniff of the reviews'"'"' requests: %s at %s\n\n' "$BRANCH" "$sha"; fi
     printf '## Requests of %s (sniff.sh at %s)\n\n' "$(date '+%F %T')" "$sha"
-    cat "$sniff_tmp/block"; printf '### Flags\n\n'; cat "$sniff_tmp/out"; echo; } >> "$sniff_file" 2>>"$LOG"
+    cat "$sniff_tmp/block"; printf '### Flags\n\n'; cat "$sniff_tmp/out"; echo; } >> "$sniff_file" 2>>"$LOG" ||
+    echo "   can't write the sniff to $sniff_file; its flags still count for this job" | tee -a "$LOG"
   flags="$(grep -m1 '^Flags: ' "$sniff_tmp/out")"
+  sniff_run_hard="$(sed -n 's/^Flags: \([0-9]*\) hard.*/\1/p' <<<"$flags")"; sniff_run_hard="${sniff_run_hard:-0}"
   sniff_soft="$(sed -n 's/.*, \([0-9]*\) soft$/\1/p' <<<"$flags")"; sniff_soft="${sniff_soft:-0}"
   rm -rf "$sniff_tmp"; sniff_tmp=""
 }
@@ -498,7 +503,7 @@ process() {
 
   # 2. Review the code and the tests, in fresh sessions at the same time, before the e2e run is spent on it.
   local tests code_pid="" tests_pid="" code_out="" tests_out="" judge_out="" problems="" findings="" found=() found_kinds="" judged
-  local asked=() sniff_tmp="" sniff_file="" sniff_hard=0 sniff_soft="" stail="" sniff_env=()
+  local asked=() sniff_tmp="" sniff_file="" sniff_hard=0 sniff_soft="" sniff_run_hard=0 sniff_prior=0 stail="" sniff_env=()
   level="$(field review "$1")"; tests="$(field tests "$1")"
   local brief=""; if [ -f "$JOB.brief" ]; then brief="$JOB.brief"; fi
   if [ "$level" = none ]; then
@@ -535,7 +540,7 @@ process() {
     # The reviews' Sniff: requests, before the judge, who gets the commit's sniff file.
     sniff_file="$REVIEWS/${BRANCH//\//-}-$(git rev-parse --short=12 "$reviewed")-sniff.md"
     sniff_reviews "$reviewed" "${asked[@]}"
-    sniff_hard="$(sniff_hard_of "$sniff_file")"
+    sniff_hard=$((sniff_prior + sniff_run_hard))
     if [ "$sniff_hard" -gt 0 ]; then
       echo "   the sniff of the reviews' requests has $sniff_hard hard flag(s) (sniff: $sniff_file)" | tee -a "$LOG"
     elif [ -n "$sniff_soft" ]; then

@@ -701,6 +701,17 @@ ss 'Plain.' --session --author reviewer
 assert "A8: requests don't change the exit code (no flags: 0)" test "$rc" = 0
 assert_contains "A8: requests are numbered in order" "$out" "Request 2 to reviewer: Two. | missing: y"
 assert_contains "'No.' is no too-good flag" "$out" "Flags: 0 hard, 0 soft"
+for v in 'no — just a rename' 'no: n/a' 'no, a rename' 'no - a rename' 'no; a rename' 'no – a rename'; do
+  printf '%s\n' "Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: $v" 'Claims: 1' 'Requests: 0' > "$TMP/session-result"
+  ss 'Plain.' --session --author reviewer
+  assert "A12: 'too good to be true: $v' is no flag" test "$out" = "Flags: 0 hard, 0 soft"
+done
+for v in 'no measurement' 'nothing counted' 'no-op claimed as a 10x gain'; do
+  printf '%s\n' "Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: $v" 'Claims: 1' 'Requests: 0' > "$TMP/session-result"
+  ss 'Plain.' --session --author reviewer
+  assert_contains "A12: 'too good to be true: $v' is still a soft flag" "$out" "soft too good to be true (line 1): Plain. — $v"
+  assert_contains "A12: '$v': one soft flag" "$out" "Flags: 0 hard, 1 soft"
+done
 printf '%s\n' 'Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: no' 'Request to reviewer:' '**Request to reviewer: **' 'Claims: 1' 'Requests: 2' > "$TMP/session-result"
 ss 'Plain.' --session --author reviewer
 assert_not_contains "a Request line with no text isn't printed" "$out" "Request"
@@ -850,6 +861,15 @@ assert "an Answered line in Markdown is read" test "$out" = "Flags: 0 hard, 0 so
 printf '1. Answered 1: yes — ok\nAnswered: 1\n' > "$TMP/session-result"
 ss 'Answer 1: a.js:100.' --answer "$TMP/earlier.txt"
 assert "a numbered Answered line is read" test "$out" = "Flags: 0 hard, 0 soft"
+printf 'Answered 1: yes — a.js:100 has it\nAnswered: 1\n' > "$TMP/session-result"
+for a in '**Answer 1**: the measurement is at a.js:100.' '**Answer 1:** the measurement is at a.js:100.' '1. Answer 1: the measurement is at a.js:100.' '1) Answer 1: the measurement is at a.js:100.'; do
+  ss "$a" --answer "$TMP/earlier.txt"
+  assert "A13: an answer block that starts '${a%%:*}…' is read: no flag" test "$out" = "Flags: 0 hard, 0 soft"
+  assert "A13: '${a%%:*}…': exit 0" test "$rc" = 0
+done
+ss 'Answers 1: the measurement is at a.js:100.' --answer "$TMP/earlier.txt"
+assert_contains "A13: 'Answers 1:' is no answer block" "$out" "Request 1 has no Answer 1: block"
+assert "A13: 'Answers 1:': exit 2" test "$rc" = 2
 printf '%s\n' 'Request 1 to reviewer: A. | missing: a | answer with: a file:line' 'Request 2 to reviewer: B. | missing: b | answer with: a file:line' > "$TMP/earlier2.txt"
 printf 'Answered 1: yes — ok\nAnswered 2: yes — ok\nAnswered: 2\n' > "$TMP/session-result"
 ss $'Answer 1: a.js:100.\nAnswer 2: a.js:500.' --answer "$TMP/earlier2.txt"

@@ -504,6 +504,9 @@ assert_contains "speed: recovered: merged" "$out" "MERGED fix/sprecover"
 assert "speed: recovered: the slow one not stored" test "$(cat "$BASE")" = "1.0"$'\n'"1.0"
 reset_pr; printf '1\n1\n1\n1\n10\n' > "$BASE"; echo 4.5 > "$TQ/bench_seq"; speedjob spmedian
 assert_contains "speed: against the median, not the mean" "$out" "FAILED fix/spmedian: machine too slow: 4.5×"
+# Sorted as numbers (9, 10, 100: median 10), not as text (10, 100, 9: median 100, so 50 would pass as 0.5x).
+reset_pr; printf '100\n9\n10\n' > "$BASE"; echo 50 > "$TQ/bench_seq"; speedjob spnumeric
+assert_contains "speed: the median of the values sorted as numbers, not as text" "$out" "FAILED fix/spnumeric: machine too slow: 5.0×"
 reset_pr; printf '1\n1\n10\n10\n' > "$BASE"; echo 22 > "$TQ/bench_seq"; speedjob speven
 assert_contains "speed: an even count's median is the middle two's mean" "$out" "machine speed: 4.0× baseline"
 reset_pr; seq 1 19 > "$BASE"; echo 10 > "$TQ/bench_seq"; speedjob sp19

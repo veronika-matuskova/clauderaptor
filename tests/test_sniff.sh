@@ -701,6 +701,11 @@ ss 'Plain.' --session --author reviewer
 assert "A8: requests don't change the exit code (no flags: 0)" test "$rc" = 0
 assert_contains "A8: requests are numbered in order" "$out" "Request 2 to reviewer: Two. | missing: y"
 assert_contains "'No.' is no too-good flag" "$out" "Flags: 0 hard, 0 soft"
+printf '%s\n' 'Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: no' 'Request to reviewer:' '**Request to reviewer: **' 'Claims: 1' > "$TMP/session-result"
+ss 'Plain.' --session --author reviewer
+assert_not_contains "a Request line with no text isn't printed" "$out" "Request"
+assert "an empty Request line: only the Flags line" test "$out" = "Flags: 0 hard, 0 soft"
+assert "an empty Request line: exit 0" test "$rc" = 0
 printf '%s\n' '- **Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: "100 %" with nothing counted**' 'Claim (line 1): Plain. | evidence named: none' 'Claims: 2' > "$TMP/session-result"
 ss 'Plain.' --session --author reviewer
 assert_contains "a Claim line in Markdown is read" "$out" "soft too good to be true (line 1): Plain. — \"100 %\" with nothing counted"

@@ -12,7 +12,7 @@
     "type": "command",
     "command": "~/.claude/statusline.py"
   },
-  "theme": "dark",
+  "theme": "custom:iris-neon-dark",
   "modelSettings": {
     "claude-opus-5-5": {
       "effortLevel": "medium"

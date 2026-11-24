@@ -95,7 +95,7 @@ fi
 
 echo "== install"
 bad=()
-for item in CLAUDE.md statusline.py rules skills agents; do
+for item in CLAUDE.md statusline.py rules skills agents themes; do
   t="$DEST/$item"
   if [ ! -L "$t" ]; then bad+=("$item isn't a link")
   elif [ ! -e "$t" ]; then bad+=("$item is a broken link")

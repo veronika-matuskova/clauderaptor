@@ -10,7 +10,7 @@ DEST="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 mkdir -p "$DEST"
 stamp="$(date +%Y%m%d%H%M%S)"
 
-for item in CLAUDE.md statusline.py rules skills agents; do
+for item in CLAUDE.md statusline.py rules skills agents themes; do
   target="$DEST/$item"
   if [ -L "$target" ] && [ "$(readlink "$target")" != "$SRC/$item" ]; then
     # A link somewhere else (another config repo, an old checkout): keep it rather than replace it silently

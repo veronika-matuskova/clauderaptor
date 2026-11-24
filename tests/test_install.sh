@@ -4,7 +4,7 @@
 source "$(dirname "$0")/lib.sh"
 
 SRC="$TMP/repo"; DEST="$TMP/home/.claude"
-mkdir -p "$SRC/scripts/setup" "$SRC/claude/rules" "$SRC/claude/skills" "$SRC/claude/agents"
+mkdir -p "$SRC/scripts/setup" "$SRC/claude/rules" "$SRC/claude/skills" "$SRC/claude/agents" "$SRC/claude/themes"
 cp "$ROOT/scripts/setup/install.sh" "$SRC/scripts/setup/"
 echo "# g" > "$SRC/claude/CLAUDE.md"; echo "x" > "$SRC/claude/statusline.py"
 cat > "$SRC/claude/settings.json" <<'EOF'
@@ -27,7 +27,7 @@ out="$(run)"
 assert "existing CLAUDE.md backed up" bash -c "grep -q old '$DEST'/CLAUDE.md.bak.*"
 assert "foreign link backed up as a link" bash -c "test \"\$(readlink '$DEST'/agents.bak.*)\" = '$TMP/other-agents'"
 assert_contains "foreign link: says where it pointed" "$out" "backed up $DEST/agents (it linked to $TMP/other-agents)"
-for item in CLAUDE.md statusline.py rules skills agents; do
+for item in CLAUDE.md statusline.py rules skills agents themes; do
   assert "$item is a symlink into the repo" test "$(readlink "$DEST/$item")" = "$SRC/claude/$item"
 done
 assert "commands/ is no longer linked" test ! -e "$DEST/commands"

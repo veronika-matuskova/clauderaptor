@@ -80,16 +80,16 @@ if [ -n "${PR_QUEUE_CHILD+set}" ]; then echo "inherited PR_QUEUE_CHILD" >> "$TQ/
 touch "$TQ/passed/$(git rev-parse HEAD)"
 EOF
 # bench (PR_QUEUE_BENCH, the speed check): prints the next line of $TQ/bench_seq (the last repeats; without it, 1.0),
-# logs in $TQ/bench.log whether it ran under the e2e lock, and fails if $TQ/bench_fail exists.
+# logs in $TQ/bench.log whether it ran under the e2e lock, and fails (after printing) if $TQ/bench_fail exists.
 cat > "$TQ/bin/bench" <<'EOF'
 #!/usr/bin/env bash
 if flock -n "$PR_QUEUE_DIR/e2e.lock" true; then echo unlocked >> "$TQ/bench.log"; else echo locked >> "$TQ/bench.log"; fi
-[ -f "$TQ/bench_fail" ] && exit 1
 v=1.0
 if [ -s "$TQ/bench_seq" ]; then
   v="$(head -1 "$TQ/bench_seq")"; [ "$(wc -l < "$TQ/bench_seq")" -gt 1 ] && sed -i 1d "$TQ/bench_seq"
 fi
 echo "$v"
+[ ! -f "$TQ/bench_fail" ]
 EOF
 # The tests never run the real benchmark (but one) and never wait for a slow machine.
 export PR_QUEUE_BENCH=bench PR_QUEUE_SPEED_WAIT=0
@@ -441,7 +441,7 @@ BASE="$PR_QUEUE_DIR/speed-baseline"
 speedjob() {
   local name="$1"; shift
   mkwt "$name"; Q add --review none --tests none "$TMP/wt-$name" fix "Speed $name" >/dev/null
-  out="$(env "$@" PATH="$TQ/bin:$PATH" bash "$ROOT/scripts/queue/pr-queue.sh" run </dev/null 2>&1)"
+  out="$(env PATH="$TQ/bin:$PATH" "$@" bash "$ROOT/scripts/queue/pr-queue.sh" run </dev/null 2>&1)"
 }
 reset_pr; speedjob spfirst
 assert_contains "speed: under the e2e lock" "$(cat "$TQ/bench.log")" "locked"
@@ -501,9 +501,10 @@ for bad in abc 0; do
   assert "speed: baseline '$bad': replaced by the new value" test "$(cat "$BASE")" = 2.0
   assert_contains "speed: baseline '$bad': merged" "$out" "MERGED fix/spbad$bad"
 done
-for broken in fail nan; do
+# A benchmark that exits with an error (after printing a number), prints n/a or prints 0.
+for broken in fail nan zero; do
   reset_pr; echo 1.0 > "$BASE"
-  if [ "$broken" = fail ]; then touch "$TQ/bench_fail"; else echo n/a > "$TQ/bench_seq"; fi
+  case "$broken" in fail) touch "$TQ/bench_fail" ;; nan) echo n/a > "$TQ/bench_seq" ;; zero) echo 0 > "$TQ/bench_seq" ;; esac
   speedjob "spbench$broken"
   assert_contains "speed: benchmark $broken: e2e runs" "$out" "   speed check failed (the benchmark printed no number); e2e runs without it"
   assert_contains "speed: benchmark $broken: merged" "$out" "MERGED fix/spbench$broken"
@@ -527,8 +528,14 @@ for w in -1 1.5 x; do
 done
 assert "run: invalid speed settings: the job stays queued" test -n "$(find "$RQ/queue" -name '*spinvalid.job')"
 out="$(Q run)"; assert_contains "speed: valid settings run it" "$out" "MERGED fix/spinvalid"
-reset_pr; echo 1.0 > "$BASE"; printf '10\n10\n1.0\n' > "$TQ/bench_seq"; t0=$SECONDS; speedjob spwait PR_QUEUE_SPEED_WAIT=1
+# A sleep that logs its argument, for this run only.
+mkdir -p "$TQ/sleepbin"; rm -f "$TQ/sleep.log"
+# shellcheck disable=SC2016  # expands when the stub runs
+printf '#!/usr/bin/env bash\necho "$*" >> "$TQ/sleep.log"\nexec %s "$@"\n' "$(command -v sleep)" > "$TQ/sleepbin/sleep"; chmod +x "$TQ/sleepbin/sleep"
+reset_pr; echo 1.0 > "$BASE"; printf '10\n10\n1.0\n' > "$TQ/bench_seq"; t0=$SECONDS
+speedjob spwait PR_QUEUE_SPEED_WAIT=1 PATH="$TQ/sleepbin:$TQ/bin:$PATH"
 assert_contains "speed: PR_QUEUE_SPEED_WAIT arrives" "$out" "machine slow: 10.0× baseline; checking again in 1 s (2 of 6)"
+assert "speed: it slept 1 s, twice" test "$(grep -cx 1 "$TQ/sleep.log")" = 2
 assert "speed: it waited" test $((SECONDS - t0)) -ge 2
 assert_contains "speed: waited, then merged" "$out" "MERGED fix/spwait"
 reset_pr; speedjob spreal PR_QUEUE_BENCH=

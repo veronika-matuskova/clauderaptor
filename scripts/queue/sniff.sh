@@ -49,7 +49,8 @@
 # to this script; its model and effort are sniff_model and sniff_effort in review.conf), at the same repo and
 # commit. It gets a bundle (in a temp folder, removed afterwards): the author, the text with its line numbers, the
 # mechanical flags and the thresholds; its instructions are in sniff.md. It lists the claims, and each one it
-# finds too good to be true is a soft "too good to be true" flag; its evidence requests are printed as
+# finds too good to be true is a soft "too good to be true" flag (not one it marks "no", alone or followed by
+# a reason: "no — just a rename", "no: n/a"); its evidence requests are printed as
 # "Request <n> to <author>: <claim> | missing: <...> | answer with: <...>" lines before the Flags line. Requests
 # don't change the exit code. The session's result ends with "Claims: <n>", the number of its Claim lines (0 for
 # a text with no claims), and "Requests: <n>", the number of its Request lines (numbered or not): a result
@@ -59,10 +60,11 @@
 # One answer round (--answer <earlier output>): the input is the author's answer to the Request lines of an
 # earlier --session output (none there exits 4). It is sniffed mechanically, then one session checks it (the
 # author defaults as above, else to the one the requests name). Request <n> is cleared only if the answer has an
-# "Answer <n>:" block (up to the next one), no line of that block has a hard flag, and the session says
-# "Answered <n>: yes" (its result ends with "Answered: <n>", checked like "Claims: <n>"). Each one not cleared is
-# a hard "unsupported after one round" flag naming its claim. It prints no Request lines: there is never a second
-# round. sniff.sh doesn't deliver requests or collect answers.
+# "Answer <n>:" block (up to the next one; also **Answer <n>**:, **Answer <n>:** or "1. Answer <n>:"), no line
+# of that block has a hard flag, and the session says "Answered <n>: yes" (its result ends with "Answered: <n>",
+# checked like "Claims: <n>"). Each one not cleared is a hard "unsupported after one round" flag naming its claim. It prints no Request lines: there is never a second
+# round. sniff.sh doesn't deliver requests or collect answers itself: review.sh --plan does, for the planner (its
+# brief's sniff is a --session run, and the planner's answer is checked with --answer).
 # References it leaves alone (never flagged): absolute paths, ~/ paths, $VAR or ${...} paths, ../ paths, URLs;
 # tokens with a placeholder or glob (<...>, ..., *); git ranges (main..HEAD); options (-x); ~~struck-out~~ text;
 # and every reference on a line whose prose (not its code spans or paths) says it is new or to be added ("new",
@@ -876,7 +878,10 @@ CLAIM_RE_S = re.compile(r"^[\s>*_`\-]*(?:\d+[.)][\s*_`]*)?Claim \(line (\d+)\):\
 TOO_GOOD_RE = re.compile(r"\|\s*too good to be true:\s*(.*?)\s*[*_`]*$", re.I)
 REQ_OUT_RE = re.compile(r"^[\s>*_`\-]*(?:\d+[.)][\s*_`]*)?Request(?: \d+)? to [\w-]+:[\s*_`]*(.*?)[\s*_`]*$")
 ANSWERED_RE = re.compile(r"^[\s>*_`\-]*(?:\d+[.)][\s*_`]*)?Answered (\d+):[*_`\s]*(yes|no)\b[\s—–-]*(.*?)\s*$", re.I)
-ANSWER_RE = re.compile(r"^[\s>*_`\-]*Answer (\d+)\s*:")
+ANSWER_RE = re.compile(r"^[\s>*_`\-]*(?:\d+[.)][\s*_`]*)?Answer (\d+)[\s*_`]*:")
+# A "no" verdict, bare or with a reason after it ("no — just a rename", "no: n/a", "no, ..."), is no flag;
+# "no measurement" is one.
+NOT_TOO_GOOD_RE = re.compile(r"no\s*(?:$|[.:,;—–]|-\s)", re.I)
 
 def run_session(bundle_text):
     """The session's result text. The bundle goes in a temp folder, removed afterwards."""
@@ -930,7 +935,7 @@ if session and not answer_path:
         if m:
             tg = TOO_GOOD_RE.search(m.group(2))
             why = tg.group(1).strip() if tg else ""
-            if why and why.lower().rstrip(".") != "no":
+            if why and not NOT_TOO_GOOD_RE.match(why):
                 claim = m.group(2).split("|")[0].strip()
                 flag("soft", "too good to be true", int(m.group(1)), claim_of(claim), why)
             continue

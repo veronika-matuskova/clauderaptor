@@ -298,8 +298,8 @@ that names it (e.g. A2) and says what is missing."
     size="$(wc -c <"$sniff_input")" || die "can't read $sniff_input"
     [ "$size" -le 100000 ] || die "the input file is too big for the prompt ($size bytes, at most 100000): $sniff_input"
     task="Sniff the claims in one text, following the instructions below.
-- Repo: $wt, commit $sha. Read the repo only at that commit (git show $sha:<path>, git grep <word> $sha), never
-  its working tree.
+- Repo: $wt, commit $sha. You run in an empty scratch folder, not in the repo: read the repo with git -C $wt, and
+  only at that commit (git -C $wt show $sha:<path>, git -C $wt grep <word> $sha), never its working tree.
 - The input ($sniff_input), between the lines BEGIN INPUT and END INPUT:
 BEGIN INPUT
 $(cat "$sniff_input")

@@ -869,10 +869,10 @@ def review_check():
 review_check()
 
 # --- the session (--session, --answer): one review.sh --sniff ---
-CLAIM_RE_S = re.compile(r"^[\s>*_`\-]*Claim \(line (\d+)\):\s*(.*)$")
+CLAIM_RE_S = re.compile(r"^[\s>*_`\-]*(?:\d+[.)][\s*_`]*)?Claim \(line (\d+)\):\s*(.*)$")
 TOO_GOOD_RE = re.compile(r"\|\s*too good to be true:\s*(.*?)\s*[*_`]*$", re.I)
-REQ_OUT_RE = re.compile(r"^[\s>*_`\-]*Request to [\w-]+:\s*(.*?)\s*$")
-ANSWERED_RE = re.compile(r"^[\s>*_`\-]*Answered (\d+):[*_`\s]*(yes|no)\b[\s—–-]*(.*?)\s*$", re.I)
+REQ_OUT_RE = re.compile(r"^[\s>*_`\-]*(?:\d+[.)][\s*_`]*)?Request to [\w-]+:[\s*_`]*(.*?)[\s*_`]*$")
+ANSWERED_RE = re.compile(r"^[\s>*_`\-]*(?:\d+[.)][\s*_`]*)?Answered (\d+):[*_`\s]*(yes|no)\b[\s—–-]*(.*?)\s*$", re.I)
 ANSWER_RE = re.compile(r"^[\s>*_`\-]*Answer (\d+)\s*:")
 
 def run_session(bundle_text):

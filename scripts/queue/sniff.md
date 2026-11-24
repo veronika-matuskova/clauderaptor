@@ -14,8 +14,10 @@ sniff.sh wrote. It has:
 
 Rules:
 
-- Read only the bundle, and the repo at the given commit (`git show <commit>:<path>`, `git grep <word> <commit>`,
-  `git log <commit>`), to see whether the evidence a claim names is there. Never the working tree.
+- Read only the bundle, and the repo at the given commit, to see whether the evidence a claim names is there. You
+  run in an empty scratch folder, not in the repo, so give every git command the repo's path:
+  `git -C <repo> show <commit>:<path>`, `git -C <repo> grep <word> <commit>`, `git -C <repo> log <commit>`. Never
+  the working tree.
 - Don't judge the code: whether a change is right is the reviews' work, not yours. You check claims and their
   evidence only.
 - Read no transcripts, logs or files outside the repo, and run nothing but read-only git commands.

@@ -706,6 +706,11 @@ ss 'Plain.' --session --author reviewer
 assert_contains "a Claim line in Markdown is read" "$out" "soft too good to be true (line 1): Plain. — \"100 %\" with nothing counted"
 assert_contains "a Claim line without the too-good field: no flag" "$out" "Flags: 0 hard, 1 soft"
 assert "soft only: exit 1" test "$rc" = 1
+printf '%s\n' '1. Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: no measurement' '2) **Request to reviewer: Plain. | missing: m | answer with: a measurement**' > "$TMP/session-result"
+ss 'Plain.' --session --author reviewer
+assert_contains "a numbered Claim line is read" "$out" "soft too good to be true (line 1): Plain. — no measurement"
+assert_contains "a numbered Request line in bold is read, without the bold" "$out" "Request 1 to reviewer: Plain. | missing: m | answer with: a measurement
+Flags:"
 ss "$TG"
 assert "A9: without --session no session" test "$(calls)" = 0
 assert "A9: and the never-called stub wasn't called" test ! -e "$TMP/claude-calls"
@@ -783,6 +788,9 @@ assert_contains "the session doesn't answer for it: hard" "$out" "the session fo
 printf '**Answered 1: yes**\n' > "$TMP/session-result"
 ss 'Answer 1: a.js:100.' --answer "$TMP/earlier.txt"
 assert "an Answered line in Markdown is read" test "$out" = "Flags: 0 hard, 0 soft"
+printf '1. Answered 1: yes — ok\n' > "$TMP/session-result"
+ss 'Answer 1: a.js:100.' --answer "$TMP/earlier.txt"
+assert "a numbered Answered line is read" test "$out" = "Flags: 0 hard, 0 soft"
 printf '%s\n' 'Request 1 to reviewer: A. | missing: a | answer with: a file:line' 'Request 2 to reviewer: B. | missing: b | answer with: a file:line' > "$TMP/earlier2.txt"
 printf 'Answered 1: yes — ok\nAnswered 2: yes — ok\n' > "$TMP/session-result"
 ss $'Answer 1: a.js:100.\nAnswer 2: a.js:500.' --answer "$TMP/earlier2.txt"

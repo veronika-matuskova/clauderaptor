@@ -33,7 +33,17 @@
 #      commit already reviewed (the code: at that level) or judged as ready isn't reviewed or judged again.
 #      A Ctrl-C of the runner, a hangup, or a TERM to its whole process group (kill -- -<pgid>), stops the
 #      reviews, the judge and their sessions; a kill of the runner's pid alone leaves its job running;
-#   3. if the repo has scripts/e2e-gate.mjs and the commit has no local pass: `npm run test:e2e:full`, under the lock;
+#   3. if the repo has scripts/e2e-gate.mjs and the commit has no local pass: `npm run test:e2e:full`, under the lock.
+#      First, under the lock, a speed check: a fixed CPU benchmark (the fastest of 3 runs of a python3 loop, in
+#      CPU-seconds, which a normal load hardly changes but a throttled machine raises many times), or the command
+#      $PR_QUEUE_BENCH (on PATH, prints one number). Its result against the median of the last 20 accepted ones,
+#      kept in $PR_QUEUE_DIR/speed-baseline (shared by all repos: it describes the machine; the first one, or a
+#      file without a valid number, starts it anew):
+#      - at most $PR_QUEUE_SPEED_MAX (default 4) times the baseline: it is added to the file, and e2e runs;
+#      - above: it waits $PR_QUEUE_SPEED_WAIT seconds (default 300), still holding the lock, and checks again, up
+#        to 6 times; still slow after that fails the job (slow_machine): the machine, not the branch. A slow
+#        result is never stored.
+#      A benchmark that fails or prints no number leaves e2e to run without it. PR_QUEUE_SPEED_MAX=0 turns it off;
 #   4. open the PR (scripts/create-pr.sh <type> "<description>" if the repo has it, else gh pr create), or push to
 #      the open one; the body is the body file (else the current one) with a "Local end-to-end run" section for
 #      the commit being pushed, set before the push because CI reads it;
@@ -227,7 +237,7 @@ with_line() {
 # failjob <step> <reason> <message> [<emit field>...]: records the message, moves the job to failed/ and
 # returns 1. The step, the reason and the fields go to the job_failed event. Reasons: not_ready (the worktree is
 # gone, off the branch or dirty), fetch, conflict, review_code, review_tests, review_error, judge, e2e,
-# no_e2e_pass, moved (commits after the review), push, pr, head, checks_failed, checks_timeout, merge; and
+# slow_machine (the speed check before e2e), no_e2e_pass, moved (commits after the review), push, pr, head, checks_failed, checks_timeout, merge; and
 # abandoned, for a job a dead runner left in running/ (step start) or whose process ended without failjob (step
 # unknown), both in run_repo; and replaced (step queue), for a queued job that a re-queue of its branch replaces
 # (add).
@@ -270,6 +280,53 @@ stop_reviews() {
   wait
   rm -f "$code_out" "$tests_out" "$judge_out"
   trap - "$1"; kill -"$1" "$BASHPID"
+}
+
+# The speed check before e2e (step 3). say <message>: to the log and the output (fd 7, in the e2e subshell).
+SPEED_TRIES=6
+say() { echo "   $*" | tee -a "$LOG" >&7; }
+# number <value>: whether it is a number above 0.
+number() { [[ "$1" =~ ^[0-9]*\.?[0-9]+$ ]] && awk -v v="$1" 'BEGIN { exit !(v + 0 > 0) }'; }
+# speed_bench: one measurement, in CPU-seconds: $PR_QUEUE_BENCH's, else the fastest of 3 runs of a fixed loop (about
+# 0.3 s each on this machine).
+speed_bench() {
+  if [ -n "${PR_QUEUE_BENCH:-}" ]; then command "$PR_QUEUE_BENCH" 2>/dev/null; return; fi
+  python3 -I -c '
+import time
+def once():
+    t = time.process_time(); x = 0
+    for i in range(1000000): x += i * i % 7
+    return time.process_time() - t
+print("%.3f" % min(once() for _ in range(3)))'
+}
+# valid_lines <file>: its lines that are numbers above 0.
+valid_lines() { awk '/^[0-9]*\.?[0-9]+$/ && $0 + 0 > 0' "$1"; }
+# speed_check <file>: 0 when e2e may run; 75, with the last ratio in the file, when the machine stayed too slow.
+speed_check() {
+  local max="${PR_QUEUE_SPEED_MAX:-4}" wait="${PR_QUEUE_SPEED_WAIT:-300}" file="$STATE/speed-baseline" v base r n=0
+  [ "$max" != 0 ] || return 0
+  while :; do
+    if ! v="$(speed_bench)" || ! number "$v"; then
+      say "speed check failed (the benchmark printed no number); e2e runs without it"; return 0
+    fi
+    if [ ! -f "$file" ]; then
+      echo "$v" > "$file"; say "speed baseline set: $v s CPU ($file)"; return 0
+    fi
+    base="$(valid_lines "$file" | sort -g | awk '{ a[NR] = $0 } END { if (NR) print (NR % 2 ? a[(NR + 1) / 2] : (a[NR / 2] + a[NR / 2 + 1]) / 2) }')"
+    if [ -z "$base" ]; then
+      say "speed baseline unreadable ($file); starting a new one"; echo "$v" > "$file"; return 0
+    fi
+    r="$(awk -v v="$v" -v b="$base" 'BEGIN { printf "%.1f", v / b }')"
+    if awk -v v="$v" -v b="$base" -v m="$max" 'BEGIN { exit !(v / b <= m) }'; then
+      say "machine speed: ${r}× baseline"
+      { valid_lines "$file"; echo "$v"; } | tail -n 20 > "$file.new" && mv "$file.new" "$file"
+      return 0
+    fi
+    if [ "$n" -ge "$SPEED_TRIES" ]; then echo "$r" > "$1"; return 75; fi
+    n=$((n + 1))
+    say "machine slow: ${r}× baseline; checking again in $wait s ($n of $SPEED_TRIES)"
+    sleep "$wait"
+  done
 }
 
 process() {
@@ -378,9 +435,20 @@ process() {
     if ! node scripts/e2e-gate.mjs pr-line >/dev/null 2>&1; then
       echo "   running the full e2e suite on $(git rev-parse --short HEAD)" | tee -a "$LOG"
       # The e2e lock is held on fd 8 for the subshell, so that e2e_started is emitted once it is held.
+      # The speed check runs under the lock too, so no other e2e run loads the machine while it measures. Its
+      # messages go to fd 7, the output. A slow machine ends the subshell with 75 and its ratio in $slow:
+      # failjob and its event only work out here.
       emit e2e_waiting
-      ( flock 8 || exit 1; emit e2e_started; npm run test:e2e:full ) 8>"$STATE/e2e.lock" >>"$LOG" 2>&1
+      local slow; slow="$(mktemp)"
+      ( flock 8 || exit 1; speed_check "$slow" || exit 75; emit e2e_started; npm run test:e2e:full 7>&- ) \
+        7>&1 8>"$STATE/e2e.lock" >>"$LOG" 2>&1
       local e2e_rc=$?
+      if [ "$e2e_rc" -eq 75 ] && [ -s "$slow" ]; then
+        local ratio; ratio="$(cat "$slow")"; rm -f "$slow"
+        failjob e2e slow_machine "machine too slow: ${ratio}× baseline after $SPEED_TRIES re-checks; e2e not run, the branch was not tested"
+        return
+      fi
+      rm -f "$slow"
       emit e2e_finished rc:int="$e2e_rc"
       [ "$e2e_rc" -eq 0 ] || { failjob e2e e2e "the full e2e suite failed"; return; }
     fi
@@ -504,6 +572,11 @@ run() {
     0|1) ;;
     *) die "PR_QUEUE_JUDGE must be 0 (no judge: a review that needs changes fails the job) or 1, not '$PR_QUEUE_JUDGE'" ;;
   esac
+  local speed="${PR_QUEUE_SPEED_MAX:-4}"
+  if [ "$speed" != 0 ] && ! { [[ "$speed" =~ ^[0-9]*\.?[0-9]+$ ]] && awk -v m="$speed" 'BEGIN { exit !(m + 0 > 1) }'; }; then
+    die "PR_QUEUE_SPEED_MAX must be 0 (no speed check) or a number above 1, not '$speed'"
+  fi
+  [[ "${PR_QUEUE_SPEED_WAIT:-300}" =~ ^[0-9]+$ ]] || die "PR_QUEUE_SPEED_WAIT must be a whole number of seconds, not '$PR_QUEUE_SPEED_WAIT'"
   POLL="${PR_QUEUE_POLL:-5}"
   [[ "$POLL" =~ ^[0-9]*\.?[0-9]+$ && "$POLL" =~ [1-9] ]] || die "PR_QUEUE_POLL must be a number of seconds above 0, not '$POLL'"
   migrate

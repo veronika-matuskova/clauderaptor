@@ -825,6 +825,7 @@ assert_contains "A17: the prompt names the claim and where it is" "$rp" "- hard 
 assert_contains "A17: the prompt names b.js:12 and asks in scope or out" "$rp" "\`b.js:12\`: in scope or out?"
 assert_contains "A17: the answer wanted" "$rp" "Wanted: a scope decision: name the file in Requirements (in scope) or in Out of scope (out)"
 assert_contains "A17: no new requirement or finding" "$rp" "Add no new requirement or finding"
+assert_not_contains "a round with no Request: no ## Answers asked for" "$rp" "## Answers"
 assert_contains "A17: the whole revised brief back" "$rp" "reply with the whole revised brief"
 assert_contains "the prompt names the saved brief" "$rp" "the saved brief, $pfile"
 assert_contains "A19: the answer settles it: exit 0" "$out" "exit=0"
@@ -993,6 +994,11 @@ assert "A7: no Request line in the sniff file's Flags" test -z "$(sed -n '/^## F
 assert "A7: no Request line in the output" test -z "$(grep '^Request' <<<"$out")"
 assert_contains "A7: and the answer stands" "$out" "exit=0"
 
+# A round with no Request: the whole answer is the brief, as in part 2, even with a "## Answers" section.
+mv "$STUB/sniff_result" "$TMP/sniff_result.a4"; pbrief nothing > "$STUB/result"
+out="$(pv)"; pfile="$(saved_of "$out")"
+assert "no Request: the answer isn't split at ## Answers" test "$(tail -n +3 "$pfile")" = "$(cat "$STUB/result2")"
+pbrief '`b.js` stays.' > "$STUB/result"; mv "$TMP/sniff_result.a4" "$STUB/sniff_result"
 # A9: no answer checked: each Request is a hard flag left
 touch "$STUB/nosid"; out="$(pv)"; rm "$STUB/nosid"; pfile="$(saved_of "$out")"; sfile="${pfile%.md}-sniff.md"
 assert_contains "A9: no session: the note" "$out" "note: no session to resume"

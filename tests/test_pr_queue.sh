@@ -1098,6 +1098,8 @@ assert_contains "A3 (4a): the test review's request under its file, its prefix a
 Sniffed 2: the test reads sniffref.txt:1 | sniffref.txt:1 | check the line
 "
 assert_contains "A3 (4a): one sniff of both"      "$(cat "$sf")" "Flags: 1 hard, 0 soft"
+assert_contains "A4 (4a): the log notes the hard flag" "$(cat "$RQ/logs/fix/sniffref.log")" \
+  "   the sniff of the reviews' requests has 1 hard flag(s) (sniff: $sf)"
 assert_contains "A3 (4a): the log names the run"  "$out" "sniffing 2 request(s) of the reviews at $(git -C "$TMP/wt-sniffref" rev-parse --short HEAD) (sniff.sh)"
 assert_contains "A4 (4a): a hard flag fails the job" "$out" \
   "FAILED fix/sniffref: the sniff of the reviews' requests has 1 hard flag(s) (sniff: $sf)"
@@ -1123,6 +1125,7 @@ assert_contains "A4 (4a): a second sniff at the commit: its own run" "$out" "sni
 assert "A4 (4a): a second sniff at the commit: appended" test "$(grep -c '^Flags: ' "$sf")" = 2
 assert_contains "A4 (4a): the hard flags of both sniffs at the commit count" "$out" \
   "FAILED fix/sniffref: the sniff of the reviews' requests has 2 hard flag(s) (sniff: $sf)"
+assert "A2 (4a): one title in the sniff file, a block per sniff" test "$(grep -c '^# Sniff of' "$sf") $(grep -c '^## Requests of' "$sf")" = "1 2"
 # With a judge that fails the job, the sniff's hard flags end its message; the judge gets the sniff file, and
 # its own Sniff: lines are never run.
 reset_pr; mkwt sniffjudge; echo "needs changes" > "$TQ/verdict"
@@ -1153,7 +1156,8 @@ for c in nojudge reverr escal judgefail; do
   echo "needs changes" > "$TQ/verdict"; jz=1
   case "$c" in
     nojudge) jz=0 ;;
-    reverr) rm "$TQ/verdict"; echo failed > "$TQ/tests_verdict" ;;
+    reverr) rm "$TQ/verdict"; echo failed > "$TQ/tests_verdict"
+      echo "Sniff: snreverr.txt:50 from a failed review | snreverr.txt:50 | x" > "$TQ/tests_sniff" ;;
     escal) echo escalate > "$TQ/judge_verdict" ;;
     judgefail) echo failed > "$TQ/judge_verdict" ;;
   esac
@@ -1162,6 +1166,7 @@ for c in nojudge reverr escal judgefail; do
     nojudge) want="FAILED fix/snnojudge: the review found changes to make (review: $(revfile snnojudge medium-notests.md)); the sniff has 1 hard flag(s) (sniff: $sf)"
       assert_contains "A5 (4a): PR_QUEUE_JUDGE=0: job_failed review/review_code" "$(ev fix/snnojudge 'failed()')" "review/review_code" ;;
     reverr) want="FAILED fix/snreverr: the test review didn't run: review: no verdict in the review; the sniff has 1 hard flag(s) (sniff: $sf)"
+      assert_not_contains "A3 (4a): a review that didn't run: its Sniff: lines aren't read" "$(cat "$sf")" "from a failed review"
       assert_contains "A5 (4a): a review that didn't run: job_failed review/review_error" "$(ev fix/snreverr 'failed()')" "review/review_error" ;;
     escal) want="FAILED fix/snescal: needs your decision: the judge rejected a finding that would be critical if real (judge: $PR_QUEUE_DIR/reviews/fix-snescal-$h-judge.md); the sniff has 1 hard flag(s) (sniff: $sf)" ;;
     judgefail) want="; the judge didn't run: review: no verdict in the review; the sniff has 1 hard flag(s) (sniff: $sf)" ;;
@@ -1204,7 +1209,8 @@ assert_contains "A4 (4a): a sniff file that can't be written: the hard flag fail
 assert "A4 (4a): a sniff file that can't be written: no e2e" test ! -s "$TQ/npm.log"
 # A cut-off block (its Sniffed lines, no Flags: line) wasn't sniffed to the end: the claim is sniffed again.
 reset_pr; mkwt cut4a; h="$(s12 cut4a)"; sf="$PR_QUEUE_DIR/reviews/fix-cut4a-$h-sniff.md"
-printf '## Requests of then (sniff.sh at x)\n\n### The code review: x.md\n\nSniffed 1: cut4a.txt:99 is the fix | cut4a.txt:99 | one line\n' > "$sf"
+{ printf '## Requests of before (sniff.sh at x)\n\n### The code review: x.md\n\nSniffed 1: cut4a.txt:1 done before | cut4a.txt:1 | x\n\n### Flags\n\nFlags: 0 hard, 0 soft\n\n'
+  printf '## Requests of then (sniff.sh at x)\n\n### The code review: x.md\n\nSniffed 1: cut4a.txt:99 is the fix | cut4a.txt:99 | one line\n'; } > "$sf"
 echo 'Sniff: cut4a.txt:99 is the fix | cut4a.txt:99 | one line' > "$TQ/code_sniff"
 Q add "$TMP/wt-cut4a" fix "Cut off" >/dev/null; out="$(Q run)"
 assert_not_contains "A10 (4a): a cut-off block: not taken as sniffed" "$out" "already sniffed"
@@ -1217,7 +1223,9 @@ reset_pr; mkwt forms4a; h="$(s12 forms4a)"; sf="$PR_QUEUE_DIR/reviews/fix-forms4
 rm -rf "$TQ/tmp4a"; mkdir -p "$TQ/tmp4a"
 printf '1. Sniff: forms4a.txt:1 numbered | forms4a.txt:1 | gone.txt:5 is only in why\n* Sniff: forms4a.txt:1 starred | forms4a.txt:1 | a\n+ Sniff: forms4a.txt:1 plussed | forms4a.txt:1 | b\n' > "$TQ/code_sniff"
 printf '__Sniff:__ forms4a.txt:1 underscored | forms4a.txt:1 | c__\n1) Sniff: forms4a.txt:1 paren | forms4a.txt:1 | d\n- Sniff: forms4a.txt:1 piped | forms4a.txt:1 | e | f, a pipe in why\n' > "$TQ/tests_sniff"
-Q add "$TMP/wt-forms4a" fix "Forms" >/dev/null; out="$(TMPDIR="$TQ/tmp4a" Q run)"
+printf '  - Sniff: forms4a.txt:1 indented | forms4a.txt:1 | g\n**Sniff**: forms4a.txt:1 bold label | forms4a.txt:1 | h\nSniff: forms4a.txt:1 glob | forms4a.txt:1 | matches *\nSniff: forms4a.txt:1 two parts | forms4a.txt:1\nSniff: forms4a.txt:1 no why | forms4a.txt:1 |\n' >> "$TQ/tests_sniff"
+printf 'max_sniff_requests=6\n' > "$TMP/limit6.conf"
+Q add "$TMP/wt-forms4a" fix "Forms" >/dev/null; out="$(SNIFF_CONFIG="$TMP/limit6.conf" TMPDIR="$TQ/tmp4a" Q run)"
 assert_contains "A3 (4a): a numbered Sniff: line is sniffed" "$(cat "$sf")" "Sniffed 1: forms4a.txt:1 numbered | forms4a.txt:1 | gone.txt:5 is only in why"
 assert_contains "A3 (4a): a * Sniff: line is sniffed" "$(cat "$sf")" "Sniffed 2: forms4a.txt:1 starred | forms4a.txt:1 | a"
 assert_contains "A3 (4a): a + Sniff: line is sniffed" "$(cat "$sf")" "Sniffed 3: forms4a.txt:1 plussed | forms4a.txt:1 | b"
@@ -1227,6 +1235,11 @@ assert_contains "A3 (4a): a 1) Sniff: line is sniffed" "$(cat "$sf")" "Sniffed 5
 assert_contains "A9 (4a): a | in <why> stays in it" "$(cat "$sf")" "Sniffed 6: forms4a.txt:1 piped | forms4a.txt:1 | e | f, a pipe in why
 "
 assert_contains "A2 (4a): <why> isn't sniffed: no flag for its reference" "$(cat "$sf")" "Flags: 0 hard, 0 soft"
+assert_contains "A3 (4a): an indented Sniff: line is sniffed" "$(cat "$sf")" "Sniffed 7: forms4a.txt:1 indented | forms4a.txt:1 | g"
+assert_contains "A3 (4a): a **Sniff**: line is sniffed" "$(cat "$sf")" "Sniffed 8: forms4a.txt:1 bold label | forms4a.txt:1 | h"
+assert_contains "A3 (4a): a line without emphasis keeps its last *" "$(cat "$sf")" "Sniffed 9: forms4a.txt:1 glob | forms4a.txt:1 | matches *"
+assert_contains "A9 (4a): two parts are refused" "$out" "   sniff: $(revfile forms4a tests.md): Sniff line 7 refused: give <claim> | <where> | <why>"
+assert_contains "A9 (4a): an empty <why> is refused" "$out" "   sniff: $(revfile forms4a tests.md): Sniff line 8 refused: give <claim> | <where> | <why>"
 assert_contains "A2 (4a): <why> isn't sniffed: merged" "$out" "MERGED fix/forms4a"
 assert "A17 (4a): the sniff's temp folder is removed" test -z "$(ls -A "$TQ/tmp4a")"
 # The fallbacks: no temp folder, the Sniff: lines can't be read (python3 fails), sniff.sh fails with no reason.
@@ -1294,6 +1307,14 @@ assert "A17 (4a): stop: no temp files left" test -z "$(ls -A "$TQ/tmps")"
 assert "A17 (4a): stop: at once, not after the sniff's 30 s" test $((SECONDS - t0)) -lt 10
 assert "A17 (4a): stop: the job stayed in running/" test -n "$(find "$RQ/running" -name '*stopsniff4a.job')"
 rm -f "$TQ/sniff_hang" "$RQ"/running/*
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/qcopy/queue/sniff.sh"   # no output, no Flags: line
+reset_pr; mkwt noflags4a; echo 'Sniff: noflags4a.txt:1 x | noflags4a.txt:1 | y' > "$TQ/code_sniff"
+Q add "$TMP/wt-noflags4a" fix "No flags line" >/dev/null
+out="$(PATH="$TQ/bin:$PATH" bash "$TMP/qcopy/queue/pr-queue.sh" run </dev/null 2>&1)"
+assert_contains "A6 (4a): no Flags: line: counted as none" "$out" \
+  "   the sniff of the reviews' requests has 0 soft flag(s) (sniff: $PR_QUEUE_DIR/reviews/fix-noflags4a-"
+assert_not_contains "A6 (4a): no Flags: line: no shell error" "$out" "expected"
+assert_contains "A6 (4a): no Flags: line: merged" "$out" "MERGED fix/noflags4a"
 rm -rf "$TMP/qcopy"
 # Soft flags only: the job goes on, with one line in the log; a re-queue of the commit (sniffed already) goes on too.
 reset_pr; mkwt softagain; echo fail > "$TQ/checks_seq"
@@ -1321,7 +1342,7 @@ assert_contains "A17 (4a): exit 4: the job goes on" "$out" "MERGED fix/nested4a"
 assert "A17 (4a): exit 4: no sniff file"          test -z "$(sniffs_of nested4a)"
 # The limit per review, from SNIFF_CONFIG: the code review's third line is refused; the test review's malformed
 # line is refused and doesn't count, so both its others run.
-reset_pr; mkwt limit4a; printf 'max_sniff_requests=2\n' > "$TMP/limit2.conf"
+reset_pr; mkwt limit4a; printf 'echo noise\nmax_sniff_requests=2\n' > "$TMP/limit2.conf"   # its output isn't read as the value
 printf 'Sniff: limit4a.txt:1 one | limit4a.txt:1 | a\nSniff: limit4a.txt:1 two | limit4a.txt:1 | b\nSniff: limit4a.txt:1 three | limit4a.txt:1 | c\n' > "$TQ/code_sniff"
 printf 'Sniff: only a claim\nSniff: limit4a.txt:1 four | limit4a.txt:1 | d\nSniff: limit4a.txt:1 five | | e\nSniff: limit4a.txt:1 six | limit4a.txt:1 | f\n' > "$TQ/tests_sniff"
 h="$(s12 limit4a)"; Q add "$TMP/wt-limit4a" fix "Limit" >/dev/null; out="$(SNIFF_CONFIG="$TMP/limit2.conf" Q run)"
@@ -1349,9 +1370,13 @@ assert_contains "A7 (4a): a limit of 0 refuses every line" "$out" "Sniff line 1 
 assert "A7 (4a): a limit of 0: no sniff file"    test -z "$(sniffs_of zero4a)"
 assert_contains "A7 (4a): a limit of 0: merged"  "$out" "MERGED fix/zero4a"
 # A missing or invalid limit: no line runs, the log says why, the job goes on.
-for c in nokey bad; do
+for c in nokey bad trail; do
   reset_pr; mkwt "conf$c"
-  if [ "$c" = nokey ]; then echo 'max_diff_lines=1' > "$TMP/conf-$c.conf"; else echo 'max_sniff_requests=x' > "$TMP/conf-$c.conf"; fi
+  case "$c" in
+    nokey) echo 'max_diff_lines=1' > "$TMP/conf-$c.conf" ;;
+    bad) echo 'max_sniff_requests=x' > "$TMP/conf-$c.conf" ;;
+    trail) echo 'max_sniff_requests=3x' > "$TMP/conf-$c.conf" ;;
+  esac
   echo "Sniff: conf$c.txt:99 is the fix | conf$c.txt:99 | one line" > "$TQ/code_sniff"
   Q add "$TMP/wt-conf$c" fix "Conf $c" >/dev/null; out="$(max_sniff_requests=3 SNIFF_CONFIG="$TMP/conf-$c.conf" Q run)"  # only the file's value counts
   assert_contains "A8 (4a): $c: the log names the key and the file" "$(cat "$RQ/logs/fix/conf$c.log")" \
@@ -1360,6 +1385,14 @@ for c in nokey bad; do
   assert "A8 (4a): $c: no sniff file"            test -z "$(sniffs_of "conf$c")"
   assert_contains "A8 (4a): $c: merged"          "$out" "MERGED fix/conf$c"
 done
+# An invalid limit and no Sniff: line: no note (nothing to refuse). A review that needs changes, judged ready,
+# with no sniff file: the judge gets none.
+reset_pr; mkwt confnone; echo "needs changes" > "$TQ/verdict"; echo ready > "$TQ/judge_verdict"
+Q add "$TMP/wt-confnone" fix "Conf none" >/dev/null; out="$(SNIFF_CONFIG="$TMP/conf-bad.conf" Q run)"
+assert_not_contains "A1 (4a): no Sniff: line: no note about the limit" "$out" "max_sniff_requests"
+assert "A13 (4a): no sniff file: the judge gets none" test -z "$(grep '^judge-sniff ' "$TQ/claude.log")"
+assert_contains "A13 (4a): no sniff file: the judge ran, and the job merged" "$out" "MERGED fix/confnone"
+rm -f "$TQ/verdict" "$TQ/judge_verdict"
 # The same claim (whitespace aside) is sniffed once per commit: again in the same job, in a re-queue of the
 # commit (its reviews cached as ready print it again), and once more at a new commit.
 reset_pr; mkwt again4a; echo fail > "$TQ/checks_seq"

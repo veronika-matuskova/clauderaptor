@@ -49,6 +49,9 @@ Then, for each claim with `found: no` or a too-good-to-be-true reason, print one
 
 `<author>` is the bundle's Author. Pick the one form of answer that would settle the claim.
 
+Last, print one line `Claims: <n>`, the number of `Claim` lines you printed: `Claims: 0` when the text claims
+nothing. Without it, or with another number, sniff.sh takes your result as lost and the sniff as not run.
+
 ## Mode: answer
 
 The bundle lists the requests of the earlier round (`Request <n> to <author>: ...`) and the author's answer. An
@@ -63,4 +66,7 @@ answer to request n is the block that starts with `Answer <n>:`. For each reques
 
 There is no second round: print no requests in this mode.
 
-End with nothing else: no summary, no verdict.
+Last, print one line `Answered: <n>`, the number of `Answered` lines you printed. Without it, or with another
+number, sniff.sh takes your result as lost and the sniff as not run.
+
+End with that count line, and nothing else: no summary, no verdict.

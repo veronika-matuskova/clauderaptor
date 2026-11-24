@@ -674,7 +674,7 @@ ss() {
 calls() { if [ -f "$TMP/session-calls" ]; then wc -l < "$TMP/session-calls"; else echo 0; fi; }
 printf '%s\n' 'Claim (line 2): Made it 10x faster. | evidence named: none | found: no | too good to be true: no measurement' \
   'Claim (line 1): See a.js:500. | evidence named: a.js:500 | found: no | too good to be true: no' \
-  'Request to reviewer: Made it 10x faster. | missing: a measurement before and after | answer with: a measurement' > "$TMP/session-result"
+  'Request to reviewer: Made it 10x faster. | missing: a measurement before and after | answer with: a measurement' 'Claims: 2' > "$TMP/session-result"
 TG=$'See a.js:500.\nMade it 10x faster.'
 ss "$TG" --session --author reviewer --commit HEAD~1
 assert "A8: exactly one session" test "$(calls)" = 1
@@ -696,17 +696,17 @@ assert_contains "the bundle's mode" "$(cat "$TMP/session-prompt")" "Mode: claims
 assert "the bundle's temp folder and the session's scratch are removed" test -z "$(ls -A "$TMP/tmpd")"
 SNIFF_CONFIG="$TMP/none.conf" ss "$TG" --session --author reviewer
 assert_contains "no thresholds file: the bundle says so, and the session runs" "$(cat "$TMP/session-prompt")" "Thresholds ($TMP/none.conf): none ($TMP/none.conf not read)"
-printf '%s\n' 'Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: No.' 'Request to reviewer: Plain. | missing: x | answer with: a file:line' 'Request to reviewer: Two. | missing: y | answer with: a command and its output' > "$TMP/session-result"
+printf '%s\n' 'Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: No.' 'Request to reviewer: Plain. | missing: x | answer with: a file:line' 'Request to reviewer: Two. | missing: y | answer with: a command and its output' 'Claims: 1' > "$TMP/session-result"
 ss 'Plain.' --session --author reviewer
 assert "A8: requests don't change the exit code (no flags: 0)" test "$rc" = 0
 assert_contains "A8: requests are numbered in order" "$out" "Request 2 to reviewer: Two. | missing: y"
 assert_contains "'No.' is no too-good flag" "$out" "Flags: 0 hard, 0 soft"
-printf '%s\n' '- **Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: "100 %" with nothing counted**' 'Claim (line 1): Plain. | evidence named: none' > "$TMP/session-result"
+printf '%s\n' '- **Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: "100 %" with nothing counted**' 'Claim (line 1): Plain. | evidence named: none' 'Claims: 2' > "$TMP/session-result"
 ss 'Plain.' --session --author reviewer
 assert_contains "a Claim line in Markdown is read" "$out" "soft too good to be true (line 1): Plain. — \"100 %\" with nothing counted"
 assert_contains "a Claim line without the too-good field: no flag" "$out" "Flags: 0 hard, 1 soft"
 assert "soft only: exit 1" test "$rc" = 1
-printf '%s\n' '1. Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: no measurement' '2) **Request to reviewer: Plain. | missing: m | answer with: a measurement**' > "$TMP/session-result"
+printf '%s\n' '1. Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: no measurement' '2) **Request to reviewer: Plain. | missing: m | answer with: a measurement**' '**Claims: 1**' > "$TMP/session-result"
 ss 'Plain.' --session --author reviewer
 assert_contains "a numbered Claim line is read" "$out" "soft too good to be true (line 1): Plain. — no measurement"
 assert_contains "a numbered Request line in bold is read, without the bold" "$out" "Request 1 to reviewer: Plain. | missing: m | answer with: a measurement
@@ -715,8 +715,35 @@ ss "$TG"
 assert "A9: without --session no session" test "$(calls)" = 0
 assert "A9: and the never-called stub wasn't called" test ! -e "$TMP/claude-calls"
 
+echo "-- the count line (Claims: <n>)"
+printf 'Claims: 0\n' > "$TMP/session-result"
+ss 'Plain.' --session --author reviewer
+assert "Claims: 0 with no Claim lines: a text with no claims, no flag" test "$out" = "Flags: 0 hard, 0 soft"
+assert "Claims: 0: exit 0" test "$rc" = 0
+: > "$TMP/session-result"; ss 'Plain.' --session --author reviewer
+assert_contains "an empty result: the session didn't run" "$err" 'sniff: the session didn'"'"'t run: its result has no "Claims: <n>" line (empty or cut off)'
+assert "an empty result: exit 4" test "$rc" = 4
+assert "an empty result: nothing on stdout" test -z "$out"
+printf '%s\n' 'Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: no measurement' > "$TMP/session-result"
+ss 'Plain.' --session --author reviewer
+assert_contains "a result cut off before the count line: didn't run" "$err" 'its result has no "Claims: <n>" line (empty or cut off)'
+assert "cut off: exit 4" test "$rc" = 4
+printf '%s\n' 'Claim (line 1): Plain. | evidence named: none | found: no | too good to be true: no' 'Claims: 2' > "$TMP/session-result"
+ss 'Plain.' --session --author reviewer
+assert_contains "a count over the Claim lines read: didn't run" "$err" 'sniff: the session didn'"'"'t run: its result says "Claims: 2" but has 1 Claim line'
+assert "a count over: exit 4" test "$rc" = 4
+printf '%s\n' 'Claim (line 1): A. | too good to be true: no' 'Claim (line 1): B. | too good to be true: no' 'Claims: 1' > "$TMP/session-result"
+ss 'Plain.' --session --author reviewer
+assert_contains "a count under the Claim lines read: didn't run" "$err" 'its result says "Claims: 1" but has 2 Claim lines'
+assert "a count under: exit 4" test "$rc" = 4
+printf '%s\n' 'Claims: 5' 'Claim (line 1): A. | too good to be true: no' 'Claims: 1' > "$TMP/session-result"
+ss 'Plain.' --session --author reviewer
+assert "the last count line counts" test "$rc" = 0
+printf 'Answered: 0\n' > "$TMP/session-result"; ss 'Plain.' --session --author reviewer
+assert_contains "an Answered count in a claims run is no Claims line" "$err" 'its result has no "Claims: <n>" line'
+
 echo "-- the author"
-printf 'Claim (line 1): x | evidence named: none | found: no | too good to be true: no\n' > "$TMP/session-result"
+printf 'Claim (line 1): x | evidence named: none | found: no | too good to be true: no\nClaims: 1\n' > "$TMP/session-result"
 ss 'Plain.' --session --author developer
 assert_contains "A10: --author developer reaches the session's prompt" "$(cat "$TMP/session-prompt")" "Author: developer"
 mkdir -p "$TMP/au"; echo 'Plain.' > "$TMP/au/r.md"
@@ -764,7 +791,7 @@ assert "a session that doesn't start: exit 4" test "$rc" = 4
 echo "-- one answer round (--answer)"
 printf '%s\n' 'soft too good to be true (line 2): Made it 10x faster. — no measurement' \
   'Request 1 to reviewer: Made it 10x faster. | missing: a measurement before and after | answer with: a file:line' 'Flags: 0 hard, 1 soft' > "$TMP/earlier.txt"
-printf 'Answered 1: yes — a.js:100 has the measurement\n' > "$TMP/session-result"
+printf 'Answered 1: yes — a.js:100 has the measurement\nAnswered: 1\n' > "$TMP/session-result"
 ss $'Answer 1: the measurement is at a.js:100.' --answer "$TMP/earlier.txt"
 assert "A16: an answer with evidence the session confirms: no flag" test "$out" = "Flags: 0 hard, 0 soft"
 assert "A16: answered: exit 0" test "$rc" = 0
@@ -778,32 +805,44 @@ assert "A16: past the end: exit 2" test "$rc" = 2
 ss 'No answers here.' --answer "$TMP/earlier.txt"
 assert_contains "A16: no Answer 1: hard, naming the claim" "$out" "hard unsupported after one round (line 1): Made it 10x faster. — Request 1 has no Answer 1: block"
 assert "A16: no Answer 1: exit 2" test "$rc" = 2
-printf 'Answered 1: no — it argues, with no measurement\n' > "$TMP/session-result"
+printf 'Answered 1: no — it argues, with no measurement\nAnswered: 1\n' > "$TMP/session-result"
 ss 'Answer 1: trust me.' --answer "$TMP/earlier.txt"
 assert_contains "the session says no: hard, with its reason" "$out" "hard unsupported after one round (line 1): Made it 10x faster. — the session found the evidence missing in Answer 1: it argues, with no measurement"
 assert "the session says no: exit 2" test "$rc" = 2
-printf 'Nothing about it.\n' > "$TMP/session-result"
+printf 'Nothing about it.\nAnswered: 0\n' > "$TMP/session-result"
 ss 'Answer 1: a.js:100.' --answer "$TMP/earlier.txt"
 assert_contains "the session doesn't answer for it: hard" "$out" "the session found the evidence missing in Answer 1: the session didn't answer for it"
-printf '**Answered 1: yes**\n' > "$TMP/session-result"
+printf '**Answered 1: yes**\nAnswered: 1\n' > "$TMP/session-result"
 ss 'Answer 1: a.js:100.' --answer "$TMP/earlier.txt"
 assert "an Answered line in Markdown is read" test "$out" = "Flags: 0 hard, 0 soft"
-printf '1. Answered 1: yes — ok\n' > "$TMP/session-result"
+printf '1. Answered 1: yes — ok\nAnswered: 1\n' > "$TMP/session-result"
 ss 'Answer 1: a.js:100.' --answer "$TMP/earlier.txt"
 assert "a numbered Answered line is read" test "$out" = "Flags: 0 hard, 0 soft"
 printf '%s\n' 'Request 1 to reviewer: A. | missing: a | answer with: a file:line' 'Request 2 to reviewer: B. | missing: b | answer with: a file:line' > "$TMP/earlier2.txt"
-printf 'Answered 1: yes — ok\nAnswered 2: yes — ok\n' > "$TMP/session-result"
+printf 'Answered 1: yes — ok\nAnswered 2: yes — ok\nAnswered: 2\n' > "$TMP/session-result"
 ss $'Answer 1: a.js:100.\nAnswer 2: a.js:500.' --answer "$TMP/earlier2.txt"
 assert_not_contains "a block ends at the next one: Answer 1 is clear" "$out" "(line 1): A."
 assert_contains "and Answer 2 has its own hard flag" "$out" "hard unsupported after one round (line 2): B. — Answer 2 has a hard flag (line 2)"
-printf 'Answered 1: yes — ok\n' > "$TMP/session-result"
+printf 'Answered 1: yes — ok\nAnswered: 1\n' > "$TMP/session-result"
 ss $'Answer 1: the measurement is below.\nIt is at a.js:500.' --answer "$TMP/earlier.txt"
 assert_contains "a hard flag on a later line of the block counts" "$out" "hard unsupported after one round (line 1): Made it 10x faster. — Answer 1 has a hard flag (line 2)"
-printf 'Answered 1: yes — ok\nRequest to reviewer: More? | missing: m | answer with: a file:line\n' > "$TMP/session-result"
+printf 'Answered 1: yes — ok\nRequest to reviewer: More? | missing: m | answer with: a file:line\nAnswered: 1\n' > "$TMP/session-result"
 ss 'Answer 1: a.js:100.' --answer "$TMP/earlier.txt" --author developer
 assert_not_contains "A17: an answer run prints no Request line" "$out" "Request"
 assert "A17: an answer run: one session" test "$(calls)" = 1
 assert_contains "--author wins in an answer run" "$(cat "$TMP/session-prompt")" "Author: developer"
+: > "$TMP/session-result"; ss 'Answer 1: a.js:100.' --answer "$TMP/earlier.txt"
+assert_contains "--answer: an empty result: didn't run" "$err" 'sniff: the session didn'"'"'t run: its result has no "Answered: <n>" line (empty or cut off)'
+assert "--answer: an empty result: exit 4" test "$rc" = 4
+assert "--answer: an empty result: nothing on stdout" test -z "$out"
+printf 'Answered 1: yes — ok\n' > "$TMP/session-result"; ss 'Answer 1: a.js:100.' --answer "$TMP/earlier.txt"
+assert_contains "--answer: cut off before the count line: didn't run" "$err" 'its result has no "Answered: <n>" line (empty or cut off)'
+assert "--answer: cut off: exit 4" test "$rc" = 4
+printf 'Answered 1: yes — ok\nAnswered: 2\n' > "$TMP/session-result"; ss 'Answer 1: a.js:100.' --answer "$TMP/earlier.txt"
+assert_contains "--answer: a count that disagrees: didn't run" "$err" 'its result says "Answered: 2" but has 1 Answered line'
+assert "--answer: a count that disagrees: exit 4" test "$rc" = 4
+printf 'Claims: 0\n' > "$TMP/session-result"; ss 'Answer 1: a.js:100.' --answer "$TMP/earlier.txt"
+assert_contains "--answer: a Claims count is no Answered line" "$err" 'its result has no "Answered: <n>" line'
 printf 'Flags: 0 hard, 0 soft\n' > "$TMP/norequests.txt"
 ss 'Answer 1: a.js:100.' --answer "$TMP/norequests.txt"
 assert_contains "A17: an earlier output with no Request lines" "$err" "sniff: no Request lines in $TMP/norequests.txt"

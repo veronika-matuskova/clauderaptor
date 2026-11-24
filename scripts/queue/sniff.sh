@@ -51,15 +51,18 @@
 # mechanical flags and the thresholds; its instructions are in sniff.md. It lists the claims, and each one it
 # finds too good to be true is a soft "too good to be true" flag; its evidence requests are printed as
 # "Request <n> to <author>: <claim> | missing: <...> | answer with: <...>" lines before the Flags line. Requests
-# don't change the exit code. The author is --author, else from the input's sidecar (<input without .md>.json):
-# kind code or tests is a reviewer, plan a planner. No author, or an unknown one, exits 4; so does a session that
-# didn't run ("sniff: the session didn't run: <reason>" on stderr).
+# don't change the exit code. The session's result ends with "Claims: <n>", the number of its Claim lines (0 for
+# a text with no claims): a result without that line (empty, or cut off) or with another number is taken as
+# lost, and the session as not run (exit 4). The author is --author, else from the input's sidecar (<input
+# without .md>.json): kind code or tests is a reviewer, plan a planner. No author, or an unknown one, exits 4; so
+# does a session that didn't run ("sniff: the session didn't run: <reason>" on stderr).
 # One answer round (--answer <earlier output>): the input is the author's answer to the Request lines of an
 # earlier --session output (none there exits 4). It is sniffed mechanically, then one session checks it (the
 # author defaults as above, else to the one the requests name). Request <n> is cleared only if the answer has an
 # "Answer <n>:" block (up to the next one), no line of that block has a hard flag, and the session says
-# "Answered <n>: yes". Each one not cleared is a hard "unsupported after one round" flag naming its claim. It
-# prints no Request lines: there is never a second round. sniff.sh doesn't deliver requests or collect answers.
+# "Answered <n>: yes" (its result ends with "Answered: <n>", checked like "Claims: <n>"). Each one not cleared is
+# a hard "unsupported after one round" flag naming its claim. It prints no Request lines: there is never a second
+# round. sniff.sh doesn't deliver requests or collect answers.
 # References it leaves alone (never flagged): absolute paths, ~/ paths, $VAR or ${...} paths, ../ paths, URLs;
 # tokens with a placeholder or glob (<...>, ..., *); git ranges (main..HEAD); options (-x); ~~struck-out~~ text;
 # and every reference on a line whose prose (not its code spans or paths) says it is new or to be added ("new",
@@ -892,6 +895,19 @@ def run_session(bundle_text):
         stop(f"the session didn't run: {reason}")
     return r.stdout.decode("utf-8", "replace")
 
+def check_count(result, label, line_re, what):
+    """A result ends with "<label>: <n>", n the number of its lines that line_re matches. Without that line
+    (an empty result, or one cut off), or with another n, the session's result is taken as lost."""
+    count_re = re.compile(rf"^[\s>*_`\-]*{label}:[\s*_`]*(\d+)[\s*_`]*$")
+    rows = result.splitlines()
+    counts = [int(m.group(1)) for m in (count_re.match(r) for r in rows) if m]
+    if not counts:
+        stop(f'the session didn\'t run: its result has no "{label}: <n>" line (empty or cut off)')
+    found_n = sum(1 for r in rows if line_re.match(r))
+    if counts[-1] != found_n:
+        stop(f'the session didn\'t run: its result says "{label}: {counts[-1]}" but has {found_n} {what} line'
+             f'{"" if found_n == 1 else "s"}')
+
 def bundle_of(mode, text_lines, mech, extra=""):
     conf = read_conf(False)
     th = ", ".join(f"{k}={plain(conf[k])}" for k in CONF_KEYS if k in conf) or f"none ({conf_path} not read)"
@@ -907,6 +923,7 @@ def flag_lines():
 out_requests = []
 if session and not answer_path:
     result = run_session(bundle_of("claims", lines, flag_lines()))
+    check_count(result, "Claims", CLAIM_RE_S, "Claim")
     for raw in result.splitlines():
         m = CLAIM_RE_S.match(raw)
         if m:
@@ -922,6 +939,7 @@ if session and not answer_path:
 elif answer_path:
     reqs = "\n".join(f"Request {n} to {a}: {t}" for n, a, t in requests)
     result = run_session(bundle_of("answer", lines, flag_lines(), f"\n## The requests of the earlier round ({answer_path})\n\n{reqs}\n"))
+    check_count(result, "Answered", ANSWERED_RE, "Answered")
     said = {}
     for raw in result.splitlines():
         m = ANSWERED_RE.match(raw)

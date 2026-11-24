@@ -1106,6 +1106,15 @@ assert "A4 (4a): no PR"                           test ! -s "$TQ/created.log"
 assert "A4 (4a): the job in failed/"              in_failed sniffref
 assert_contains "A4 (4a): job_failed review/sniff" "$(ev fix/sniffref 'failed()')" "review/sniff"
 assert "A4 (4a): no sniff session"                test -z "$(grep '^sniff ' "$TQ/claude.log")"
+# A re-queue of the same commit: its claims were sniffed already, but their hard flags still fail it.
+Q add "$TMP/wt-sniffref" fix "Sniff ref" >/dev/null; : > "$TQ/npm.log"; out="$(Q run)"
+assert_contains "A4 (4a): a re-queue of the commit: already sniffed" "$out" "sniff: sniffref.txt:99 holds the fix: already sniffed at"
+assert_not_contains "A4 (4a): a re-queue of the commit: no new sniff" "$out" "sniffing"
+assert_contains "A4 (4a): a re-queue of the commit fails again on the earlier hard flag" "$out" \
+  "FAILED fix/sniffref: the sniff of the reviews' requests has 1 hard flag(s) (sniff: $sf)"
+assert_contains "A4 (4a): a re-queue of the commit: job_failed review/sniff" "$(ev fix/sniffref 'failed()')" "review/sniff"
+assert "A4 (4a): a re-queue of the commit: no e2e" test ! -s "$TQ/npm.log"
+assert "A4 (4a): the sniff file isn't added to"  test "$(grep -c '^Flags: ' "$sf")" = 1
 # With a judge that fails the job, the sniff's hard flags end its message; the judge gets the sniff file, and
 # its own Sniff: lines are never run.
 reset_pr; mkwt sniffjudge; echo "needs changes" > "$TQ/verdict"
@@ -1122,8 +1131,46 @@ assert_not_contains "A12 (4a): the judge's Sniff: line isn't sniffed" "$(cat "$s
 Q add "$TMP/wt-sniffjudge" fix "Sniff judge" >/dev/null; out="$(Q run)"
 assert_contains "A12 (4a): a re-queue reads the reviews again" "$out" "already sniffed at"
 assert_not_contains "A12 (4a): not the judge's file" "$(cat "$sf") $out" "judgeclaim"
+# A new commit, judged again with changes to make: the second round needs the user, with the sniff's flags.
+git -C "$TMP/wt-sniffjudge" commit -q --allow-empty -m again
+Q add "$TMP/wt-sniffjudge" fix "Sniff judge" >/dev/null; out="$(Q run)"
+assert_contains "A5 (4a): two judged rounds end with the sniff's hard flags" "$out" \
+  "after two judged rounds (judge: $PR_QUEUE_DIR/reviews/fix-sniffjudge-$(s12 sniffjudge)-judge.md); the sniff has 1 hard flag(s) (sniff: $PR_QUEUE_DIR/reviews/fix-sniffjudge-$(s12 sniffjudge)-sniff.md)"
 rm -f "$TQ/verdict" "$TQ/judge_sniff"
-# Soft flags only: the job goes on, with one line in the log.
+# Every other failure of step 2 ends with the sniff's hard flags too: no judge (PR_QUEUE_JUDGE=0), a review that
+# didn't run, a judge that escalates, a judge that didn't run.
+for c in nojudge reverr escal judgefail; do
+  reset_pr; mkwt "sn$c"; h="$(s12 "sn$c")"; sf="$PR_QUEUE_DIR/reviews/fix-sn$c-$h-sniff.md"
+  echo "Sniff: sn$c.txt:9 is the fix | sn$c.txt:9 | one line" > "$TQ/code_sniff"
+  echo "needs changes" > "$TQ/verdict"; jz=1
+  case "$c" in
+    nojudge) jz=0 ;;
+    reverr) rm "$TQ/verdict"; echo failed > "$TQ/tests_verdict" ;;
+    escal) echo escalate > "$TQ/judge_verdict" ;;
+    judgefail) echo failed > "$TQ/judge_verdict" ;;
+  esac
+  Q add "$TMP/wt-sn$c" fix "Sniff $c" >/dev/null; out="$(PR_QUEUE_JUDGE=$jz Q run)"
+  case "$c" in
+    nojudge) want="FAILED fix/snnojudge: the review found changes to make (review: $(revfile snnojudge medium-notests.md)); the sniff has 1 hard flag(s) (sniff: $sf)"
+      assert_contains "A5 (4a): PR_QUEUE_JUDGE=0: job_failed review/review_code" "$(ev fix/snnojudge 'failed()')" "review/review_code" ;;
+    reverr) want="FAILED fix/snreverr: the test review didn't run: review: no verdict in the review; the sniff has 1 hard flag(s) (sniff: $sf)"
+      assert_contains "A5 (4a): a review that didn't run: job_failed review/review_error" "$(ev fix/snreverr 'failed()')" "review/review_error" ;;
+    escal) want="FAILED fix/snescal: needs your decision: the judge rejected a finding that would be critical if real (judge: $PR_QUEUE_DIR/reviews/fix-snescal-$h-judge.md); the sniff has 1 hard flag(s) (sniff: $sf)" ;;
+    judgefail) want="; the judge didn't run: review: no verdict in the review; the sniff has 1 hard flag(s) (sniff: $sf)" ;;
+  esac
+  assert_contains "A5 (4a): $c: the failure ends with the sniff's hard flags" "$out" "$want"
+  assert "A5 (4a): $c: no e2e"                    test ! -s "$TQ/npm.log"
+done
+rm -f "$TQ/verdict" "$TQ/tests_verdict" "$TQ/judge_verdict"
+# Soft flags only: the job goes on, with one line in the log; a re-queue of the commit (sniffed already) goes on too.
+reset_pr; mkwt softagain; echo fail > "$TQ/checks_seq"
+echo 'Sniff: ran the e2e suite again | the PR body | no run is shown' > "$TQ/code_sniff"
+Q add "$TMP/wt-softagain" fix "Soft again" >/dev/null; out="$(Q run)"
+assert_contains "A6 (4a): soft only: the job goes on (to the checks)" "$out" "FAILED fix/softagain: checks failed"
+rm -f "$TQ/checks_seq"; Q add "$TMP/wt-softagain" fix "Soft again" >/dev/null; out="$(Q run)"
+assert_contains "A6 (4a): a re-queue of a soft-only commit: already sniffed" "$out" "sniff: ran the e2e suite again: already sniffed at"
+assert_not_contains "A6 (4a): a re-queue of a soft-only commit: no hard flags" "$out" "hard flag"
+assert_contains "A6 (4a): a re-queue of a soft-only commit merges" "$out" "MERGED fix/softagain"
 reset_pr; mkwt sniffsoft
 echo 'Sniff: ran the e2e suite | the PR body | no run is shown' > "$TQ/code_sniff"
 h="$(s12 sniffsoft)"; sf="$PR_QUEUE_DIR/reviews/fix-sniffsoft-$h-sniff.md"

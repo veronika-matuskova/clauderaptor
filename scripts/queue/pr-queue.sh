@@ -38,7 +38,8 @@
 #      the flags to $REVIEW_DIR/<branch>-<sha>-sniff.md, which the judge (REVIEW_SNIFF) and the branch's next
 #      reviews get. A line without three non-empty parts, or one past max_sniff_requests per review (in sniff.conf,
 #      or $SNIFF_CONFIG; a missing or invalid value: no line runs, a note says why), is refused, with a log line; a
-#      claim already sniffed at that commit isn't sniffed again. The judge's and the sniff's own output are never
+#      claim already sniffed at that commit isn't sniffed again, but the hard flags of every sniff in that file count
+#      (a re-queue of the same commit fails on them again). The judge's and the sniff's own output are never
 #      read for Sniff: lines. A hard flag fails the job (step review, reason sniff: "the sniff of the reviews'
 #      requests has <n> hard flag(s) (sniff: <file>)") if the judge lets it go on, and ends the message of any
 #      other failure of this step ("; the sniff has <n> hard flag(s) ..."); soft flags only add a line to the log,
@@ -381,11 +382,13 @@ PY
 }
 # sniff_reviews <sha> <asker>\t<review file>...: sniffs the reviews' Sniff: requests at the reviewed commit, once
 # per claim and commit, mechanically (sniff.sh, no session), and appends the requests and the flags to the
-# commit's sniff file, $sniff_file. Sets sniff_hard, its hard flags. A sniff that didn't run only adds a line to
-# the log: it never stalls a branch. Without a Sniff: line, it does nothing.
+# commit's sniff file, $sniff_file. Sets sniff_soft, the soft flags of this run (empty if nothing was sniffed now).
+# A sniff that didn't run only adds a line to the log: it never stalls a branch. Without a Sniff: line, it does
+# nothing. The hard flags count from the whole sniff file (sniff_hard_of), so a re-queue of the same commit, whose
+# claims were already sniffed, still has them.
 sniff_reviews() {
-  local sha="$1" short max conf="${SNIFF_CONFIG:-$HERE/sniff.conf}" rc n flags h s reason; shift
-  short="$(git rev-parse --short "$sha")"; sniff_hard=0
+  local sha="$1" short max conf="${SNIFF_CONFIG:-$HERE/sniff.conf}" rc n flags reason; shift
+  short="$(git rev-parse --short "$sha")"; sniff_soft=""
   # The limit, from the config: sourced in a subshell, so that only the file's value counts.
   # shellcheck source=/dev/null  # a config file, checked by the tests instead
   max="$(unset max_sniff_requests; . "$conf" >/dev/null 2>&1; echo "${max_sniff_requests:-}")"
@@ -410,14 +413,12 @@ sniff_reviews() {
     printf '## Requests of %s (sniff.sh at %s)\n\n' "$(date '+%F %T')" "$sha"
     cat "$sniff_tmp/block"; printf '### Flags\n\n'; cat "$sniff_tmp/out"; echo; } >> "$sniff_file" 2>>"$LOG"
   flags="$(grep -m1 '^Flags: ' "$sniff_tmp/out")"
-  h="$(sed -n 's/^Flags: \([0-9]*\) hard.*/\1/p' <<<"$flags")"; s="$(sed -n 's/.*, \([0-9]*\) soft$/\1/p' <<<"$flags")"
-  sniff_hard="${h:-0}"
-  if [ "$sniff_hard" -gt 0 ]; then
-    echo "   the sniff of the reviews' requests has $sniff_hard hard flag(s) (sniff: $sniff_file)" | tee -a "$LOG"
-  else
-    echo "   the sniff of the reviews' requests has ${s:-0} soft flag(s) (sniff: $sniff_file)" | tee -a "$LOG"
-  fi
+  sniff_soft="$(sed -n 's/.*, \([0-9]*\) soft$/\1/p' <<<"$flags")"; sniff_soft="${sniff_soft:-0}"
   rm -rf "$sniff_tmp"; sniff_tmp=""
+}
+# sniff_hard_of <sniff file>: the hard flags of every sniff in it (the sum of its Flags: lines), 0 without one.
+sniff_hard_of() {
+  if [ -f "$1" ]; then awk '/^Flags: [0-9]+ hard,/ { n += $2 } END { print n + 0 }' "$1"; else echo 0; fi
 }
 
 # The speed check before e2e (step 3). say <message>: to the log and the output (fd 7, in the e2e subshell).
@@ -497,7 +498,7 @@ process() {
 
   # 2. Review the code and the tests, in fresh sessions at the same time, before the e2e run is spent on it.
   local tests code_pid="" tests_pid="" code_out="" tests_out="" judge_out="" problems="" findings="" found=() found_kinds="" judged
-  local asked=() sniff_tmp="" sniff_file="" sniff_hard=0 stail="" sniff_env=()
+  local asked=() sniff_tmp="" sniff_file="" sniff_hard=0 sniff_soft="" stail="" sniff_env=()
   level="$(field review "$1")"; tests="$(field tests "$1")"
   local brief=""; if [ -f "$JOB.brief" ]; then brief="$JOB.brief"; fi
   if [ "$level" = none ]; then
@@ -534,6 +535,12 @@ process() {
     # The reviews' Sniff: requests, before the judge, who gets the commit's sniff file.
     sniff_file="$REVIEWS/${BRANCH//\//-}-$(git rev-parse --short=12 "$reviewed")-sniff.md"
     sniff_reviews "$reviewed" "${asked[@]}"
+    sniff_hard="$(sniff_hard_of "$sniff_file")"
+    if [ "$sniff_hard" -gt 0 ]; then
+      echo "   the sniff of the reviews' requests has $sniff_hard hard flag(s) (sniff: $sniff_file)" | tee -a "$LOG"
+    elif [ -n "$sniff_soft" ]; then
+      echo "   the sniff of the reviews' requests has $sniff_soft soft flag(s) (sniff: $sniff_file)" | tee -a "$LOG"
+    fi
     if [ "$sniff_hard" -gt 0 ]; then stail="; the sniff has $sniff_hard hard flag(s) (sniff: $sniff_file)"; fi
     if [ -f "$sniff_file" ]; then sniff_env=(REVIEW_SNIFF="$sniff_file"); fi
     if [ -n "$problems" ]; then trap - INT TERM HUP; failjob review review_error "${problems#; }$findings$stail" found:list="${found_kinds%$'\n'}"; return; fi

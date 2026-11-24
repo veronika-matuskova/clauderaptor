@@ -7,6 +7,8 @@
 #   review.sh --suite <checkout>                   an audit of the checkout's whole test suite (same file)
 #   review.sh --judge <worktree> <review file>...  a judge of reviews that need changes (scripts/queue/review-judge.md)
 #   review.sh --plan <checkout> <request file>     a brief for a requested task, before an agent starts (scripts/queue/plan.md)
+#   review.sh --sniff <checkout> <commit> <input file>  a sniff session for sniff.sh --session and --answer
+#                                                  (scripts/queue/sniff.md): reads the input, checks its claims
 # The session runs in the worktree, with --safe-mode: nothing of the branch's own config is loaded (its
 # CLAUDE.md files, .claude/ rules, settings and hooks, skills that could stand in for /code-review, MCP
 # servers), so the branch can't steer its own review; a change to them is part of the diff it reviews.
@@ -23,7 +25,11 @@
 # that runs away is stopped there and the session goes on to report it. A Ctrl-C, kill (TERM) or hangup of
 # review.sh stops the session too, and waits for it to end. (Started by pr-queue.sh, review.sh ignores SIGINT as
 # a background job: the queue sends it TERM.)
-# The model and effort of each kind of review are set in review.conf, next to this script ($REVIEW_CONFIG to
+# A sniff (--sniff) gets the input file's text in its prompt (at most 100000 bytes) and reads the repo at <commit>
+# (any rev), with the rules of that commit. It runs in a scratch folder, removed afterwards, not in the checkout,
+# which may move meanwhile; 1800 s, like the code. It prints the session's result and exits 0, or 2 if it didn't
+# run. It writes nothing to $REVIEW_DIR or $BRIEF_DIR and no sidecar.
+# The model and effort of each kind of review (and of a sniff) are set in review.conf, next to this script ($REVIEW_CONFIG to
 # read another file); REVIEW_MODEL and REVIEW_EFFORT override them for one run. A commit already reviewed as
 # ready isn't reviewed again with other ones: the cache goes by commit and level, not by model or effort.
 # REVIEW_SKIP_TESTS=1 tells /code-review to leave the quality of tests to the test review.
@@ -100,6 +106,9 @@ rules() {
   if [ "${3:-}" = suite ]; then
     echo "This session loads no CLAUDE.md, rules, settings, hooks or skills of the repo. The rules to audit by are"
     echo "below: the user's, and the repo's at the audited commit ${1:0:12}, which hold its rules for tests."
+  elif [ "${3:-}" = sniff ]; then
+    echo "This session loads no CLAUDE.md, rules, settings, hooks or skills of the repo. The rules below are the"
+    echo "user's, and the repo's at commit ${1:0:12}, the commit the claims are checked at."
   elif [ "${3:-}" = plan ]; then
     echo "This session loads no CLAUDE.md, rules, settings, hooks or skills of the repo. The rules the planned"
     echo "change must follow are below: the user's, and the repo's at commit ${1:0:12}, the commit you plan at."
@@ -139,14 +148,19 @@ print("" if t.startswith("/") or r == ".." or r.startswith("../") else r)' "$p" 
 }
 
 usage="usage: review.sh <worktree> [low|medium|high|xhigh] | --tests <worktree> | --suite <checkout> \
-| --judge <worktree> <review file>... | --plan <checkout> <request file>"
-mode=code; level=medium; reviews=(); request=""
+| --judge <worktree> <review file>... | --plan <checkout> <request file> | --sniff <checkout> <commit> <input file>"
+mode=code; level=medium; reviews=(); request=""; sniff_rev=""; sniff_input=""
 case "${1:-}" in
   --tests|--suite) [ $# -eq 2 ] || die "$usage"; mode="${1#--}"; shift ;;
   --plan)
     [ $# -eq 3 ] || die "$usage"; mode=plan; shift
     if [ ! -f "$2" ] || [ ! -s "$2" ]; then die "no such request file, or it's empty: $2"; fi
     request="$(readlink -f "$2")"  # absolute: the session runs in the checkout
+    ;;
+  --sniff)
+    [ $# -eq 4 ] || die "$usage"; mode=sniff; shift
+    if [ ! -f "$3" ] || [ ! -r "$3" ]; then die "no such input file: $3"; fi
+    sniff_rev="$2"; sniff_input="$(readlink -f "$3")"
     ;;
   --judge)
     [ $# -ge 3 ] || die "$usage"; mode=judge; shift; reviews=("${@:2}")
@@ -165,11 +179,14 @@ HERE="$(dirname "$(readlink -f "$0")")"
 CAPPED="$(dirname "$HERE")/capped.sh"   # shared with the tests and the rules, one folder up
 wt="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" || die "$1 is not a git checkout"
 branch="$(git -C "$wt" branch --show-current)"
-if [ -z "$branch" ] && [ "$mode" != suite ] && [ "$mode" != plan ]; then die "$wt is not on a branch"; fi
+if [ -z "$branch" ] && [ "$mode" != suite ] && [ "$mode" != plan ] && [ "$mode" != sniff ]; then die "$wt is not on a branch"; fi
 sha="$(git -C "$wt" rev-parse -q --verify --short=12 HEAD)" || die "$wt has no commits"
+if [ "$mode" = sniff ]; then
+  sha="$(git -C "$wt" rev-parse -q --verify "$sniff_rev^{commit}")" || die "no such commit in $wt: $sniff_rev"
+fi
 main="$(dirname "$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir)")"
 dir="${REVIEW_DIR:-${PR_QUEUE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/pr-queue}/reviews}"
-mkdir -p "$dir" || die "can't create $dir"
+if [ "$mode" != sniff ]; then mkdir -p "$dir" || die "can't create $dir"; fi   # a sniff writes nothing there
 base="$dir/${branch//\//-}-$sha"
 brief=""
 if [ -n "${REVIEW_BRIEF:-}" ] && { [ "$mode" = code ] || [ "$mode" = tests ] || [ "$mode" = judge ]; }; then
@@ -275,6 +292,19 @@ that names it (e.g. A2) and says what is missing."
 - The request (read it with cat): $request"
     title="Brief for $name at $sha ("
     ;;
+  sniff)
+    rules_at="$sha"; rules_what="the commit the claims are checked at"
+    [ -f "$HERE/sniff.md" ] || die "missing $HERE/sniff.md"
+    size="$(wc -c <"$sniff_input")" || die "can't read $sniff_input"
+    [ "$size" -le 100000 ] || die "the input file is too big for the prompt ($size bytes, at most 100000): $sniff_input"
+    task="Sniff the claims in one text, following the instructions below.
+- Repo: $wt, commit $sha. You run in an empty scratch folder, not in the repo: read the repo with git -C $wt, and
+  only at that commit (git -C $wt show $sha:<path>, git -C $wt grep <word> $sha), never its working tree.
+- The input ($sniff_input), between the lines BEGIN INPUT and END INPUT:
+BEGIN INPUT
+$(cat "$sniff_input")
+END INPUT"
+    ;;
 esac
 conf="${REVIEW_CONFIG:-$HERE/review.conf}"
 # <kind>_model and <kind>_effort (the code: code_effort_<level>); a suite audit uses the test review's.
@@ -300,6 +330,12 @@ if [ "$mode" = plan ]; then
   the repo's contributing guide at that commit too (git show ${rules_at:0:12}:<path>).
 
 $(cat "$HERE/plan.md")"
+elif [ "$mode" = sniff ]; then
+  scratch="$(mktemp -d)" || die "can't create a scratch folder"
+  prompt="$task
+- Repo rules: the ones under \"Rules for this review\" in your system prompt, from commit ${rules_at:0:12}.
+
+$(cat "$HERE/sniff.md")"
 elif [ "$mode" != code ]; then
   instructions="$HERE/review-tests.md"
   if [ "$mode" = judge ]; then instructions="$HERE/review-judge.md"; fi
@@ -315,10 +351,14 @@ elif [ "$mode" != code ]; then
 $(cat "$instructions")"
 fi
 
-before="$(state)"
+before=""; if [ "$mode" != sniff ]; then before="$(state)"; fi   # a sniff's checkout may move: it reads <commit>
 limit="${REVIEW_TIMEOUT:-1800}"
-if [ "$mode" != code ] && [ "$mode" != plan ]; then limit="${REVIEW_TIMEOUT:-3600}"; fi
-cd "$wt" || die "can't enter $wt"
+if [ "$mode" != code ] && [ "$mode" != plan ] && [ "$mode" != sniff ]; then limit="${REVIEW_TIMEOUT:-3600}"; fi
+if [ "$mode" = sniff ]; then
+  cd "$scratch" || die "can't enter $scratch"   # not a worktree: the stats would count the session as an agent's
+else
+  cd "$wt" || die "can't enter $wt"
+fi
 # In the background, so that a Ctrl-C or kill stops the session too: timeout runs it in a process group of
 # its own, which neither signal reaches by itself. The trap waits for the session (at most 30 s, then timeout
 # kills it) before the EXIT trap removes the folders it may still be using.
@@ -332,6 +372,16 @@ wait "$session"; rc=$?; session=""
 trap - INT TERM HUP
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then die "the review took longer than ${limit}s (REVIEW_TIMEOUT) and was stopped"; fi
 [ "$rc" -eq 0 ] || die "claude -p failed (exit $rc)"
+if [ "$mode" = sniff ]; then   # only the result: no file, no sidecar
+  python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+r = d.get("result") if isinstance(d, dict) else None
+r = r if isinstance(r, str) else ""
+print(r, end="" if r.endswith("\n") else "\n")
+' <"$json" || die "couldn't read claude's output"
+  exit 0
+fi
 note=""
 if [ "$(state)" != "$before" ]; then
   case "$mode" in

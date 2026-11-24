@@ -989,4 +989,122 @@ assert_contains "detached HEAD: an audit is fine" "$(rv --suite "$W")" "exit=0"
 assert_contains "detached HEAD: the sidecar's branch is null" "$(sc "$REVIEW_DIR/wt-suite-$(git -C "$W" rev-parse --short=12 HEAD).json" 'd["branch"]')" "null"
 assert_contains "usage"           "$(rv)" "usage: review.sh"
 
+
+# --- the sniff session (--sniff): sniff.sh's one session, read-only, in a scratch folder, no files ---
+rm -f "$STUB/hook" "$STUB/json" "$STUB/fail"; export BRIEF_DIR="$TMP/briefs"
+SN="$TMP/snrepo"; git init -q -b main "$SN"
+echo "Old rule: sniff at the given commit." > "$SN/CLAUDE.md"; git -C "$SN" add -A; git -C "$SN" commit -q -m one
+SN1="$(git -C "$SN" rev-parse HEAD)"
+echo "New rule: HEAD's." > "$SN/CLAUDE.md"; git -C "$SN" commit -q -am two
+printf 'Mode: claims\nAuthor: developer\n1: All tests pass, BUNDLE-CANARY.\n' > "$TMP/bundle.md"
+printf 'Claim (line 1): All tests pass. | evidence named: none | found: no | too good to be true: no\n' > "$STUB/result"
+listing() { ls -laR "$REVIEW_DIR" "$BRIEF_DIR" 2>&1; }
+before_ls="$(listing)"; touch "$TMP/sniff-marker"
+out="$(rv --sniff "$SN" "$SN1" "$TMP/bundle.md")"
+assert_contains "A6: --sniff prints the session's result" "$out" "Claim (line 1): All tests pass. | evidence named: none"
+assert_contains "A6: --sniff exits 0"                    "$out" "exit=0"
+assert "A6: --sniff prints the result only"              test "$out" = "$(cat "$STUB/result")
+exit=0"
+assert "A6: REVIEW_DIR and BRIEF_DIR as they were"       test "$(listing)" = "$before_ls"
+assert "A6: no sidecar or other .json written"           test -z "$(find "$TMP" -name '*.json' -newer "$TMP/sniff-marker" -not -path "$STUB/*")"
+assert "A1: --sniff on the configured model (sonnet)"    test "$(flag --model)" = sonnet
+assert "A1: --sniff at the configured sniff_effort"      test "$(flag --effort)" = "$(sed -n 's/^sniff_effort=//p' "$ROOT/scripts/queue/review.conf")"
+args="$(cat "$STUB/args")"
+assert_contains "A5: --sniff loads none of the repo's config" "$args" "--safe-mode"
+assert "A5: --sniff has no edit tools"                   test "$(flag --disallowed-tools)" = "Edit,Write,NotebookEdit"
+assert "A5: --sniff: headless JSON"                      test "$(flag --output-format)" = json
+assert_contains "A5: --sniff: no stdin"                  "$(cat "$STUB/stdin")" "/dev/null"
+assert "A5: --sniff stopped after 1800 s"                test "$(cat "$STUB/timeout")" = "-k 30 1800"
+snwd="$(cat "$STUB/cwd")"
+assert "A5: --sniff doesn't run in the checkout"         test "$snwd" != "$SN"
+assert "A5: --sniff's scratch folder is gone afterwards" test ! -e "$snwd"
+assert_contains "A5: --sniff: the rules of the given commit" "$(cat "$STUB/sysprompt")" "Old rule: sniff at the given commit."
+assert_not_contains "A5: --sniff: not HEAD's rules"     "$(cat "$STUB/sysprompt")" "New rule"
+assert_contains "--sniff: the rules say which commit"    "$(cat "$STUB/sysprompt")" "the repo's at commit ${SN1:0:12}, the commit the claims are checked at"
+prompt="$(cat "$STUB/args")"
+assert_contains "--sniff: the prompt names the repo and the commit" "$prompt" "Repo: $SN, commit $SN1."
+assert_contains "--sniff: the session runs outside the repo, so the prompt says git -C <repo>" "$prompt" "git -C $SN show $SN1:<path>, git -C $SN grep <word> $SN1"
+assert_contains "--sniff: sniff.md's git commands name the repo" "$prompt" "\`git -C <repo> show <commit>:<path>\`"
+assert_contains "--sniff: the prompt asks for the Claims count line" "$prompt" "Last, print one line \`Claims: <n>\`, the number of \`Claim\` lines you printed"
+assert_contains "--sniff: the prompt asks for the Requests count line" "$prompt" "Then print one line \`Requests: <n>\`, the number of \`Request\` lines you printed"
+assert_contains "--sniff: the prompt asks for the Answered count line" "$prompt" "Last, print one line \`Answered: <n>\`, the number of \`Answered\` lines you printed"
+assert "--sniff: sniff.md has no git command without -C" test -z "$(grep -E '\`git (show|grep|log)' "$ROOT/scripts/queue/sniff.md")"
+assert_contains "--sniff: the input is in the prompt"    "$prompt" "BUNDLE-CANARY"
+assert_contains "A18: --sniff: the prompt asks only for evidence" "$prompt" "Ask only for evidence: no suggested fix, and no new finding."
+printf 'Request to developer: x' > "$STUB/result"
+assert "--sniff: a result with no final newline gets one" test "$(rv --sniff "$SN" "$SN1" "$TMP/bundle.md")" = "Request to developer: x
+exit=0"
+echo '{"result": null, "session_id": "s"}' > "$STUB/json"
+assert "--sniff: no result prints an empty line" test "$(rv --sniff "$SN" "$SN1" "$TMP/bundle.md")" = "
+exit=0"
+echo 'not json' > "$STUB/json"; out="$(rv --sniff "$SN" "$SN1" "$TMP/bundle.md")"; rm "$STUB/json"
+assert_contains "--sniff: output that isn't JSON"  "$out" "couldn't read claude's output"
+assert_contains "--sniff: output that isn't JSON -> exit 2" "$out" "exit=2"
+printf 'Claim (line 1): All tests pass. | evidence named: none | found: no | too good to be true: no\n' > "$STUB/result"
+out="$(REVIEW_TIMEOUT=60 rv --sniff "$SN" "$SN1" "$TMP/bundle.md")"
+assert "A5: --sniff: REVIEW_TIMEOUT=60 gives 60 s"       test "$(cat "$STUB/timeout")" = "-k 30 60"
+out="$(rv --sniff "$SN" HEAD~1 "$TMP/bundle.md")"
+assert_contains "--sniff: any rev, resolved to its commit" "$(cat "$STUB/args")" "commit $SN1."
+mv "$REVIEW_DIR" "$TMP/reviews-away"; out="$(rv --sniff "$SN" "$SN1" "$TMP/bundle.md")"
+assert "--sniff doesn't create REVIEW_DIR"               test ! -e "$REVIEW_DIR"
+mv "$TMP/reviews-away" "$REVIEW_DIR"
+printf 'git -C %q commit -q --allow-empty -m moved\n' "$SN" > "$STUB/hook"
+out="$(rv --sniff "$SN" "$SN1" "$TMP/bundle.md")"; rm "$STUB/hook"
+assert "--sniff: the hook moved the checkout"            test "$(git -C "$SN" log -1 --format=%s)" = moved
+assert_contains "--sniff: a checkout that moves doesn't fail it" "$out" "exit=0"
+git -C "$SN" checkout -q --detach
+assert_contains "--sniff: a detached HEAD is fine"       "$(rv --sniff "$SN" "$SN1" "$TMP/bundle.md")" "exit=0"
+head -c 100000 /dev/zero | tr '\0' x > "$TMP/big.md"
+assert_contains "--sniff: an input of 100000 bytes runs" "$(rv --sniff "$SN" "$SN1" "$TMP/big.md")" "exit=0"
+echo >> "$TMP/big.md"; out="$(rv --sniff "$SN" "$SN1" "$TMP/big.md")"
+assert_contains "--sniff: an input over 100000 bytes is too big" "$out" "the input file is too big for the prompt (100001 bytes, at most 100000): $TMP/big.md"
+assert_contains "--sniff: too big -> exit 2"             "$out" "exit=2"
+assert "--sniff: too big: no session"                    test ! -f "$STUB/args"
+
+# A2, A3: the config, and its overrides
+printf 'sniff_model=haiku\nsniff_effort=low\n' > "$TMP/sniff-models.conf"
+REVIEW_CONFIG="$TMP/sniff-models.conf" rv --sniff "$SN" "$SN1" "$TMP/bundle.md" >/dev/null
+assert "A2: --sniff: sniff_model from REVIEW_CONFIG"     test "$(flag --model)" = haiku
+assert "A2: --sniff: sniff_effort from REVIEW_CONFIG"    test "$(flag --effort)" = low
+REVIEW_MODEL=fable REVIEW_EFFORT=max rv --sniff "$SN" "$SN1" "$TMP/bundle.md" >/dev/null
+assert "A2: --sniff: REVIEW_MODEL overrides"             test "$(flag --model)" = fable
+assert "A2: --sniff: REVIEW_EFFORT overrides"            test "$(flag --effort)" = max
+printf 'sniff_effort=low\n' > "$TMP/sniff-nomodel.conf"
+out="$(REVIEW_CONFIG="$TMP/sniff-nomodel.conf" rv --sniff "$SN" "$SN1" "$TMP/bundle.md")"
+assert_contains "A3: no sniff_model in the config"       "$out" "no sniff_model in $TMP/sniff-nomodel.conf"
+assert_contains "A3: no sniff_model -> exit 2"           "$out" "exit=2"
+assert "A3: no sniff_model: no session"                  test ! -e "$STUB/args"
+out="$(sniff_model=x REVIEW_CONFIG="$TMP/sniff-nomodel.conf" rv --sniff "$SN" "$SN1" "$TMP/bundle.md")"
+assert_contains "A3: sniff_model from the environment doesn't count" "$out" "no sniff_model in"
+assert "A3: sniff_model from the environment: no session" test ! -e "$STUB/args"
+printf 'sniff_model=haiku\nsniff_effort=bogus\n' > "$TMP/sniff-bogus.conf"
+out="$(REVIEW_CONFIG="$TMP/sniff-bogus.conf" rv --sniff "$SN" "$SN1" "$TMP/bundle.md")"
+assert_contains "A3: a bad sniff_effort" "$out" "sniff_effort in $TMP/sniff-bogus.conf must be low, medium, high, xhigh or max, not 'bogus'"
+assert_contains "A3: a bad sniff_effort -> exit 2"       "$out" "exit=2"
+assert "A3: a bad sniff_effort: no session"              test ! -e "$STUB/args"
+
+# A7: it fails cleanly
+out="$(rv --sniff "$SN" "$SN1")"
+assert_contains "A7: --sniff with too few arguments: the usage" "$out" "--sniff <checkout> <commit> <input file>"
+assert_contains "A7: too few arguments -> exit 2"        "$out" "exit=2"
+out="$(rv --sniff "$SN" "$SN1" "$TMP/bundle.md" extra)"
+assert_contains "A7: --sniff with too many arguments: the usage" "$out" "usage: review.sh"
+assert_contains "A7: too many arguments -> exit 2"       "$out" "exit=2"
+out="$(rv --sniff "$SN" "$SN1" "$TMP/nope.md")"
+assert_contains "A7: a missing input file is named"      "$out" "no such input file: $TMP/nope.md"
+assert_contains "A7: a missing input file -> exit 2"     "$out" "exit=2"
+out="$(rv --sniff "$SN" nosuchrev "$TMP/bundle.md")"
+assert_contains "A7: an unknown commit is named"         "$out" "no such commit in $SN: nosuchrev"
+assert_contains "A7: an unknown commit -> exit 2"        "$out" "exit=2"
+assert "A7: an unknown commit: no session"               test ! -e "$STUB/args"
+out="$(rv --sniff "$TMP" "$SN1" "$TMP/bundle.md")"
+assert_contains "--sniff: not a checkout"                "$out" "is not a git checkout"
+touch "$STUB/fail"; out="$(rv --sniff "$SN" "$SN1" "$TMP/bundle.md")"; rm "$STUB/fail"
+assert_contains "A7: a failing session"                  "$out" "claude -p failed (exit 1)"
+assert_contains "A7: a failing session -> exit 2"        "$out" "exit=2"
+cp "$ROOT/scripts/queue/review.sh" "$ROOT/scripts/queue/review.conf" "$TMP/copy/queue/"
+out="$(cv --sniff "$SN" "$SN1" "$TMP/bundle.md")"
+assert_contains "--sniff: a missing sniff.md is named"   "$out" "missing $TMP/copy/queue/sniff.md"
+assert_contains "--sniff: a missing sniff.md -> exit 2"  "$out" "exit=2"
+
 finish

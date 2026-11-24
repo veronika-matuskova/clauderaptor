@@ -68,17 +68,32 @@ sha="$(git rev-parse HEAD)"
 printf 'Full end-to-end suite passed locally on `%s` (1 passed).\n' "$sha"
 EOF
 # npm run test:e2e:full: records whether it ran under the e2e lock (and if it got PR_QUEUE_CHILD), then passes
-# unless $TQ/e2e_fail exists. $TQ/on_e2e: a script run once, first. $TQ/e2e_nopass: it passes, but records no
+# unless $TQ/e2e_fail exists (it exits with the code in it, else 1). $TQ/on_e2e: a script run once, first. $TQ/e2e_nopass: it passes, but records no
 # pass (so e2e-gate.mjs pr-line fails).
 cat > "$TQ/bin/npm" <<'EOF'
 #!/usr/bin/env bash
 [ -f "$TQ/on_e2e" ] && { bash "$TQ/on_e2e"; rm -f "$TQ/on_e2e"; }
 if flock -n "$PR_QUEUE_DIR/e2e.lock" true; then echo "$* unlocked" >> "$TQ/npm.log"; else echo "$* locked" >> "$TQ/npm.log"; fi
 if [ -n "${PR_QUEUE_CHILD+set}" ]; then echo "inherited PR_QUEUE_CHILD" >> "$TQ/npm.log"; fi
-[ -f "$TQ/e2e_fail" ] && exit 1
+[ -f "$TQ/e2e_fail" ] && exit "$(grep -m1 . "$TQ/e2e_fail" || echo 1)"   # its exit code, if it has one
 [ -f "$TQ/e2e_nopass" ] && exit 0
 touch "$TQ/passed/$(git rev-parse HEAD)"
 EOF
+# bench (PR_QUEUE_BENCH, the speed check): prints the next line of $TQ/bench_seq (the last repeats; without it, 1.0),
+# logs in $TQ/bench.log whether it ran under the e2e lock, and fails (after printing) if $TQ/bench_fail exists.
+cat > "$TQ/bin/bench" <<'EOF'
+#!/usr/bin/env bash
+if flock -n "$PR_QUEUE_DIR/e2e.lock" true; then echo unlocked >> "$TQ/bench.log"; else echo locked >> "$TQ/bench.log"; fi
+v=1.0
+if [ -s "$TQ/bench_seq" ]; then
+  v="$(head -1 "$TQ/bench_seq")"; [ "$(wc -l < "$TQ/bench_seq")" -gt 1 ] && sed -i 1d "$TQ/bench_seq"
+fi
+echo "$v"
+[ ! -f "$TQ/bench_fail" ]
+EOF
+# The tests never run the real benchmark (but one) and never wait for a slow machine.
+export PR_QUEUE_BENCH=bench PR_QUEUE_SPEED_WAIT=0
+unset PR_QUEUE_SPEED_MAX
 # claude -p (run by review.sh): logs "code <prompt>" for a code review, "tests <first line>" for a test review,
 # "judge <its reviews line>" for a judge, and reports the verdict in $TQ/verdict, $TQ/tests_verdict (default
 # ready) or $TQ/judge_verdict (default needs changes). $TQ/claude_fail makes them all fail.
@@ -159,8 +174,8 @@ reset_pr() {
   rm -f "$TQ/pr_state" "$TQ/pr_body" "$TQ/pr_branch" "$TQ/checks_seq" "$TQ/e2e_fail" "$TQ/merge_fail" "$TQ/head_lag" "$TQ/on_checks" \
     "$TQ/verdict" "$TQ/tests_verdict" "$TQ/judge_verdict" "$TQ/judge_hang" "$TQ/claude_fail" "$TQ/sync" "$TQ"/started-* "$TQ/sync.log" \
     "$TQ/e2e_nopass" "$TQ/push_reject" "$TQ/awake.pids" "$TQ/awake.args" "$TQ/awake.ended" "$TQ/awake_fail" \
-    "$TQ/awake.seq" "$TQ/awake.fds" "$TQ/awake_slow"
-  : > "$TQ/gh.log"; : > "$TQ/created.log"; : > "$TQ/npm.log"; : > "$TQ/claude.log"
+    "$TQ/awake.seq" "$TQ/awake.fds" "$TQ/awake_slow" "$TQ/bench_seq" "$TQ/bench_fail" "$PR_QUEUE_DIR/speed-baseline"
+  : > "$TQ/gh.log"; : > "$TQ/created.log"; : > "$TQ/npm.log"; : > "$TQ/claude.log"; : > "$TQ/bench.log"
 }
 # code_reviews / test_reviews: the review sessions claude.log shows since the last reset
 code_reviews() { grep '^code ' "$TQ/claude.log"; }
@@ -436,6 +451,118 @@ reset_pr; touch "$TQ/e2e_fail"; mkwt e2efail
 Q add "$TMP/wt-e2efail" fix "E2e fail" >/dev/null; out="$(Q run)"
 assert_contains "e2e fail: job failed"       "$out" "FAILED fix/e2efail: the full e2e suite failed"
 assert "e2e fail: no PR opened"              test ! -s "$TQ/created.log"
+
+# --- the speed check before e2e: under the e2e lock, against the median of the stored baseline ---
+BASE="$PR_QUEUE_DIR/speed-baseline"
+# speedjob <name> [run's env...]: queues fix/<name> (no reviews) and runs the queue; the output is in $out.
+speedjob() {
+  local name="$1"; shift
+  mkwt "$name"; Q add --review none --tests none "$TMP/wt-$name" fix "Speed $name" >/dev/null
+  out="$(env PATH="$TQ/bin:$PATH" "$@" bash "$ROOT/scripts/queue/pr-queue.sh" run </dev/null 2>&1)"
+}
+reset_pr; speedjob spfirst
+assert_contains "speed: under the e2e lock" "$(cat "$TQ/bench.log")" "locked"
+assert_not_contains "speed: never without it" "$(cat "$TQ/bench.log")" "unlocked"
+assert_contains "speed: no baseline: set" "$out" "   speed baseline set: 1.0 s CPU ($BASE)"
+assert "speed: no baseline: the file holds it" test "$(cat "$BASE")" = 1.0
+assert_contains "speed: no baseline: merged" "$out" "MERGED fix/spfirst"
+assert_contains "speed: the log has it too" "$(cat "$RQ/logs/fix/spfirst.log")" "speed baseline set: 1.0 s CPU"
+# Before npm: the bench ran first (npm logs after it).
+assert "speed: e2e ran after it" test "$(wc -l < "$TQ/npm.log")" = 1
+# npm's own exit code 75 is a failed e2e run, not a slow machine.
+reset_pr; echo 75 > "$TQ/e2e_fail"; speedjob sp75
+assert_contains "speed: npm exits 75: e2e failed" "$out" "FAILED fix/sp75: the full e2e suite failed"
+assert_contains "events: npm exits 75: e2e/e2e" "$(ev fix/sp75 'failed(), one("e2e_finished")["rc"]')" "('e2e/e2e', 75)"
+reset_pr; mkwt sppassed; touch "$TQ/passed/$(git -C "$TMP/wt-sppassed" rev-parse HEAD)"
+Q add --review none --tests none "$TMP/wt-sppassed" fix "Speed passed" >/dev/null; out="$(Q run)"
+assert_contains "speed: a recorded pass: merged" "$out" "MERGED fix/sppassed"
+assert "speed: a recorded pass: no check" test ! -s "$TQ/bench.log"
+reset_pr; echo 1.0 > "$BASE"; echo 4.0 > "$TQ/bench_seq"; speedjob spat
+assert_contains "speed: 4.0x runs" "$out" "   machine speed: 4.0× baseline"
+assert_contains "speed: 4.0x: e2e ran" "$(cat "$TQ/npm.log")" "run test:e2e:full locked"
+assert_contains "speed: 4.0x: merged" "$out" "MERGED fix/spat"
+assert "speed: 4.0x: stored" test "$(cat "$BASE")" = "1.0"$'\n'"4.0"
+reset_pr; echo 1.0 > "$BASE"; echo 4.1 > "$TQ/bench_seq"; speedjob spslow
+assert_contains "speed: 4.1x fails the job" "$out" \
+  "FAILED fix/spslow: machine too slow: 4.1× baseline after 6 re-checks; e2e not run, the branch was not tested"
+assert_contains "speed: 4.1x: said, and checked again" "$out" "   machine slow: 4.1× baseline; checking again in 0 s (6 of 6)"
+assert "speed: 4.1x: no e2e" test ! -s "$TQ/npm.log"
+assert "speed: 4.1x: 1 check and 6 re-checks" test "$(wc -l < "$TQ/bench.log")" = 7
+assert "speed: 4.1x: the baseline unchanged" test "$(cat "$BASE")" = 1.0
+assert "speed: 4.1x: job in failed/" in_failed spslow
+assert "speed: 4.1x: no PR" test ! -s "$TQ/created.log"
+assert_contains "events: a slow machine fails e2e" "$(ev fix/spslow 'failed()')" "e2e/slow_machine"
+assert_contains "events: waited, then failed" "$(ev fix/spslow 'names()')" "e2e_waiting job_failed"
+assert_not_contains "events: no e2e_started" "$(ev fix/spslow 'names()')" "e2e_started"
+assert_not_contains "events: no e2e_finished" "$(ev fix/spslow 'names()')" "e2e_finished"
+reset_pr; echo 1.0 > "$BASE"; printf '10\n1.0\n' > "$TQ/bench_seq"; speedjob sprecover
+assert_contains "speed: a slow check said" "$out" "   machine slow: 10.0× baseline; checking again in 0 s (1 of 6)"
+assert_not_contains "speed: only one re-check" "$out" "(2 of 6)"
+assert_contains "speed: the re-check passes" "$out" "   machine speed: 1.0× baseline"
+assert_contains "speed: recovered: e2e ran" "$(cat "$TQ/npm.log")" "run test:e2e:full locked"
+assert_contains "speed: recovered: merged" "$out" "MERGED fix/sprecover"
+assert "speed: recovered: the slow one not stored" test "$(cat "$BASE")" = "1.0"$'\n'"1.0"
+reset_pr; printf '1\n1\n1\n1\n10\n' > "$BASE"; echo 4.5 > "$TQ/bench_seq"; speedjob spmedian
+assert_contains "speed: against the median, not the mean" "$out" "FAILED fix/spmedian: machine too slow: 4.5×"
+# Sorted as numbers (9, 10, 100: median 10), not as text (10, 100, 9: median 100, so 50 would pass as 0.5x).
+reset_pr; printf '100\n9\n10\n' > "$BASE"; echo 50 > "$TQ/bench_seq"; speedjob spnumeric
+assert_contains "speed: the median of the values sorted as numbers, not as text" "$out" "FAILED fix/spnumeric: machine too slow: 5.0×"
+reset_pr; printf '1\n1\n10\n10\n' > "$BASE"; echo 22 > "$TQ/bench_seq"; speedjob speven
+assert_contains "speed: an even count's median is the middle two's mean" "$out" "machine speed: 4.0× baseline"
+reset_pr; seq 1 19 > "$BASE"; echo 10 > "$TQ/bench_seq"; speedjob sp19
+assert "speed: 19 stored + 1: 20 lines, the oldest kept" test "$(head -1 "$BASE") $(tail -1 "$BASE") $(wc -l < "$BASE")" = "1 10 20"
+reset_pr; seq 1 20 > "$BASE"; echo 10 > "$TQ/bench_seq"; speedjob sp20
+assert "speed: 20 stored + 1: 20 lines, the oldest dropped" test "$(head -1 "$BASE") $(tail -1 "$BASE") $(wc -l < "$BASE")" = "2 10 20"
+reset_pr; printf '1\nabc\n0\n' > "$BASE"; echo 1.0 > "$TQ/bench_seq"; speedjob spmixed
+assert "speed: unreadable lines ignored and dropped" test "$(cat "$BASE")" = "1"$'\n'"1.0"
+for bad in abc 0; do
+  reset_pr; echo "$bad" > "$BASE"; echo 2.0 > "$TQ/bench_seq"; speedjob "spbad$bad"
+  assert_contains "speed: baseline '$bad': unreadable" "$out" "   speed baseline unreadable ($BASE); starting a new one"
+  assert "speed: baseline '$bad': replaced by the new value" test "$(cat "$BASE")" = 2.0
+  assert_contains "speed: baseline '$bad': merged" "$out" "MERGED fix/spbad$bad"
+done
+# A benchmark that exits with an error (after printing a number), prints n/a or prints 0.
+for broken in fail nan zero; do
+  reset_pr; echo 1.0 > "$BASE"
+  case "$broken" in fail) touch "$TQ/bench_fail" ;; nan) echo n/a > "$TQ/bench_seq" ;; zero) echo 0 > "$TQ/bench_seq" ;; esac
+  speedjob "spbench$broken"
+  assert_contains "speed: benchmark $broken: e2e runs" "$out" "   speed check failed (the benchmark printed no number); e2e runs without it"
+  assert_contains "speed: benchmark $broken: merged" "$out" "MERGED fix/spbench$broken"
+  assert "speed: benchmark $broken: the baseline unchanged" test "$(cat "$BASE")" = 1.0
+done
+reset_pr; echo 1.0 > "$BASE"; echo 50 > "$TQ/bench_seq"; speedjob spoff PR_QUEUE_SPEED_MAX=0
+assert "speed: PR_QUEUE_SPEED_MAX=0: no check" test ! -s "$TQ/bench.log"
+assert_contains "speed: PR_QUEUE_SPEED_MAX=0: merged" "$out" "MERGED fix/spoff"
+reset_pr; echo 1.0 > "$BASE"; echo 4.5 > "$TQ/bench_seq"; speedjob spmax PR_QUEUE_SPEED_MAX=5
+assert_contains "speed: PR_QUEUE_SPEED_MAX=5: 4.5x runs" "$out" "MERGED fix/spmax"
+reset_pr; echo 1.0 > "$BASE"; echo 1.6 > "$TQ/bench_seq"; speedjob spmaxlow PR_QUEUE_SPEED_MAX=1.5
+assert_contains "speed: PR_QUEUE_SPEED_MAX=1.5 accepted, and 1.6x is slow" "$out" "machine too slow: 1.6×"
+reset_pr; mkwt spinvalid; Q add --review none --tests none "$TMP/wt-spinvalid" fix "Speed invalid" >/dev/null
+for m in 1 x -2 0.0; do
+  out="$(PR_QUEUE_SPEED_MAX=$m Q run)"
+  assert_contains "run: PR_QUEUE_SPEED_MAX=$m refused" "$out" "PR_QUEUE_SPEED_MAX must be 0 (no speed check) or a number above 1, not '$m'"
+done
+for w in -1 1.5 x; do
+  out="$(PR_QUEUE_SPEED_WAIT=$w Q run)"
+  assert_contains "run: PR_QUEUE_SPEED_WAIT=$w refused" "$out" "PR_QUEUE_SPEED_WAIT must be a whole number of seconds, not '$w'"
+done
+assert "run: invalid speed settings: the job stays queued" test -n "$(find "$RQ/queue" -name '*spinvalid.job')"
+out="$(Q run)"; assert_contains "speed: valid settings run it" "$out" "MERGED fix/spinvalid"
+# A sleep that logs its argument, for this run only.
+mkdir -p "$TQ/sleepbin"; rm -f "$TQ/sleep.log"
+# shellcheck disable=SC2016  # expands when the stub runs
+printf '#!/usr/bin/env bash\necho "$*" >> "$TQ/sleep.log"\nexec %s "$@"\n' "$(command -v sleep)" > "$TQ/sleepbin/sleep"; chmod +x "$TQ/sleepbin/sleep"
+reset_pr; echo 1.0 > "$BASE"; printf '10\n10\n1.0\n' > "$TQ/bench_seq"; t0=$SECONDS
+speedjob spwait PR_QUEUE_SPEED_WAIT=1 PATH="$TQ/sleepbin:$TQ/bin:$PATH"
+assert_contains "speed: PR_QUEUE_SPEED_WAIT arrives" "$out" "machine slow: 10.0× baseline; checking again in 1 s (2 of 6)"
+assert "speed: it slept 1 s, twice" test "$(grep -cx 1 "$TQ/sleep.log")" = 2
+assert "speed: it waited" test $((SECONDS - t0)) -ge 2
+assert_contains "speed: waited, then merged" "$out" "MERGED fix/spwait"
+reset_pr; speedjob spreal PR_QUEUE_BENCH=
+assert "speed: the built-in benchmark: one number above 0" \
+  python3 -I -c 'import sys; l = open(sys.argv[1]).read().split(); assert len(l) == 1 and float(l[0]) > 0' "$BASE"
+assert_contains "speed: the built-in benchmark: merged" "$out" "MERGED fix/spreal"
+rm -f "$BASE"
 
 # --- the other failures before the PR: git fetch, no pass recorded after a passing e2e run, git push ---
 reset_pr; mkwt nofetch

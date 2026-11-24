@@ -55,6 +55,15 @@
 # approved by the user): the review checks the change against each criterion. A judge gets it to check the
 # findings that name a criterion, not to look for others. (The cache doesn't go by the brief: a commit reviewed
 # as ready without one isn't reviewed again with one.)
+# REVIEW_SNIFF=<file> gives a judge the commit's sniff file (pr-queue.sh's <branch>-<sha>-sniff.md: the reviews'
+# Sniff: requests and their flags), to use only for the findings it concerns; a missing file exits 2.
+# A code or test review is told that it may ask for a sniff of a claim it doubts (in the brief, or in the code's
+# comments or docs), with at most max_sniff_requests lines "Sniff: <claim> | <where> | <why>" (sniff.conf, or
+# $SNIFF_CONFIG; not told without a valid value), which pr-queue.sh checks at the commit. It also gets the branch's
+# earlier sniff files, <branch>-<sha>-sniff.md of commits HEAD descends from (HEAD's too), oldest first, found
+# like a judge's earlier rulings; none: no such line. The judge, plan and sniff prompts are told neither.
+# A sniff session (--sniff) runs with SNIFF_IN_SESSION=1 in its environment: sniff.sh refuses to run in it, so a
+# sniff never starts another.
 # A plan (--plan) reads the request file and the checkout's HEAD, which may move meanwhile (only a note), and
 # writes a brief: requirements, acceptance criteria A1…, out of scope, risk, open questions. It is saved to
 # $BRIEF_DIR (default $PR_QUEUE_DIR/briefs) as <repo>-<sha>-<time>-<random>.md, with a sidecar, and printed. Exit 0 = a
@@ -202,6 +211,43 @@ if [ -n "${REVIEW_BRIEF:-}" ] && { [ "$mode" = code ] || [ "$mode" = tests ] || 
   [ -f "$REVIEW_BRIEF" ] || die "no such brief: $REVIEW_BRIEF"
   brief="$(readlink -f "$REVIEW_BRIEF")"
 fi
+sniffed=""
+if [ -n "${REVIEW_SNIFF:-}" ] && [ "$mode" = judge ]; then
+  [ -f "$REVIEW_SNIFF" ] || die "no such sniff file: $REVIEW_SNIFF"
+  sniffed="$(readlink -f "$REVIEW_SNIFF")"
+fi
+# earlier <suffix>: the branch's files <branch>-<sha><suffix> in $dir of commits HEAD descends from, oldest first,
+# one per line: not of another repo's branch of the same name, nor of an earlier branch of that name, merged
+# (squashed) before. Leaves out $out.
+earlier_files() {
+  local prefix="$dir/${branch//\//-}-" f rest list=""
+  for f in "$prefix"*"$1"; do
+    if [ ! -f "$f" ] || [ "$f" = "${out:-}" ]; then continue; fi
+    rest="${f#"$prefix"}"; [[ "$rest" =~ ^([0-9a-f]{7,40})"$1"$ ]] || continue
+    git -C "$wt" merge-base --is-ancestor "${BASH_REMATCH[1]}" HEAD 2>/dev/null || continue
+    list+="$(stat -c %Y "$f") $f"$'\n'
+  done
+  sort -n <<<"$list" | cut -d' ' -f2- | sed '/^$/d'
+}
+# asking: the paragraph that tells a code or test review how to ask for a sniff; empty when sniff.conf has no
+# valid max_sniff_requests (the queue would run none).
+asking() {
+  local max
+  # shellcheck source=/dev/null  # a config file, checked by the tests instead
+  max="$(unset max_sniff_requests; . "${SNIFF_CONFIG:-$HERE/sniff.conf}" >/dev/null 2>&1; echo "${max_sniff_requests:-}")"
+  if [[ "$max" =~ ^[0-9]+$ ]]; then
+    printf '%s' "If you doubt a claim in the brief or in the code's comments or docs (a file, line, test, function \
+or run it names), you may ask the queue to check it: add a line \"Sniff: <claim> | <where> | <why>\" (the claim, \
+the file:line where it is made, and why you doubt it), at most $max such lines. The queue checks them mechanically \
+with sniff.sh at commit $sha, after your review, and gives the results to the judge and to the next review."
+  fi
+}
+# sniffs: the line that gives a code or test review the branch's earlier sniff files (the queue's
+# <branch>-<sha>-sniff.md); empty without one.
+sniffs() {
+  local f; f="$(earlier_files -sniff.md)"
+  if [ -n "$f" ]; then printf '%s' "Earlier sniff results on this branch, oldest first (read each with cat): ${f//$'\n'/ }."; fi
+}
 
 case "$mode" in
   code)
@@ -234,6 +280,8 @@ in your system prompt, otherwise \"Verdict: ready\". If the skill is not availab
 criteria, approved by the user). For each acceptance criterion the change doesn't meet, add an important finding \
 that names it (e.g. A2) and says what is missing."
     fi
+    ask="$(asking)"; if [ -n "$ask" ]; then prompt+=" $ask"; fi
+    ask="$(sniffs)"; if [ -n "$ask" ]; then prompt+=" $ask"; fi
     title="Review of $branch at $sha (/code-review $level, "
     ;;
   tests)
@@ -250,6 +298,10 @@ that names it (e.g. A2) and says what is missing."
   For each acceptance criterion with no test that checks it (where its Check names a test or a command a test
   could run), add a must-fix finding of category missing that names it (e.g. A2)."
     fi
+    ask="$(asking)"; if [ -n "$ask" ]; then task+="
+- $ask"; fi
+    ask="$(sniffs)"; if [ -n "$ask" ]; then task+="
+- $ask"; fi
     title="Test review of $branch at $sha ("
     ;;
   suite)
@@ -269,14 +321,7 @@ that names it (e.g. A2) and says what is missing."
     change_base; rules_at="$mb"; rules_what="the base of the change, against $against"
     # The branch's earlier judgements, oldest first: of other commits HEAD descends from, so not of another
     # repo's branch of the same name, nor of an earlier branch of that name, merged (squashed) before.
-    prefix="$dir/${branch//\//-}-"; earlier=""
-    for f in "$prefix"*-judge.md; do
-      if [ ! -f "$f" ] || [ "$f" = "$out" ]; then continue; fi
-      rest="${f#"$prefix"}"; [[ "$rest" =~ ^([0-9a-f]{7,40})-judge\.md$ ]] || continue
-      git -C "$wt" merge-base --is-ancestor "${BASH_REMATCH[1]}" HEAD 2>/dev/null || continue
-      earlier+="$(stat -c %Y "$f") $f"$'\n'
-    done
-    earlier="$(sort -n <<<"$earlier" | cut -d' ' -f2- | sed '/^$/d')"
+    earlier="$(earlier_files -judge.md)"
     task="Judge the reviews of one change, following the instructions below.
 - Repo: $wt, branch $branch. The change: git diff ${mb:0:12} $sha (against $against). Judge exactly commit $sha.
 - Reviews to judge (read each with cat): ${reviews[*]}
@@ -287,6 +332,10 @@ that names it (e.g. A2) and says what is missing."
 - The change's brief, approved by the user (read it with cat): $brief. Use it only to rule on findings that name
   one of its acceptance criteria (e.g. \"A2 not met\"): the criterion is part of what the change must do, so a
   real one is inside the change. Don't look for criteria the reviews didn't raise."
+    fi
+    if [ -n "$sniffed" ]; then
+      task+="
+- Sniff results on this commit (read with cat): $sniffed. Use them only for the findings they concern."
     fi
     title="Judgement of $branch at $sha ("
     ;;
@@ -372,6 +421,8 @@ fi
 # its own, which neither signal reaches by itself. The trap waits for the session (at most 30 s, then timeout
 # kills it) before the EXIT trap removes the folders it may still be using.
 session=""
+# A sniff's session must not start another sniff (sniff.sh refuses to run with this set).
+if [ "$mode" = sniff ]; then export SNIFF_IN_SESSION=1; fi
 trap '[ -z "$session" ] || { kill "$session" 2>/dev/null; wait "$session"; }; die "stopped, and so was the claude -p session"' INT TERM HUP
 timeout -k 30 "$limit" "$CAPPED" claude -p "$prompt" --output-format json --permission-mode auto \
   --model "$model" --effort "$effort" --safe-mode --append-system-prompt-file "$sysprompt" \

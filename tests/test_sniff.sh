@@ -5,7 +5,7 @@
 # shellcheck source=tests/lib.sh
 source "$(dirname "$0")/lib.sh"
 
-unset PR_QUEUE_DIR XDG_STATE_HOME STATS_EVENTS
+unset PR_QUEUE_DIR XDG_STATE_HOME STATS_EVENTS SNIFF_IN_SESSION
 mkdir -p "$TMP/bin" "$TMP/ev"
 cat > "$TMP/bin/claude" <<EOF
 #!/usr/bin/env bash
@@ -43,6 +43,21 @@ assert_contains "A1: a.js:500 flagged with the file's length" "$out" "hard missi
 assert_not_contains "A1: a.js:100 not flagged" "$out" "a.js:100 —"
 assert_contains "A1: one hard flag" "$out" "Flags: 1 hard, 0 soft"
 assert "A1: exit 2" test "$rc" = 2
+# A sniff never starts another: inside a sniff session (SNIFF_IN_SESSION=1) it exits 4 before it checks anything,
+# also with --session (no claude call); the same input sniffs as before without it, or with another value.
+rm -f "$TMP/claude-calls"
+err="$(SNIFF_IN_SESSION=1 bash "$S" "$TMP/in.md" --repo "$R" --session --author developer 2>&1 >"$TMP/nested.out")"; rc=$?
+assert "A11 (4a): SNIFF_IN_SESSION=1: exit 4" test "$rc" = 4
+assert "A11 (4a): SNIFF_IN_SESSION=1: says why" test "$err" = "sniff: a sniff doesn't start another sniff"
+assert "A11 (4a): SNIFF_IN_SESSION=1: no flags printed" test ! -s "$TMP/nested.out"
+assert "A11 (4a): SNIFF_IN_SESSION=1: the stub claude isn't called" test ! -e "$TMP/claude-calls"
+err="$(SNIFF_IN_SESSION=1 bash "$S" --bogus 2>&1)"
+assert "A11 (4a): the guard comes before the arguments" test "$err" = "sniff: a sniff doesn't start another sniff"
+sn $'See a.js:500 and a.js:100.'
+assert "A11 (4a): without it, the same input: exit 2, as before" test "$rc" = 2
+SNIFF_IN_SESSION=0 sn $'See a.js:500 and a.js:100.'
+assert "A11 (4a): SNIFF_IN_SESSION=0 sniffs as before" test "$rc" = 2
+assert_contains "A11 (4a): SNIFF_IN_SESSION=0: the flag" "$out" "a.js:500, but a.js has 120 lines"
 sn $'Last line a.js:120, one past it a.js:121, a range a.js:110-130.'
 assert_not_contains "the last line isn't flagged" "$out" "a.js:120 —"
 assert_contains "one past the last line is flagged" "$out" "a.js:121 — a.js:121, but a.js has 120 lines"

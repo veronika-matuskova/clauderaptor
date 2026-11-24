@@ -6,6 +6,7 @@ source "$(dirname "$0")/lib.sh"
 
 mkdir -p "$TMP/bin"
 unset REVIEW_TIMEOUT REVIEW_MODEL REVIEW_EFFORT REVIEW_CONFIG   # the documented overrides, if the user exported one
+unset REVIEW_SNIFF SNIFF_CONFIG SNIFF_IN_SESSION
 # The user's rules: a stand-in for ~/.claude, which the tests never touch.
 export REVIEW_DIR="$TMP/reviews" STUB="$TMP/stub" CLAUDE_CONFIG_DIR="$TMP/claude-config"
 # rules is a link, as install.sh makes ~/.claude/rules.
@@ -25,8 +26,10 @@ mkdir -p "$STUB"
 # $STUB/sniffs/n), touching none of the files above; it returns $STUB/sniff_result for "Mode: claims" (default
 # "Claims: 0", "Requests: 0") and $STUB/answer_result for "Mode: answer" (default "Answered: 0"), and exits 1
 # with $STUB/sniff_fail. With $STUB/sniff_plain it is an ordinary call (the tests of --sniff itself).
+# Every call records its SNIFF_IN_SESSION ("unset" without one) in $STUB/env_sniff.
 cat > "$TMP/bin/claude" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "${SNIFF_IN_SESSION-unset}" > "$STUB/env_sniff"
 case "$*" in *"Sniff the claims in one text"*)
   if [ ! -f "$STUB/sniff_plain" ]; then
     k=$(( $(cat "$STUB/sniffs/n" 2>/dev/null || echo 0) + 1 )); mkdir -p "$STUB/sniffs"; echo "$k" > "$STUB/sniffs/n"
@@ -720,6 +723,7 @@ assert_contains "plan: gives the request file" "$args" "The request (read it wit
 assert_contains "plan: the instructions"      "$args" "## How to plan"
 assert_contains "plan: asks for numbered criteria" "$args" "Number the criteria A1, A2"
 assert_contains "plan: points at the test rule" "$args" "the test rule in \`claude/rules/tests.md\`"
+assert_not_contains "A15 (4a): the plan isn't told to ask for a sniff" "$args" "Sniff: <claim> | <where> | <why>"
 assert_contains "plan: tests both sides of each boundary" "$args" "each boundary: a test on both sides of it"
 assert_contains "plan: tests each error path and fallback" "$args" "each error path, fallback, guard and early return: a test that runs it"
 assert_contains "plan: tests each message's text" "$args" "each user-visible message, hint and failure reason: a test that asserts its text"
@@ -1153,6 +1157,67 @@ commit brief3; out="$(REVIEW_BRIEF="$TMP/nope.md" rv "$W")"
 assert_contains "brief: a missing brief -> exit 2" "$out" "exit=2"
 assert_contains "brief: says so"              "$out" "no such brief: $TMP/nope.md"
 
+# --- the reviews' Sniff: requests (pr-queue.sh runs them): how to ask, earlier sniffs, REVIEW_SNIFF for the judge ---
+printf 'x.\nVerdict: ready\n' > "$STUB/result"
+commit sniff0; p0="$sha"; commit sniff1; p1="$sha"
+rv "$W" >/dev/null; args="$(cat "$STUB/args")"
+assert_contains "A15 (4a): the code review is told how to ask" "$args" 'add a line "Sniff: <claim> | <where> | <why>"'
+assert_contains "A15 (4a): the code review: at most max_sniff_requests" "$args" "at most 3 such lines"
+assert_contains "A15 (4a): the code review: checked at the commit" "$args" "mechanically with sniff.sh at commit $p1, after your review"
+assert_not_contains "A14 (4a): the code review: no earlier sniff, no line" "$args" "sniff results"
+assert "A11 (4a): a code review's session has no SNIFF_IN_SESSION" test "$(cat "$STUB/env_sniff")" = unset
+rv --tests "$W" >/dev/null; args="$(cat "$STUB/args")"
+assert_contains "A15 (4a): the test review is told how to ask" "$args" '- If you doubt a claim in the brief or in the code'"'"'s comments or docs'
+assert_contains "A15 (4a): the test review: the line" "$args" 'add a line "Sniff: <claim> | <where> | <why>"'
+assert_not_contains "A14 (4a): the test review: no earlier sniff, no line" "$args" "sniff results"
+printf 'max_sniff_requests=2\n' > "$TMP/sniff2.conf"; commit sniff1b
+SNIFF_CONFIG="$TMP/sniff2.conf" rv "$W" >/dev/null
+assert_contains "A15 (4a): the limit comes from SNIFF_CONFIG" "$(cat "$STUB/args")" "at most 2 such lines"
+for bad in 'max_sniff_requests=x' 'other=1' 'max_sniff_requests=-1'; do
+  printf '%s\n' "$bad" > "$TMP/sniffbad.conf"; commit "sniffbad$bad"
+  SNIFF_CONFIG="$TMP/sniffbad.conf" rv "$W" >/dev/null
+  assert_not_contains "A15 (4a): $bad: not told to ask (the queue would run none)" "$(cat "$STUB/args")" "Sniff: <claim>"
+done
+commit sniffnoconf; SNIFF_CONFIG="$TMP/nope.conf" rv "$W" >/dev/null
+assert_not_contains "A15 (4a): no config file: not told to ask" "$(cat "$STUB/args")" "Sniff: <claim>"
+# The branch's earlier sniff files: of commits HEAD descends from, oldest first; not of a commit off the branch
+# or of another repo's branch of the same name.
+printf 'Flags: 0 hard, 0 soft\n' | tee "$REVIEW_DIR/feat-notes-$p0-sniff.md" > "$REVIEW_DIR/feat-notes-$p1-sniff.md"
+touch -d '2 minutes ago' "$REVIEW_DIR/feat-notes-$p0-sniff.md"
+sside="$REVIEW_DIR/feat-notes-$(git -C "$W" commit-tree -m side "HEAD^{tree}" | cut -c1-12)-sniff.md"
+sother="$REVIEW_DIR/feat-notes-0123456789ab-sniff.md"
+echo x | tee "$sside" > "$sother"
+commit sniff2
+rv "$W" >/dev/null; args="$(cat "$STUB/args")"
+assert_contains "A14 (4a): the code review gets the earlier sniff files, oldest first" "$args" \
+  "Earlier sniff results on this branch, oldest first (read each with cat): $REVIEW_DIR/feat-notes-$p0-sniff.md $REVIEW_DIR/feat-notes-$p1-sniff.md."
+assert_not_contains "A14 (4a): the code review: not a commit off the branch" "$args" "$sside"
+assert_not_contains "A14 (4a): the code review: not another repo's" "$args" "$sother"
+rv --tests "$W" >/dev/null; args="$(cat "$STUB/args")"
+assert_contains "A14 (4a): the test review gets them too" "$args" \
+  "- Earlier sniff results on this branch, oldest first (read each with cat): $REVIEW_DIR/feat-notes-$p0-sniff.md $REVIEW_DIR/feat-notes-$p1-sniff.md."
+assert_not_contains "A14 (4a): the test review: not a commit off the branch" "$args" "$sside"
+rm "$sside" "$sother"
+# The judge: REVIEW_SNIFF gives it this commit's sniff file; it isn't told to ask, nor given earlier ones.
+printf 'Ruling.\nVerdict: ready\n' > "$STUB/result"
+cp "$REVIEW_DIR/feat-notes-$p1-sniff.md" "$REVIEW_DIR/feat-notes-$sha-sniff.md"
+(cd "$REVIEW_DIR" && REVIEW_SNIFF="feat-notes-$sha-sniff.md" rv --judge "$W" "$TMP/code-review.md" >/dev/null)
+args="$(cat "$STUB/args")"
+assert_contains "A13 (4a): the judge gets the sniff file" "$args" \
+  "- Sniff results on this commit (read with cat): $REVIEW_DIR/feat-notes-$sha-sniff.md. Use them only for the findings they concern."
+assert_not_contains "A15 (4a): the judge isn't told how to ask" "$args" "Sniff: <claim>"
+assert_not_contains "A14 (4a): the judge doesn't get earlier sniffs" "$args" "Earlier sniff results"
+rm "$REVIEW_DIR"/feat-notes-"$sha"-judge.*; rv --judge "$W" "$TMP/code-review.md" >/dev/null
+assert "A13 (4a): the judge ran again"        test -f "$STUB/args"
+assert_not_contains "A13 (4a): no sniff file without REVIEW_SNIFF" "$(cat "$STUB/args")" "Sniff results on this commit"
+rm "$REVIEW_DIR"/feat-notes-"$sha"-judge.*; out="$(REVIEW_SNIFF="$TMP/nope-sniff.md" rv --judge "$W" "$TMP/code-review.md")"
+assert_contains "A13 (4a): a missing sniff file is named" "$out" "no such sniff file: $TMP/nope-sniff.md"
+assert_contains "A13 (4a): a missing sniff file -> exit 2" "$out" "exit=2"
+assert "A13 (4a): a missing sniff file: no session" test ! -e "$STUB/args"
+commit sniff3; out="$(REVIEW_SNIFF="$TMP/nope-sniff.md" rv "$W")"
+assert_contains "A13 (4a): a code review ignores REVIEW_SNIFF" "$out" "exit=0"
+assert_not_contains "A13 (4a): a code review isn't given it" "$(cat "$STUB/args")" "Sniff results on this commit"
+
 printf 'Counts: mutation 0, missing 0, empty 0, duplicate 0, not atomic 0, rule 0\nVerdict: ready\n' > "$STUB/result"
 assert_contains "bad level"       "$(rv "$W" max)" "level must be low, medium, high or xhigh"
 assert_contains "not a checkout"  "$(rv "$TMP")" "is not a git checkout"
@@ -1178,6 +1243,8 @@ before_ls="$(listing)"; touch "$TMP/sniff-marker"
 out="$(rv --sniff "$SN" "$SN1" "$TMP/bundle.md")"
 assert_contains "A6: --sniff prints the session's result" "$out" "Claim (line 1): All tests pass. | evidence named: none"
 assert_contains "A6: --sniff exits 0"                    "$out" "exit=0"
+assert "A11 (4a): --sniff runs its session with SNIFF_IN_SESSION=1" test "$(cat "$STUB/env_sniff")" = 1
+assert_not_contains "A15 (4a): the sniff session isn't told to ask for a sniff" "$(cat "$STUB/args")" "Sniff: <claim> | <where> | <why>"
 assert "A6: --sniff prints the result only"              test "$out" = "$(cat "$STUB/result")
 exit=0"
 assert "A6: REVIEW_DIR and BRIEF_DIR as they were"       test "$(listing)" = "$before_ls"

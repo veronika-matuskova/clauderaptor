@@ -8,6 +8,7 @@ export TQ="$TMP/t" PR_QUEUE_DIR="$TMP/state" PR_QUEUE_CHECKS_WAIT=0 PR_QUEUE_POL
 export CLAUDE_CONFIG_DIR="$TMP/claude-config"; mkdir -p "$CLAUDE_CONFIG_DIR"
 echo "Stand-in user rule." > "$CLAUDE_CONFIG_DIR/CLAUDE.md"
 unset REVIEW_DIR REVIEW_TIMEOUT PR_QUEUE_REVIEW REVIEW_MODEL REVIEW_EFFORT REVIEW_CONFIG   # reviews go to $PR_QUEUE_DIR/reviews, not a real folder
+unset SNIFF_CONFIG SNIFF_IN_SESSION REVIEW_SNIFF
 mkdir -p "$TQ/bin" "$TQ/passed"
 Q() { PATH="$TQ/bin:$PATH" bash "$ROOT/scripts/queue/pr-queue.sh" "$@" </dev/null 2>&1; }
 
@@ -100,9 +101,14 @@ unset PR_QUEUE_SPEED_MAX
 # With $TQ/sync, each session waits up to 30 s for the other one to start, and logs in sync.log if it did.
 # With $TQ/hang, each session logs its pid in $TQ/hung and hangs for 30 s; on TERM it takes 0.5 s to end.
 # $TQ/judge_hang does the same for a judge only. A session whose prompt gives it the change's brief logs its
-# kind and the brief's text in $TQ/brief.log.
+# kind and the brief's text in $TQ/brief.log. $TQ/code_sniff, $TQ/tests_sniff and $TQ/judge_sniff: lines (e.g.
+# Sniff: requests) added to that kind's result, before its verdict. A judge given a sniff file also logs
+# "judge-sniff <that line>". A sniff session (review.sh --sniff) only logs "sniff <its first line>".
 cat > "$TQ/bin/claude" <<'EOF'
 #!/usr/bin/env bash
+if [[ "$2" == "Sniff the claims in one text"* ]]; then
+  echo "sniff ${2%%$'\n'*}" >> "$TQ/claude.log"; echo '{"result": "Claims: 0\nRequests: 0\n"}'; exit 0
+fi
 prev=""; for a in "$@"; do [ "$prev" = --append-system-prompt-file ] && cp "$a" "$TQ/sysprompt"; prev="$a"; done
 b="$(grep -oE "change's brief[^/]*(/[^ ]+\.brief)" <<<"$2" | grep -oE '/[^ ]+\.brief' | head -1)"
 if [[ "$2" == *"code-review skill"* ]]; then
@@ -110,6 +116,7 @@ if [[ "$2" == *"code-review skill"* ]]; then
 elif [[ "$2" == "Judge the reviews of one change"* ]]; then
   kind=judge other=""; echo "judge $(grep -m1 '^- Reviews to judge' <<<"$2")" >> "$TQ/claude.log"
   v="$(cat "$TQ/judge_verdict" 2>/dev/null || echo "needs changes")"
+  if grep -q '^- Sniff results on this commit' <<<"$2"; then echo "judge-sniff $(grep -m1 '^- Sniff results on this commit' <<<"$2")" >> "$TQ/claude.log"; fi
 else
   kind=tests other=code; echo "tests ${2%%$'\n'*}" >> "$TQ/claude.log"; v="$(cat "$TQ/tests_verdict" 2>/dev/null || echo ready)"
 fi
@@ -124,7 +131,8 @@ if [ -f "$TQ/sync" ] && [ -n "$other" ]; then
     sleep 0.1
   done
 fi
-python3 -I -c 'import json, sys; print(json.dumps({"result": "important: a.txt:1: broken\nVerdict: " + sys.argv[1], "total_cost_usd": 0.3, "duration_ms": 1000}))' "$v"
+extra="$(cat "$TQ/${kind}_sniff" 2>/dev/null)"
+python3 -I -c 'import json, sys; print(json.dumps({"result": "important: a.txt:1: broken\n" + (sys.argv[2] + "\n" if sys.argv[2] else "") + "Verdict: " + sys.argv[1], "total_cost_usd": 0.3, "duration_ms": 1000}))' "$v" "$extra"
 EOF
 # powershell.exe (the keep-awake helper): it's here from the start, so that no test runs the real one (on WSL
 # it's on PATH). It logs its pid in $TQ/awake.pids and its arguments in $TQ/awake.args (one line per start),
@@ -174,7 +182,8 @@ reset_pr() {
   rm -f "$TQ/pr_state" "$TQ/pr_body" "$TQ/pr_branch" "$TQ/checks_seq" "$TQ/e2e_fail" "$TQ/merge_fail" "$TQ/head_lag" "$TQ/on_checks" \
     "$TQ/verdict" "$TQ/tests_verdict" "$TQ/judge_verdict" "$TQ/judge_hang" "$TQ/claude_fail" "$TQ/sync" "$TQ"/started-* "$TQ/sync.log" \
     "$TQ/e2e_nopass" "$TQ/push_reject" "$TQ/awake.pids" "$TQ/awake.args" "$TQ/awake.ended" "$TQ/awake_fail" \
-    "$TQ/awake.seq" "$TQ/awake.fds" "$TQ/awake_slow" "$TQ/bench_seq" "$TQ/bench_fail" "$PR_QUEUE_DIR/speed-baseline"
+    "$TQ/awake.seq" "$TQ/awake.fds" "$TQ/awake_slow" "$TQ/bench_seq" "$TQ/bench_fail" "$PR_QUEUE_DIR/speed-baseline" \
+    "$TQ/code_sniff" "$TQ/tests_sniff" "$TQ/judge_sniff"
   : > "$TQ/gh.log"; : > "$TQ/created.log"; : > "$TQ/npm.log"; : > "$TQ/claude.log"; : > "$TQ/bench.log"
 }
 # code_reviews / test_reviews: the review sessions claude.log shows since the last reset
@@ -1055,6 +1064,144 @@ assert "judge stopped: at once, not after the session's 30 s" test $((SECONDS - 
 assert "judge stopped: no temp files left"   test -z "$(ls -A "$TQ/tmp")"
 assert "judge stopped: the job stayed in running/" test -n "$(find "$RQ/running" -name '*stopjudge.job')"
 rm -f "$TQ/judge_hang" "$RQ"/running/*
+
+# --- the reviews' Sniff: requests: sniffed at the reviewed commit, saved for the judge; a hard flag fails the job ---
+# sniffs_of <name> [sha]: the sniff files of fix/<name> (at that 12-character sha); revfile <name> <suffix>: its
+# review file at $h; s12 <name>: its worktree's HEAD, 12 characters (read before a merge removes the worktree).
+sniffs_of() { find "$PR_QUEUE_DIR/reviews" -name "fix-$1-${2:-*}-sniff.md"; }
+revfile() { echo "$PR_QUEUE_DIR/reviews/fix-$1-$h-$2"; }
+s12() { git -C "$TMP/wt-$1" rev-parse --short=12 HEAD; }
+# No Sniff: line: nothing new.
+reset_pr; mkwt plain4a
+Q add "$TMP/wt-plain4a" fix "Plain" >/dev/null; out="$(Q run)"
+assert "A1 (4a): no Sniff: line, no sniff file"   test -z "$(find "$PR_QUEUE_DIR/reviews" -name '*-sniff.md')"
+assert "A1 (4a): no sniff session"                test -z "$(grep '^sniff ' "$TQ/claude.log")"
+assert_not_contains "A1 (4a): no sniff in the job's log" "$(cat "$RQ/logs/fix/plain4a.log")" "sniff"
+assert_contains "A1 (4a): merged"                 "$out" "MERGED fix/plain4a"
+assert "A1 (4a): the same events as before" test "$(ev fix/plain4a 'names()')" = \
+  "job_queued job_started main_merged review_started review_started review_finished review_finished e2e_waiting e2e_started e2e_finished pr_opened checks_finished merged"
+# A hard flag: a line past the end of the job's one-line file. Both reviews ask (one as a list item in bold).
+reset_pr; mkwt sniffref
+echo 'Sniff: sniffref.txt:99 holds the fix | sniffref.txt:99 | the file has one line' > "$TQ/code_sniff"
+echo '- **Sniff: the test reads sniffref.txt:1 | sniffref.txt:1 | check the line**' > "$TQ/tests_sniff"
+Q add "$TMP/wt-sniffref" fix "Sniff ref" >/dev/null; out="$(Q run)"
+h="$(s12 sniffref)"; sf="$PR_QUEUE_DIR/reviews/fix-sniffref-$h-sniff.md"
+assert "A2 (4a): the sniff file of the reviewed commit" test -f "$sf"
+assert_contains "A2 (4a): sniffed at the reviewed commit" "$(cat "$sf")" "(sniff.sh at $(git -C "$TMP/wt-sniffref" rev-parse HEAD))"
+assert_contains "A2 (4a): the request under the code review's file" "$(cat "$sf")" "### The code review: $(revfile sniffref medium-notests.md)
+
+Sniffed 1: sniffref.txt:99 holds the fix | sniffref.txt:99 | the file has one line"
+assert_contains "A2 (4a): the hard flag" "$(cat "$sf")" \
+  "hard missing reference (line 1): sniffref.txt:99 — sniffref.txt:99, but sniffref.txt has 1 lines"
+assert_contains "A3 (4a): the test review's request under its file, its prefix and bold dropped" "$(cat "$sf")" "### The test review: $(revfile sniffref tests.md)
+
+Sniffed 2: the test reads sniffref.txt:1 | sniffref.txt:1 | check the line
+"
+assert_contains "A3 (4a): one sniff of both"      "$(cat "$sf")" "Flags: 1 hard, 0 soft"
+assert_contains "A3 (4a): the log names the run"  "$out" "sniffing 2 request(s) of the reviews at $(git -C "$TMP/wt-sniffref" rev-parse --short HEAD) (sniff.sh)"
+assert_contains "A4 (4a): a hard flag fails the job" "$out" \
+  "FAILED fix/sniffref: the sniff of the reviews' requests has 1 hard flag(s) (sniff: $sf)"
+assert "A4 (4a): no e2e"                          test ! -s "$TQ/npm.log"
+assert "A4 (4a): no PR"                           test ! -s "$TQ/created.log"
+assert "A4 (4a): the job in failed/"              in_failed sniffref
+assert_contains "A4 (4a): job_failed review/sniff" "$(ev fix/sniffref 'failed()')" "review/sniff"
+assert "A4 (4a): no sniff session"                test -z "$(grep '^sniff ' "$TQ/claude.log")"
+# With a judge that fails the job, the sniff's hard flags end its message; the judge gets the sniff file, and
+# its own Sniff: lines are never run.
+reset_pr; mkwt sniffjudge; echo "needs changes" > "$TQ/verdict"
+echo 'Sniff: the fix is on line 7 | sniffjudge.txt:7 | one line' > "$TQ/code_sniff"  # the reference only in <where>
+echo 'Sniff: judgeclaim.txt:5 is real | judgeclaim.txt:5 | the judge asks' > "$TQ/judge_sniff"
+Q add "$TMP/wt-sniffjudge" fix "Sniff judge" >/dev/null; out="$(Q run)"
+sf="$PR_QUEUE_DIR/reviews/fix-sniffjudge-$(s12 sniffjudge)-sniff.md"
+assert_contains "A5 (4a): the judge's failure"    "$out" "; the judge confirmed changes to make (judge: "
+assert_contains "A5 (4a): ends with the sniff's hard flags" "$out" "-judge.md); the sniff has 1 hard flag(s) (sniff: $sf)"
+assert_contains "A5 (4a): job_failed judge/judge" "$(ev fix/sniffjudge 'failed()')" "judge/judge"
+assert_contains "A13 (4a): the judge gets the sniff file" "$(grep '^judge-sniff ' "$TQ/claude.log")" \
+  "Sniff results on this commit (read with cat): $sf. Use them only"
+assert_not_contains "A12 (4a): the judge's Sniff: line isn't sniffed" "$(cat "$sf")" "judgeclaim"
+Q add "$TMP/wt-sniffjudge" fix "Sniff judge" >/dev/null; out="$(Q run)"
+assert_contains "A12 (4a): a re-queue reads the reviews again" "$out" "already sniffed at"
+assert_not_contains "A12 (4a): not the judge's file" "$(cat "$sf") $out" "judgeclaim"
+rm -f "$TQ/verdict" "$TQ/judge_sniff"
+# Soft flags only: the job goes on, with one line in the log.
+reset_pr; mkwt sniffsoft
+echo 'Sniff: ran the e2e suite | the PR body | no run is shown' > "$TQ/code_sniff"
+h="$(s12 sniffsoft)"; sf="$PR_QUEUE_DIR/reviews/fix-sniffsoft-$h-sniff.md"
+Q add "$TMP/wt-sniffsoft" fix "Sniff soft" >/dev/null; out="$(Q run)"
+assert_contains "A6 (4a): soft flags only: merged" "$out" "MERGED fix/sniffsoft"
+assert_contains "A6 (4a): the log notes the soft flag" "$(cat "$RQ/logs/fix/sniffsoft.log")" \
+  "the sniff of the reviews' requests has 1 soft flag(s) (sniff: $sf)"
+assert_contains "A6 (4a): the soft flag in the sniff file" "$(cat "$sf")" "soft run that didn't happen (line 1): ran the e2e suite"
+# A sniff that didn't run (here: inside a sniff session, SNIFF_IN_SESSION=1) only adds a note.
+reset_pr; mkwt nested4a
+echo 'Sniff: nested4a.txt:99 is the fix | nested4a.txt:99 | one line' > "$TQ/code_sniff"
+Q add "$TMP/wt-nested4a" fix "Nested" >/dev/null; out="$(SNIFF_IN_SESSION=1 Q run)"
+assert_contains "A17 (4a): exit 4 only adds a note" "$out" "   the sniff didn't run: a sniff doesn't start another sniff"
+assert_contains "A17 (4a): exit 4: the job goes on" "$out" "MERGED fix/nested4a"
+assert "A17 (4a): exit 4: no sniff file"          test -z "$(sniffs_of nested4a)"
+# The limit per review, from SNIFF_CONFIG: the code review's third line is refused; the test review's malformed
+# line is refused and doesn't count, so both its others run.
+reset_pr; mkwt limit4a; printf 'max_sniff_requests=2\n' > "$TMP/limit2.conf"
+printf 'Sniff: limit4a.txt:1 one | limit4a.txt:1 | a\nSniff: limit4a.txt:1 two | limit4a.txt:1 | b\nSniff: limit4a.txt:1 three | limit4a.txt:1 | c\n' > "$TQ/code_sniff"
+printf 'Sniff: only a claim\nSniff: limit4a.txt:1 four | limit4a.txt:1 | d\nSniff: limit4a.txt:1 five | | e\nSniff: limit4a.txt:1 six | limit4a.txt:1 | f\n' > "$TQ/tests_sniff"
+h="$(s12 limit4a)"; Q add "$TMP/wt-limit4a" fix "Limit" >/dev/null; out="$(SNIFF_CONFIG="$TMP/limit2.conf" Q run)"
+sf="$(sniffs_of limit4a)"
+assert_contains "A7 (4a): the third line is refused" "$out" \
+  "sniff: $(revfile limit4a medium-notests.md): Sniff line 3 refused: over the limit of 2 per session"
+assert_contains "A7 (4a): the first two run" "$(cat "$sf")" "Sniffed 1: limit4a.txt:1 one | limit4a.txt:1 | a
+Sniffed 2: limit4a.txt:1 two | limit4a.txt:1 | b
+Refused (Sniff line 3): limit4a.txt:1 three | limit4a.txt:1 | c — over the limit of 2 per session"
+assert_contains "A9 (4a): a line with only a claim is refused" "$out" \
+  "sniff: $(revfile limit4a tests.md): Sniff line 1 refused: give <claim> | <where> | <why>"
+assert_contains "A9 (4a): an empty part is refused" "$out" "Sniff line 3 refused: give <claim> | <where> | <why>"
+assert_contains "A7 (4a): two well-formed lines of a review: both run" "$(cat "$sf")" "Sniffed 3: limit4a.txt:1 four | limit4a.txt:1 | d"
+assert_contains "A7 (4a): the refused lines don't count" "$(cat "$sf")" "Sniffed 4: limit4a.txt:1 six | limit4a.txt:1 | f"
+assert_not_contains "A7 (4a): the test review's lines aren't over the limit" "$out" "Sniff line 4 refused"
+assert_contains "A7 (4a): the input: one line per request" "$(cat "$sf")" "Flags: 0 hard, 0 soft"
+assert_contains "A7 (4a): merged"                 "$out" "MERGED fix/limit4a"
+assert "A7 (4a): the committed limit is 3"        grep -qx 'max_sniff_requests=3' "$ROOT/scripts/queue/sniff.conf"
+reset_pr; mkwt zero4a; printf 'max_sniff_requests=0\n' > "$TMP/limit0.conf"
+echo 'Sniff: zero4a.txt:99 one | zero4a.txt:1 | a' > "$TQ/code_sniff"
+Q add "$TMP/wt-zero4a" fix "Zero" >/dev/null; out="$(SNIFF_CONFIG="$TMP/limit0.conf" Q run)"
+assert_contains "A7 (4a): a limit of 0 refuses every line" "$out" "Sniff line 1 refused: over the limit of 0 per session"
+assert "A7 (4a): a limit of 0: no sniff file"    test -z "$(sniffs_of zero4a)"
+assert_contains "A7 (4a): a limit of 0: merged"  "$out" "MERGED fix/zero4a"
+# A missing or invalid limit: no line runs, the log says why, the job goes on.
+for c in nokey bad; do
+  reset_pr; mkwt "conf$c"
+  if [ "$c" = nokey ]; then echo 'max_diff_lines=1' > "$TMP/conf-$c.conf"; else echo 'max_sniff_requests=x' > "$TMP/conf-$c.conf"; fi
+  echo "Sniff: conf$c.txt:99 is the fix | conf$c.txt:99 | one line" > "$TQ/code_sniff"
+  Q add "$TMP/wt-conf$c" fix "Conf $c" >/dev/null; out="$(SNIFF_CONFIG="$TMP/conf-$c.conf" Q run)"
+  assert_contains "A8 (4a): $c: the log names the key and the file" "$(cat "$RQ/logs/fix/conf$c.log")" \
+    "sniff: no valid max_sniff_requests (a whole number of 0 or more) in $TMP/conf-$c.conf: the reviews' Sniff lines are not run"
+  assert_not_contains "A8 (4a): $c: no sniff run" "$out" "sniffing"
+  assert "A8 (4a): $c: no sniff file"            test -z "$(sniffs_of "conf$c")"
+  assert_contains "A8 (4a): $c: merged"          "$out" "MERGED fix/conf$c"
+done
+# The same claim (whitespace aside) is sniffed once per commit: again in the same job, in a re-queue of the
+# commit (its reviews cached as ready print it again), and once more at a new commit.
+reset_pr; mkwt again4a; echo fail > "$TQ/checks_seq"
+echo 'Sniff: again4a.txt:1 says again4a | again4a.txt:1 | check it' > "$TQ/code_sniff"
+echo 'Sniff: again4a.txt:1   says  again4a | elsewhere | twice' > "$TQ/tests_sniff"
+Q add "$TMP/wt-again4a" fix "Again" >/dev/null; out="$(Q run)"
+short="$(git -C "$TMP/wt-again4a" rev-parse --short HEAD)"; sf="$(sniffs_of again4a)"
+assert_contains "A10 (4a): the same claim in one job: already sniffed" "$out" "sniff: again4a.txt:1 says again4a: already sniffed at $short"
+assert_contains "A10 (4a): listed as such" "$(cat "$sf")" "Already sniffed (Sniff line 1): again4a.txt:1   says  again4a | elsewhere | twice — at $short"
+assert_contains "A10 (4a): the first run failed at the checks" "$out" "FAILED fix/again4a: checks failed"
+echo fail > "$TQ/checks_seq"; : > "$TQ/claude.log"
+Q add "$TMP/wt-again4a" fix "Again" >/dev/null; out="$(Q run)"
+assert_contains "A10 (4a): a re-queue: the review is cached" "$out" "review: already reviewed as ready"
+assert_contains "A10 (4a): a re-queue: already sniffed" "$out" "sniff: again4a.txt:1 says again4a: already sniffed at $short"
+assert_not_contains "A10 (4a): a re-queue: no sniff run" "$out" "sniffing"
+assert "A10 (4a): the request is listed once"    test "$(grep -c '^Sniffed [0-9]*: again4a.txt:1 says again4a' "$sf")" = 1
+reset_pr; echo again > "$TMP/wt-again4a/again4a.txt"; git -C "$TMP/wt-again4a" commit -qam "again"
+echo 'Sniff: again4a.txt:1 says again4a | again4a.txt:1 | check it' > "$TQ/code_sniff"
+h="$(s12 again4a)"; Q add "$TMP/wt-again4a" fix "Again" >/dev/null; out="$(Q run)"
+sf2="$(sniffs_of again4a "$h")"
+assert "A10 (4a): a new commit has its own sniff file" test -n "$sf2" -a "$sf2" != "$sf"
+assert_contains "A10 (4a): sniffed again there" "$(cat "$sf2")" "Sniffed 1: again4a.txt:1 says again4a | again4a.txt:1 | check it"
+assert_contains "A6 (4a): no flags: the sniff file says so" "$(cat "$sf2")" "Flags: 0 hard, 0 soft"
+assert_contains "A6 (4a): no flags: merged" "$out" "MERGED fix/again4a"
 
 # --- a job left in running/ by a dead runner goes to failed/ ---
 mkwt dead; printf 'worktree=%s\nbranch=fix/dead\n' "$TMP/wt-dead" > "$RQ/running/1-fix-dead.job"

@@ -31,6 +31,18 @@
 #      PR_QUEUE_JUDGE=0 skips the judge: "needs changes" then fails the job as it is. The reviews and the
 #      judgements are saved in $REVIEW_DIR (default $PR_QUEUE_DIR/reviews), and the failure names them. A
 #      commit already reviewed (the code: at that level) or judged as ready isn't reviewed or judged again.
+#      A review may ask for a sniff of a claim it doubts: a line "Sniff: <claim> | <where> | <why>" (a list or
+#      emphasis prefix allowed). After both reviews end (a cached ready one too), before the judge, the queue
+#      checks them with sniff.sh at the reviewed commit, mechanically (no session; line k of its input is the k-th
+#      request's "<claim> | <where>"), and appends each review's accepted, refused and already-sniffed requests and
+#      the flags to $REVIEW_DIR/<branch>-<sha>-sniff.md, which the judge (REVIEW_SNIFF) and the branch's next
+#      reviews get. A line without three non-empty parts, or one past max_sniff_requests per review (in sniff.conf,
+#      or $SNIFF_CONFIG; a missing or invalid value: no line runs, a note says why), is refused, with a log line; a
+#      claim already sniffed at that commit isn't sniffed again. The judge's and the sniff's own output are never
+#      read for Sniff: lines. A hard flag fails the job (step review, reason sniff: "the sniff of the reviews'
+#      requests has <n> hard flag(s) (sniff: <file>)") if the judge lets it go on, and ends the message of any
+#      other failure of this step ("; the sniff has <n> hard flag(s) ..."); soft flags only add a line to the log,
+#      and a sniff that didn't run (sniff.sh exit 4) only "the sniff didn't run: <reason>". No Sniff: line: no sniff.
 #      A Ctrl-C of the runner, a hangup, or a TERM to its whole process group (kill -- -<pgid>), stops the
 #      reviews, the judge and their sessions; a kill of the runner's pid alone leaves its job running;
 #   3. if the repo has scripts/e2e-gate.mjs and the commit has no local pass: `npm run test:e2e:full`, under the lock.
@@ -246,7 +258,8 @@ with_line() {
 
 # failjob <step> <reason> <message> [<emit field>...]: records the message, moves the job to failed/ and
 # returns 1. The step, the reason and the fields go to the job_failed event. Reasons: not_ready (the worktree is
-# gone, off the branch or dirty), fetch, conflict, review_code, review_tests, review_error, judge, e2e,
+# gone, off the branch or dirty), fetch, conflict, review_code, review_tests, review_error, judge, sniff (a hard
+# flag in the sniff of the reviews' Sniff: requests), e2e,
 # slow_machine (the speed check before e2e), no_e2e_pass, moved (commits after the review), push, pr, head, checks_failed, checks_timeout, merge; and
 # abandoned, for a job a dead runner left in running/ (step start) or whose process ended without failjob (step
 # unknown), both in run_repo; and replaced (step queue), for a queued job that a re-queue of its branch replaces
@@ -268,6 +281,10 @@ review_result() {
   if grep -qx 'already reviewed as ready' <<<"$out"; then echo "   $1: already reviewed as ready" | tee -a "$LOG"; fi
   file="$(sed -n 's/^(saved to \(.*\))$/\1/p' <<<"$out" | tail -1)"
   review_finished "$4" "$5" "$3" "$out"
+  # A ready review's file too (also a cached one): its Sniff: lines are read (sniff_reviews).
+  if [ "$3" -le 1 ] && [ -n "$file" ]; then
+    if [ "$4" = code ]; then asked+=("code review"$'\t'"$file"); else asked+=("test review"$'\t'"$file"); fi
+  fi
   if [ "$3" -eq 1 ] && [ -n "$file" ]; then found+=("$file"); findings+="; the $1 found changes to make ($1: $file)"; found_kinds+="$4"$'\n'
   elif [ "$3" -ne 0 ]; then problems+="; the $1 didn't run: $(tail -1 <<<"$out")"; fi
 }
@@ -288,8 +305,119 @@ stop_reviews() {
   local pid
   for pid in $(jobs -p); do kill "$pid" 2>/dev/null; done
   wait
-  rm -f "$code_out" "$tests_out" "$judge_out"
+  rm -f "$code_out" "$tests_out" "$judge_out"; rm -rf "${sniff_tmp:-}"
   trap - "$1"; kill -"$1" "$BASHPID"
+}
+
+# The reviews' Sniff: requests (step 2). A Sniff: line of a code or test review (a list or emphasis prefix
+# allowed: "- **Sniff:** ...") asks the queue to check a claim: "Sniff: <claim> | <where> | <why>".
+# sniff_parse <max> <conf> <sniff file> <short sha> <dir> <asker>\t<review file>...: reads the review files'
+# Sniff: lines, prints what the log gets, and writes <dir>/in (line k: "<claim> | <where>" of the k-th request
+# to sniff) and <dir>/block (each asker's accepted, refused and already-sniffed requests). <max> is the limit
+# per review, empty if the config has no valid one. Exit 0: requests to sniff; 1: none to sniff; 3: no Sniff:
+# line at all.
+sniff_parse() {
+  python3 -I - "$@" <<'PY'
+import os, re, sys
+mx, conf, sfile, short, tdir = sys.argv[1:6]
+pat = re.compile(r'^\s*(?:[-*+]\s+|[0-9]+[.)]\s+)?([*_]*)Sniff[*_]*:[*_]*\s*(.*?)\s*$')
+norm = lambda c: " ".join(c.split())
+seen = set()
+if os.path.isfile(sfile):
+    for l in open(sfile, errors="replace"):
+        m = re.match(r'^Sniffed [0-9]+: (.*?) \| ', l)
+        if m:
+            seen.add(norm(m.group(1)))
+asked = []
+for a in sys.argv[6:]:
+    label, f = a.split("\t", 1)
+    try:
+        lines = open(f, errors="replace").read().splitlines()
+    except OSError:
+        continue
+    reqs = []
+    for l in lines:
+        m = pat.match(l)
+        if m:
+            reqs.append(m.group(2).rstrip("*_").rstrip() if m.group(1) else m.group(2))
+    if reqs:
+        asked.append((label, f, reqs))
+if not asked:
+    sys.exit(3)
+if not re.fullmatch(r'[0-9]+', mx):
+    print("sniff: no valid max_sniff_requests (a whole number of 0 or more) in %s: the reviews' Sniff lines are not run" % conf)
+    sys.exit(1)
+mx = int(mx)
+inputs, block = [], []
+for label, f, reqs in asked:
+    block.append("### The %s: %s\n" % (label, f))
+    n = 0
+    for k, r in enumerate(reqs, 1):
+        parts = [p.strip() for p in r.split("|", 2)]
+        if len(parts) < 3 or not all(parts):
+            print("sniff: %s: Sniff line %d refused: give <claim> | <where> | <why>" % (f, k))
+            block.append("Refused (Sniff line %d): %s — give <claim> | <where> | <why>" % (k, r))
+            continue
+        if n >= mx:
+            print("sniff: %s: Sniff line %d refused: over the limit of %d per session" % (f, k, mx))
+            block.append("Refused (Sniff line %d): %s — over the limit of %d per session" % (k, r, mx))
+            continue
+        n += 1
+        claim = norm(parts[0])
+        if claim in seen:
+            print("sniff: %s: already sniffed at %s" % (claim, short))
+            block.append("Already sniffed (Sniff line %d): %s — at %s" % (k, r, short))
+            continue
+        seen.add(claim)
+        inputs.append("%s | %s" % (parts[0], parts[1]))
+        block.append("Sniffed %d: %s | %s | %s" % (len(inputs), parts[0], parts[1], parts[2]))
+    block.append("")
+with open(os.path.join(tdir, "in"), "w") as o:
+    o.write("".join(l + "\n" for l in inputs))
+with open(os.path.join(tdir, "block"), "w") as o:
+    o.write("\n".join(block) + "\n")
+sys.exit(0 if inputs else 1)
+PY
+}
+# sniff_reviews <sha> <asker>\t<review file>...: sniffs the reviews' Sniff: requests at the reviewed commit, once
+# per claim and commit, mechanically (sniff.sh, no session), and appends the requests and the flags to the
+# commit's sniff file, $sniff_file. Sets sniff_hard, its hard flags. A sniff that didn't run only adds a line to
+# the log: it never stalls a branch. Without a Sniff: line, it does nothing.
+sniff_reviews() {
+  local sha="$1" short max conf="${SNIFF_CONFIG:-$HERE/sniff.conf}" rc n flags h s reason; shift
+  short="$(git rev-parse --short "$sha")"; sniff_hard=0
+  # The limit, from the config: sourced in a subshell, so that only the file's value counts.
+  # shellcheck source=/dev/null  # a config file, checked by the tests instead
+  max="$(unset max_sniff_requests; . "$conf" >/dev/null 2>&1; echo "${max_sniff_requests:-}")"
+  sniff_tmp="$(mktemp -d)" || { echo "   the sniff didn't run: can't create a temp folder" | tee -a "$LOG"; return 0; }
+  sniff_parse "$max" "$conf" "$sniff_file" "$short" "$sniff_tmp" "$@" > "$sniff_tmp/log"; rc=$?
+  sed 's/^/   /' "$sniff_tmp/log" | tee -a "$LOG"
+  case "$rc" in
+    0) ;;
+    1|3) rm -rf "$sniff_tmp"; sniff_tmp=""; return 0 ;;
+    *) echo "   the sniff didn't run: can't read the reviews' Sniff: lines" | tee -a "$LOG"; rm -rf "$sniff_tmp"; sniff_tmp=""; return 0 ;;
+  esac
+  n="$(wc -l < "$sniff_tmp/in")"
+  echo "   sniffing $n request(s) of the reviews at $short (sniff.sh)" | tee -a "$LOG"
+  bash "$HERE/sniff.sh" "$sniff_tmp/in" --repo "$PWD" --commit "$sha" </dev/null >"$sniff_tmp/out" 2>"$sniff_tmp/err"; rc=$?
+  if [ "$rc" -gt 2 ]; then
+    reason="$(head -1 "$sniff_tmp/err")"; reason="${reason#sniff: }"
+    echo "   the sniff didn't run: ${reason:-sniff.sh exited $rc}" | tee -a "$LOG"
+    rm -rf "$sniff_tmp"; sniff_tmp=""; return 0
+  fi
+  local new=""; if [ ! -s "$sniff_file" ]; then new=1; fi
+  { if [ -n "$new" ]; then printf '# Sniff of the reviews'"'"' requests: %s at %s\n\n' "$BRANCH" "$sha"; fi
+    printf '## Requests of %s (sniff.sh at %s)\n\n' "$(date '+%F %T')" "$sha"
+    cat "$sniff_tmp/block"; printf '### Flags\n\n'; cat "$sniff_tmp/out"; echo; } >> "$sniff_file" 2>>"$LOG"
+  flags="$(grep -m1 '^Flags: ' "$sniff_tmp/out")"
+  h="$(sed -n 's/^Flags: \([0-9]*\) hard.*/\1/p' <<<"$flags")"; s="$(sed -n 's/.*, \([0-9]*\) soft$/\1/p' <<<"$flags")"
+  sniff_hard="${h:-0}"
+  if [ "$sniff_hard" -gt 0 ]; then
+    echo "   the sniff of the reviews' requests has $sniff_hard hard flag(s) (sniff: $sniff_file)" | tee -a "$LOG"
+  else
+    echo "   the sniff of the reviews' requests has ${s:-0} soft flag(s) (sniff: $sniff_file)" | tee -a "$LOG"
+  fi
+  rm -rf "$sniff_tmp"; sniff_tmp=""
 }
 
 # The speed check before e2e (step 3). say <message>: to the log and the output (fd 7, in the e2e subshell).
@@ -369,6 +497,7 @@ process() {
 
   # 2. Review the code and the tests, in fresh sessions at the same time, before the e2e run is spent on it.
   local tests code_pid="" tests_pid="" code_out="" tests_out="" judge_out="" problems="" findings="" found=() found_kinds="" judged
+  local asked=() sniff_tmp="" sniff_file="" sniff_hard=0 stail="" sniff_env=()
   level="$(field review "$1")"; tests="$(field tests "$1")"
   local brief=""; if [ -f "$JOB.brief" ]; then brief="$JOB.brief"; fi
   if [ "$level" = none ]; then
@@ -402,18 +531,23 @@ process() {
     if [ -n "$code_pid" ]; then wait "$code_pid"; review_rc=$?; review_result review "$code_out" "$review_rc" code "$level"; fi
     if [ -n "$tests_pid" ]; then wait "$tests_pid"; review_rc=$?; review_result "test review" "$tests_out" "$review_rc" tests ""; fi
     rm -f "$code_out" "$tests_out"
-    if [ -n "$problems" ]; then trap - INT TERM HUP; failjob review review_error "${problems#; }$findings" found:list="${found_kinds%$'\n'}"; return; fi
+    # The reviews' Sniff: requests, before the judge, who gets the commit's sniff file.
+    sniff_file="$REVIEWS/${BRANCH//\//-}-$(git rev-parse --short=12 "$reviewed")-sniff.md"
+    sniff_reviews "$reviewed" "${asked[@]}"
+    if [ "$sniff_hard" -gt 0 ]; then stail="; the sniff has $sniff_hard hard flag(s) (sniff: $sniff_file)"; fi
+    if [ -f "$sniff_file" ]; then sniff_env=(REVIEW_SNIFF="$sniff_file"); fi
+    if [ -n "$problems" ]; then trap - INT TERM HUP; failjob review review_error "${problems#; }$findings$stail" found:list="${found_kinds%$'\n'}"; return; fi
     if [ ${#found[@]} -gt 0 ] && [ "${PR_QUEUE_JUDGE:-1}" = 0 ]; then
       # Both reviews' findings: the code's is named as the reason, and both kinds are in found.
       trap - INT TERM HUP
       local reason=review_tests; if grep -qx code <<<"$found_kinds"; then reason=review_code; fi
-      failjob review "$reason" "${findings#; }" found:list="${found_kinds%$'\n'}"; return
+      failjob review "$reason" "${findings#; }$stail" found:list="${found_kinds%$'\n'}"; return
     fi
     if [ ${#found[@]} -gt 0 ]; then
       echo "   judging the findings (review.sh --judge)" | tee -a "$LOG"
       emit review_started kind=judge level:opt=
       judge_out="$(mktemp)"
-      REVIEW_DIR="$REVIEWS" REVIEW_BRIEF="$brief" "$HERE/review.sh" --judge "$wt" "${found[@]}" >"$judge_out" 2>&1 &
+      env ${sniff_env[@]+"${sniff_env[@]}"} REVIEW_DIR="$REVIEWS" REVIEW_BRIEF="$brief" "$HERE/review.sh" --judge "$wt" "${found[@]}" >"$judge_out" 2>&1 &
       wait $!; review_rc=$?
       trap - INT TERM HUP
       judged="$(cat "$judge_out")"; rm -f "$judge_out"; printf '%s\n' "$judged" >> "$LOG"
@@ -421,22 +555,27 @@ process() {
       local jfile; jfile="$(sed -n 's/^(saved to \(.*\))$/\1/p' <<<"$judged" | tail -1)"
       case "$review_rc" in
         0) echo "   the judge found nothing to fix (judge: $jfile)" | tee -a "$LOG" ;;
-        1) failjob judge judge "${findings#; }; the judge confirmed changes to make (judge: $jfile)" found:list="${found_kinds%$'\n'}"; return ;;
+        1) failjob judge judge "${findings#; }; the judge confirmed changes to make (judge: $jfile)$stail" found:list="${found_kinds%$'\n'}"; return ;;
         3)
           if grep -q 'two judged rounds' <<<"$judged"; then
             emit escalated reason=two_rounds review_file:opt="${jfile##*/}"
-            failjob judge judge "needs your decision: the branch still had changes to make after two judged rounds (judge: $jfile)" \
+            failjob judge judge "needs your decision: the branch still had changes to make after two judged rounds (judge: $jfile)$stail" \
               found:list="${found_kinds%$'\n'}"
           else
             emit escalated reason=critical_finding review_file:opt="${jfile##*/}"
-            failjob judge judge "needs your decision: the judge rejected a finding that would be critical if real (judge: $jfile)" \
+            failjob judge judge "needs your decision: the judge rejected a finding that would be critical if real (judge: $jfile)$stail" \
               found:list="${found_kinds%$'\n'}"
           fi
           return ;;
-        *) failjob judge review_error "${findings#; }; the judge didn't run: $(tail -1 <<<"$judged")" found:list="${found_kinds%$'\n'}"; return ;;
+        *) failjob judge review_error "${findings#; }; the judge didn't run: $(tail -1 <<<"$judged")$stail" found:list="${found_kinds%$'\n'}"; return ;;
       esac
     fi
     trap - INT TERM HUP
+    if [ "$sniff_hard" -gt 0 ]; then
+      failjob review sniff "the sniff of the reviews' requests has $sniff_hard hard flag(s) (sniff: $sniff_file)" \
+        found:list="${found_kinds%$'\n'}"
+      return
+    fi
   fi
 
   # 3. The full local suite, once, on this exact commit.

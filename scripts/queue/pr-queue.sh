@@ -70,6 +70,16 @@
 # them off. An event that can't be written is skipped, and never changes what the queue does. A job ends with
 # merged, job_ready (PR_QUEUE_MERGE=0) or job_failed {step, reason} (the reasons: see failjob); job_failed of a
 # review or a judge also has found, the reviews that found changes (code, tests).
+# While a repo's runner works on a job, it keeps Windows from sleeping or throttling the WSL VM: just before the
+# job it starts a helper, `powershell.exe -NoProfile -NonInteractive -Command <script>`, that holds a "system
+# required" request (SetThreadExecutionState(0x80000001): ES_CONTINUOUS | ES_SYSTEM_REQUIRED, not the display),
+# one per job. It holds it until its stdin reaches EOF, or for 12 hours (43200 s) at most, then exits, and
+# Windows drops the request. Its stdin is a pipe only the runner holds (not the job), so the helper ends when the
+# job does, and with the runner however that ends (a signal, a crash, kill -9). The idle time between jobs isn't
+# covered. Its output goes to $PR_QUEUE_DIR/repos/<repo>/awake.log; a helper that fails changes no job. Without
+# powershell.exe on PATH (also off WSL), the runner says once, before its first job,
+# "pr-queue: <repo>: powershell.exe not found; Windows is not kept awake while the queue runs", and runs its
+# jobs as before. PR_QUEUE_AWAKE=0 turns it off (default 1).
 set -uo pipefail
 
 STATE="${PR_QUEUE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/pr-queue}"
@@ -572,6 +582,10 @@ run() {
     0|1) ;;
     *) die "PR_QUEUE_JUDGE must be 0 (no judge: a review that needs changes fails the job) or 1, not '$PR_QUEUE_JUDGE'" ;;
   esac
+  case "${PR_QUEUE_AWAKE:-1}" in
+    0|1) ;;
+    *) die "PR_QUEUE_AWAKE must be 0 (don't keep Windows awake) or 1, not '$PR_QUEUE_AWAKE'" ;;
+  esac
   local speed="${PR_QUEUE_SPEED_MAX:-4}"
   if [ "$speed" != 0 ] && ! { [[ "$speed" =~ ^[0-9]*\.?[0-9]+$ ]] && awk -v m="$speed" 'BEGIN { exit !(m + 0 > 1) }'; }; then
     die "PR_QUEUE_SPEED_MAX must be 0 (no speed check) or a number above 1, not '$speed'"
@@ -643,11 +657,32 @@ run() {
   echo "pr-queue: jobs left in the queue of:$(for d in $given_up; do printf " %s" "$(basename "$d")"; done) (see above)"
 }
 
+# The helper's PowerShell (see the header): the request for its thread, then a wait for stdin's EOF, at most
+# 12 hours. It has no double quotes (the C# string's come from [char]34), which the way to Windows could mangle.
+AWAKE_PS=$(cat <<'EOF'
+$k = Add-Type -Name Awake -Namespace PrQueue -PassThru -MemberDefinition ('[DllImport(' + [char]34 + 'kernel32.dll' + [char]34 + ')] public static extern uint SetThreadExecutionState(int f);'); if (-not $k::SetThreadExecutionState(0x80000001)) { 'SetThreadExecutionState failed' }; [void][Console]::In.ReadToEndAsync().Wait([TimeSpan]::FromSeconds(43200))
+EOF
+)
+# awake_start: starts the helper, its stdin the read end of a pipe whose write end is this shell's fd 7. The
+# helper gets neither fd 7 nor the runner's lock (fd 9).
+AWAKE_PID=""
+awake_start() {
+  exec 7> >(exec powershell.exe -NoProfile -NonInteractive -Command "$AWAKE_PS" >>"$RQ/awake.log" 2>&1 9>&-)
+  AWAKE_PID=$!
+}
+# awake_stop: closes the pipe, so the helper ends, and waits for it (at most 10 s).
+awake_stop() {
+  [ -n "$AWAKE_PID" ] || return 0
+  exec 7>&-
+  for _ in $(seq 100); do kill -0 "$AWAKE_PID" 2>/dev/null || break; sleep 0.1; done
+  AWAKE_PID=""
+}
+
 # run_repo: works through the queue of the current repo until it is empty.
 run_repo() {
   exec 9>"$RQ/run.lock"
   flock -n 9 || { echo "pr-queue: $REPO: a runner is already working on the queue"; return 0; }
-  local job name
+  local job name awake="${PR_QUEUE_AWAKE:-1}"
   # Jobs left in running/ belong to a runner that died (we hold the lock).
   for job in "$RUNNING"/*.job; do
     [ -f "$job" ] || continue
@@ -659,7 +694,13 @@ run_repo() {
   while job="$(find "$QUEUE" -name '*.job' | sort | head -1)"; [ -n "$job" ]; do
     name="$(basename "${job%.job}")"
     mv "${job%.job}".* "$RUNNING/"
-    ( process "$RUNNING/$name.job" ) || true
+    if [ "$awake" = 1 ] && ! command -v powershell.exe >/dev/null; then
+      echo "pr-queue: $REPO: powershell.exe not found; Windows is not kept awake while the queue runs"; awake=0
+    fi
+    if [ "$awake" = 1 ]; then awake_start; fi
+    # The job doesn't get the helper's pipe (fd 7): only this shell's end closes it.
+    ( process "$RUNNING/$name.job" ) 7>&- || true
+    awake_stop
     # A job that left its file behind (a crash) must not loop forever.
     if [ -f "$RUNNING/$name.job" ]; then
       echo "pr-queue: $REPO: $name did not finish; moved to failed/"

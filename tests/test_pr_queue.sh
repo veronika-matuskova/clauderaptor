@@ -126,6 +126,22 @@ if [ -f "$TQ/sync" ] && [ -n "$other" ]; then
 fi
 python3 -I -c 'import json, sys; print(json.dumps({"result": "important: a.txt:1: broken\nVerdict: " + sys.argv[1], "total_cost_usd": 0.3, "duration_ms": 1000}))' "$v"
 EOF
+# powershell.exe (the keep-awake helper): it's here from the start, so that no test runs the real one (on WSL
+# it's on PATH). It logs its pid in $TQ/awake.pids and its arguments in $TQ/awake.args (one line per start),
+# ignores INT, TERM and HUP, and ends only on stdin's EOF, then logs its pid in $TQ/awake.ended. It logs
+# "start <pid>" and "end <pid>" in $TQ/awake.seq, and the files its open fds point to in $TQ/awake.fds. With
+# $TQ/awake_fail it prints "interop off" to stderr and exits 1 at once; with $TQ/awake_slow it takes 0.5 s to end
+# after the EOF, as the real one can.
+cat > "$TQ/bin/powershell.exe" <<'EOF'
+#!/usr/bin/env bash
+echo "$$" >> "$TQ/awake.pids"; printf '%s\n' "$*" >> "$TQ/awake.args"; echo "start $$" >> "$TQ/awake.seq"
+for f in /proc/$$/fd/*; do readlink "$f"; done >> "$TQ/awake.fds" 2>/dev/null
+if [ -f "$TQ/awake_fail" ]; then echo "interop off" >&2; exit 1; fi
+trap '' INT TERM HUP
+while read -r _; do :; done
+if [ -f "$TQ/awake_slow" ]; then sleep 0.5; fi
+echo "end $$" >> "$TQ/awake.seq"; echo "$$" >> "$TQ/awake.ended"
+EOF
 chmod +x "$TQ/bin/"*
 
 # Origin, the main checkout R (with the repo's scripts), and a second clone O that moves main.
@@ -157,7 +173,8 @@ mkwt() {
 reset_pr() {
   rm -f "$TQ/pr_state" "$TQ/pr_body" "$TQ/pr_branch" "$TQ/checks_seq" "$TQ/e2e_fail" "$TQ/merge_fail" "$TQ/head_lag" "$TQ/on_checks" \
     "$TQ/verdict" "$TQ/tests_verdict" "$TQ/judge_verdict" "$TQ/judge_hang" "$TQ/claude_fail" "$TQ/sync" "$TQ"/started-* "$TQ/sync.log" \
-    "$TQ/e2e_nopass" "$TQ/push_reject" "$TQ/bench_seq" "$TQ/bench_fail" "$PR_QUEUE_DIR/speed-baseline"
+    "$TQ/e2e_nopass" "$TQ/push_reject" "$TQ/awake.pids" "$TQ/awake.args" "$TQ/awake.ended" "$TQ/awake_fail" \
+    "$TQ/awake.seq" "$TQ/awake.fds" "$TQ/awake_slow" "$TQ/bench_seq" "$TQ/bench_fail" "$PR_QUEUE_DIR/speed-baseline"
   : > "$TQ/gh.log"; : > "$TQ/created.log"; : > "$TQ/npm.log"; : > "$TQ/claude.log"; : > "$TQ/bench.log"
 }
 # code_reviews / test_reviews: the review sessions claude.log shows since the last reset
@@ -776,6 +793,14 @@ assert "STATS_EVENTS=0: only the add's events" test "$(ev fix/evoff 'names()')" 
 # and leaves no temp files; the job stays in running/, where the next run moves it to failed/ ---
 # shellcheck disable=SC2329  # called through assert
 gone() { ! kill -0 "$1" 2>/dev/null; }
+# awake_alive: the keep-awake helpers (stub pids) still running. awake_end_by <second>: waits until every
+# helper has logged its end, or $SECONDS reaches that second.
+awake_alive() { local p; while read -r p; do kill -0 "$p" 2>/dev/null && echo "$p"; done < <(cat "$TQ/awake.pids" 2>/dev/null); }
+awake_end_by() {
+  while [ "$SECONDS" -lt "$1" ]; do
+    [ "$(sort "$TQ/awake.ended" 2>/dev/null)" = "$(sort "$TQ/awake.pids" 2>/dev/null)" ] && break; sleep 0.1
+  done
+}
 # stop_runner <INT|TERM|HUP> <name>: runs the queue (branch fix/<name>) with both sessions hanging, then sends the signal to the runner's
 # whole process group, as a terminal's Ctrl-C (INT), its closing (HUP) or `kill -- -<pgid>` (TERM) does. python
 # gives the runner a group of its own, with SIGINT on (a background job's is off). Sets started, stop_rc, took,
@@ -799,10 +824,12 @@ stop_runner() {
     if [ -z "$alive" ] && [ -z "$(ls -A "$TQ/tmp")" ] && flock -n "$RQ/run.lock" true; then break; fi
     sleep 0.1
   done
-  took=$((SECONDS - t0)); rm -f "$TQ/hang"
+  took=$((SECONDS - t0)); signalled=$t0; rm -f "$TQ/hang"
 }
 for sig in INT TERM HUP; do
   stop_runner "$sig" "stop$sig"
+  # The keep-awake helper ignores the signal; the runner's end closes its stdin, which ends it.
+  awake_end_by $((signalled + 10))
   case "$sig" in INT) code=130 ;; TERM) code=143 ;; HUP) code=129 ;; esac
   assert "$sig: both sessions started"           test "$started" = 2
   assert "$sig: the runner ends by SIG$sig"      test "$stop_rc" = "$code"
@@ -811,12 +838,114 @@ for sig in INT TERM HUP; do
   assert "$sig: at once, not after the sessions' 30 s" test "$took" -lt 10
   assert "$sig: the job stayed in running/"      test -n "$(find "$RQ/running" -name "*stop$sig.job")"
   assert "$sig: the runner's lock is free again" flock -n "$RQ/run.lock" true
+  assert "$sig: the keep-awake helper had started" test "$(wc -l < "$TQ/awake.pids")" = 1
+  assert "$sig: the helper ended within 10 s"    test "$(cat "$TQ/awake.ended" 2>/dev/null)" = "$(cat "$TQ/awake.pids")"
+  assert "$sig: the helper's pid is gone"        test -z "$(awake_alive)"
   rm -f "$RQ"/running/*
 done
 # A Ctrl-C reaches the job too, so the runner ends only once both sessions have.
 stop_runner INT stopINT2
 assert "INT: the sessions ended before the runner" test -z "$alive_at_exit"
 rm -f "$RQ"/running/*
+
+# --- the keep-awake helper (the powershell.exe stub): one per job, held while it runs, released when it ends ---
+# A job that merges: the helper's arguments, and it is alive during e2e (on_e2e notes it in $TQ/awake_held).
+# The helper takes 0.5 s to end: the runner waits for it.
+reset_pr; rm -f "$TQ/awake_held"; touch "$TQ/awake_slow"; mkwt awake
+cat > "$TQ/on_e2e" <<'EOF'
+p="$(tail -1 "$TQ/awake.pids")"
+if kill -0 "$p" && [ ! -s "$TQ/awake.ended" ]; then touch "$TQ/awake_held"; fi
+EOF
+Q add --review none --tests none "$TMP/wt-awake" fix "Awake" >/dev/null; out="$(Q run)"
+args="$(cat "$TQ/awake.args")"
+for a in -NoProfile -NonInteractive '-Command ' SetThreadExecutionState 0x80000001 43200; do
+  assert_contains "awake: the helper is given $a" "$args" "$a"
+done
+assert_not_contains "awake: not the display (0x80000003)" "$args" "0x80000003"
+assert_not_contains "awake: not ES_DISPLAY_REQUIRED" "$args" "ES_DISPLAY_REQUIRED"
+assert "awake: held while e2e runs"          test -e "$TQ/awake_held"
+assert_contains "awake: the job merged"      "$out" "MERGED fix/awake"
+assert "awake: one helper for the job"       test "$(wc -l < "$TQ/awake.pids")" = 1
+assert "awake: released after a merge"       test "$(cat "$TQ/awake.ended" 2>/dev/null)" = "$(cat "$TQ/awake.pids")"
+assert "awake: its pid is gone after a merge" test -z "$(awake_alive)"
+assert "awake: its output not in a branch log" test ! -e "$RQ/logs/awake.log"
+assert "awake: the helper doesn't hold the runner's lock" test -s "$TQ/awake.fds" -a -z "$(grep 'run\.lock' "$TQ/awake.fds")"
+# A failed job releases it too.
+reset_pr; touch "$TQ/e2e_fail"; mkwt awakefail
+Q add --review none --tests none "$TMP/wt-awakefail" fix "Awake fail" >/dev/null; out="$(Q run)"
+assert_contains "awake: the job failed"      "$out" "FAILED fix/awakefail: the full e2e suite failed"
+assert "awake: released after a failed job"  test "$(cat "$TQ/awake.ended" 2>/dev/null)" = "$(cat "$TQ/awake.pids")"
+assert "awake: its pid is gone after a failed job" test -z "$(awake_alive)"
+# Two jobs: one helper each, none left after.
+reset_pr; mkwt awake2a; mkwt awake2b
+Q add --review none --tests none "$TMP/wt-awake2a" fix "A" >/dev/null; Q add --review none --tests none "$TMP/wt-awake2b" fix "B" >/dev/null
+out="$(Q run)"
+assert_contains "awake: two jobs, the first merged"  "$out" "MERGED fix/awake2a"
+assert_contains "awake: two jobs, the second merged" "$out" "MERGED fix/awake2b"
+assert "awake: two jobs, two helpers"        test "$(wc -l < "$TQ/awake.pids")" = 2
+assert "awake: two jobs, two ended"          test "$(sort "$TQ/awake.ended" 2>/dev/null)" = "$(sort "$TQ/awake.pids")"
+assert "awake: two jobs, none left running"  test -z "$(awake_alive)"
+p1="$(sed -n 1p "$TQ/awake.pids")"; p2="$(sed -n 2p "$TQ/awake.pids")"
+assert "awake: two jobs, the first's helper ended before the second's started" \
+  test "$(paste -sd, "$TQ/awake.seq")" = "start $p1,end $p1,start $p2,end $p2"
+# A kill -9 of the runner's pid alone: the orphaned job goes on (its npm hangs until $TQ/npm_go), but the
+# helper ends, as the job doesn't hold its pipe.
+reset_pr; rm -f "$TQ/npm_pid" "$TQ/npm_go"; touch "$TQ/e2e_fail"; mkwt awakekill
+cat > "$TQ/on_e2e" <<'EOF'
+echo "$PPID" > "$TQ/npm_pid"; for _ in $(seq 600); do [ -e "$TQ/npm_go" ] && break; sleep 0.05; done
+EOF
+Q add --review none --tests none "$TMP/wt-awakekill" fix "Awake kill" >/dev/null
+PATH="$TQ/bin:$PATH" bash "$ROOT/scripts/queue/pr-queue.sh" run "$R" </dev/null >/dev/null 2>&1 &
+rpid=$!
+for _ in $(seq 300); do [ -s "$TQ/npm_pid" ] && break; sleep 0.1; done
+assert "awake, kill -9: the job reached e2e" test -s "$TQ/npm_pid"
+kill -KILL "$rpid"; { wait "$rpid"; } 2>/dev/null
+awake_end_by $((SECONDS + 10))
+assert "awake, kill -9: the helper ended within 10 s" test "$(cat "$TQ/awake.ended" 2>/dev/null)" = "$(cat "$TQ/awake.pids")"
+assert "awake, kill -9: its pid is gone"     test -z "$(awake_alive)"
+assert "awake, kill -9: the orphaned job still ran" kill -0 "$(cat "$TQ/npm_pid")"
+# The orphaned job holds the runner's lock until it ends.
+touch "$TQ/npm_go"; for _ in $(seq 300); do flock -n "$RQ/run.lock" true && break; sleep 0.1; done
+rm -f "$RQ"/failed/*awakekill*
+# Without powershell.exe on PATH (also on WSL, where the real one is under /mnt/c): one line, the jobs as before.
+mkdir -p "$TQ/bin-nops"; for f in "$TQ/bin/"*; do [ "${f##*/}" = powershell.exe ] || ln -sf "$f" "$TQ/bin-nops/"; done
+nops_path="$TQ/bin-nops"; IFS=: read -ra dirs <<<"$PATH"
+for d in "${dirs[@]}"; do [ -e "$d/powershell.exe" ] || nops_path+=":$d"; done
+assert "awake: the test's PATH has no powershell.exe" test -z "$(PATH="$nops_path" command -v powershell.exe)"
+reset_pr; mkwt nops1; mkwt nops2
+Q add --review none --tests none "$TMP/wt-nops1" fix "A" >/dev/null; Q add --review none --tests none "$TMP/wt-nops2" fix "B" >/dev/null
+out="$(PATH="$nops_path" bash "$ROOT/scripts/queue/pr-queue.sh" run </dev/null 2>&1)"
+assert_contains "awake: no powershell.exe, says so" "$out" "pr-queue: repo: powershell.exe not found; Windows is not kept awake while the queue runs"
+assert "awake: no powershell.exe, said once" test "$(grep -c 'powershell.exe not found' <<<"$out")" = 1
+assert_contains "awake: no powershell.exe, the first merged"  "$out" "MERGED fix/nops1"
+assert_contains "awake: no powershell.exe, the second merged" "$out" "MERGED fix/nops2"
+assert "awake: no powershell.exe, no helper" test ! -e "$TQ/awake.pids"
+# PR_QUEUE_AWAKE=0: no helper, no line.
+reset_pr; mkwt awakeoff
+Q add --review none --tests none "$TMP/wt-awakeoff" fix "Off" >/dev/null; out="$(PR_QUEUE_AWAKE=0 Q run)"
+assert "awake=0: no helper"                  test ! -e "$TQ/awake.pids"
+assert_not_contains "awake=0: no line"       "$out" "powershell.exe not found"
+assert_contains "awake=0: merged"            "$out" "MERGED fix/awakeoff"
+# Off, and without powershell.exe on PATH: no line either.
+reset_pr; mkwt awakeoffnops
+Q add --review none --tests none "$TMP/wt-awakeoffnops" fix "Off" >/dev/null
+out="$(PR_QUEUE_AWAKE=0 PATH="$nops_path" bash "$ROOT/scripts/queue/pr-queue.sh" run </dev/null 2>&1)"
+assert_not_contains "awake=0, no powershell.exe: no line" "$out" "powershell.exe not found"
+assert_contains "awake=0, no powershell.exe: merged" "$out" "MERGED fix/awakeoffnops"
+# A switch that is neither: run stops, the job stays queued.
+reset_pr; mkwt awakebad
+Q add --review none --tests none "$TMP/wt-awakebad" fix "Bad" >/dev/null; out="$(PR_QUEUE_AWAKE=yes Q run)"; rc=$?
+assert_contains "awake=yes: refused"         "$out" "PR_QUEUE_AWAKE must be 0 (don't keep Windows awake) or 1, not 'yes'"
+assert "awake=yes: exits with an error"      test "$rc" = 1
+assert "awake=yes: the job stays queued"     test -n "$(find "$RQ/queue" -name '*awakebad.job')"
+assert "awake=yes: no helper"                test ! -e "$TQ/awake.pids"
+rm -f "$RQ"/queue/*awakebad*
+# A helper that fails at once (WSL interop off) changes nothing; its output is kept in awake.log.
+reset_pr; touch "$TQ/awake_fail"; rm -f "$RQ/awake.log"; mkwt awakeerr
+Q add --review none --tests none "$TMP/wt-awakeerr" fix "Err" >/dev/null; out="$(Q run)"
+assert "awake: a failing helper was started" test -s "$TQ/awake.pids"
+assert_contains "awake: a failing helper, still merged" "$out" "MERGED fix/awakeerr"
+assert_contains "awake: its output in awake.log" "$(cat "$RQ/awake.log" 2>/dev/null)" "interop off"
 
 # --- the judge: rules on the reviews that need changes; only its confirmed findings go to the agent ---
 # judge_line: what the judge session was given, since the last reset

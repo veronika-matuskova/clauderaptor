@@ -1115,6 +1115,14 @@ assert_contains "A4 (4a): a re-queue of the commit fails again on the earlier ha
 assert_contains "A4 (4a): a re-queue of the commit: job_failed review/sniff" "$(ev fix/sniffref 'failed()')" "review/sniff"
 assert "A4 (4a): a re-queue of the commit: no e2e" test ! -s "$TQ/npm.log"
 assert "A4 (4a): the sniff file isn't added to"  test "$(grep -c '^Flags: ' "$sf")" = 1
+# A new request at the same commit (a code review at another level isn't cached): its hard flag adds to the
+# earlier one's.
+echo 'Sniff: sniffref.txt:50 holds it too | sniffref.txt:50 | still one line' > "$TQ/code_sniff"
+Q add --review high "$TMP/wt-sniffref" fix "Sniff ref" >/dev/null; out="$(Q run)"
+assert_contains "A4 (4a): a second sniff at the commit: its own run" "$out" "sniffing 1 request(s) of the reviews"
+assert "A4 (4a): a second sniff at the commit: appended" test "$(grep -c '^Flags: ' "$sf")" = 2
+assert_contains "A4 (4a): the hard flags of both sniffs at the commit count" "$out" \
+  "FAILED fix/sniffref: the sniff of the reviews' requests has 2 hard flag(s) (sniff: $sf)"
 # With a judge that fails the job, the sniff's hard flags end its message; the judge gets the sniff file, and
 # its own Sniff: lines are never run.
 reset_pr; mkwt sniffjudge; echo "needs changes" > "$TQ/verdict"

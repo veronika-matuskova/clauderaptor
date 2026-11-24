@@ -60,15 +60,24 @@
 # $BRIEF_DIR (default $PR_QUEUE_DIR/briefs) as <repo>-<sha>-<time>-<random>.md, with a sidecar, and printed. Exit 0 = a
 # brief with no open questions, 1 = one with open questions for the user, 2 = it didn't run or the brief lacks a
 # section or the criteria. The user approves, edits or cancels it before an agent gets it.
-# A brief that has every section, the criteria and a verdict is then sniffed: sniff.sh --brief (next to this
-# script) at the planned commit. If it has a hard flag, every flag goes back to the planner's session, once
-# (claude --resume, the same model, effort, limit and tools): the planner answers with the whole revised brief,
-# which replaces the brief if it passes the same checks and is sniffed again. There is never a second round.
-# The hard flags left are marked "unanswered", and exit 1 with "the brief's sniff has <n> hard flag(s) left". If
-# the round can't run or its answer fails the checks, the first brief stays, and a note says why. The sniff's
-# requests and flags are saved as <brief>-sniff.md, printed after the brief with "(sniff saved to <file>)". A
-# sniff that didn't run (sniff.sh missing, or exit 4) only adds a note. A round's cost and time add up in the
-# brief's title and its sidecar.
+# A brief that has every section, the criteria and a verdict is then sniffed: sniff.sh --brief --session --author
+# planner (next to this script) at the planned commit, with one sniff session (review.sh --sniff, on sniff_model
+# and sniff_effort; REVIEW_MODEL, REVIEW_EFFORT and REVIEW_TIMEOUT reach it too). If that session didn't run,
+# a note says why and the brief is sniffed mechanically (--brief alone) instead. If the sniff has a hard flag or
+# a "Request <n> to planner:" line, every flag (but a too-good-to-be-true one: its Request asks for the
+# evidence) and every Request go back to the planner's session, once (claude --resume, the same model, effort,
+# limit and tools): the planner answers with the whole revised brief, then a "## Answers" section with an
+# "Answer <n>:" block for each Request. The part before "## Answers" (a heading of that text alone, any case)
+# replaces the brief if it passes the same checks, and is sniffed again with --brief. If there were Requests,
+# the whole answer is also checked with --answer <the first sniff's output>: a Request not answered with
+# evidence adds a hard "unsupported after one round" flag (a file named only in an Answer block names nothing
+# for the brief's own checks).
+# There is never a second round. The hard flags left are marked "unanswered", and exit 1 with "the brief's
+# sniff has <n> hard flag(s) left". If the round can't run or its answer fails the checks, the first brief
+# stays, a note says why, and each Request counts as a hard flag left ("unanswered (request <n>)"). The sniff's
+# requests, the planner's answers and the flags are saved as <brief>-sniff.md, printed after the brief with
+# "(sniff saved to <file>)". A sniff that didn't run (sniff.sh missing, or exit 4) only adds a note. A round's
+# cost and time add up in the brief's title and its sidecar (not the sniff sessions').
 set -uo pipefail
 die() { echo "review: $*" >&2; exit 2; }
 # verdict <file>: "ready", "needs changes", "escalate" (a judge only), "questions" (a plan only) or "failed",
@@ -450,29 +459,37 @@ if [ "$mode" = plan ]; then
     grep -qE '^[[:space:]]*[-*][[:space:]]+(\*\*)?A1\b' "$1" || m+=", the criteria A1…"
     echo "$m"
   }
-  # sniff <brief> <output file>: sniff.sh in brief mode at the planned commit, on a copy of the brief whose
-  # first line, the title this script adds ("# Brief for <repo> at <sha> (...)"), is blank: it is no claim of
-  # the planner's (a repo named like a file, chart.js, isn't a missing reference), and line numbers stay the same.
-  # Returns its exit code (0, 1 or 2), or 4 with the reason in why when it didn't run.
+  # sniff <brief> <output file> [sniff.sh options...]: sniff.sh in brief mode at the planned commit, on a copy
+  # of the brief whose first line, the title this script adds ("# Brief for <repo> at <sha> (...)"), is blank: it
+  # is no claim of the planner's (a repo named like a file, chart.js, isn't a missing reference), and line numbers
+  # stay the same. Returns its exit code (0, 1 or 2), or 4 with the reason in why when it didn't run.
   sniff() {
-    local r
+    local r b="$1" o="$2"; shift 2
     if [ ! -f "$HERE/sniff.sh" ]; then why="$HERE/sniff.sh is missing"; return 4; fi
-    { echo; tail -n +2 "$1"; } > "$2.in"
-    bash "$HERE/sniff.sh" "$2.in" --brief --repo "$wt" --commit "$sha" >"$2" 2>"$2.err"; r=$?
+    { echo; tail -n +2 "$b"; } > "$o.in"
+    bash "$HERE/sniff.sh" "$o.in" --brief --repo "$wt" --commit "$sha" "$@" >"$o" 2>"$o.err"; r=$?
     case "$r" in 0|1|2) return "$r" ;; esac
-    why="sniff.sh exited $r"; if [ -s "$2.err" ]; then why+=": $(head -1 "$2.err")"; fi
+    why="sniff.sh exited $r"; if [ -s "$o.err" ]; then why+=": $(head -1 "$o.err")"; fi
     return 4
   }
-  # sniff_brief: sniffs the brief. On a hard flag, one round back to the planner's session (--resume) with
-  # every flag as a request; a revised brief that passes the checks replaces the brief and is sniffed again.
-  # Sets sfile (the <brief>-sniff.md written), snote (a note to print) and left (the hard flags left).
+  # sniff_brief: sniffs the brief, with one sniff session for the planner (mechanically only if it didn't run).
+  # On a hard flag or a Request line, one round back to the planner's session (--resume) with every flag and
+  # Request; a revised brief that passes the checks replaces the brief, and the whole answer is sniffed again
+  # (--answer, if there were Requests). Sets sfile (the <brief>-sniff.md written), snote (the notes to print)
+  # and left (the hard flags left).
   sniff_brief() {
-    local s first reqs="" l want rid rc2 reason="" res m2 flags
+    local s first reqs="" l want rid rc2 reason="" res m2 flags rq=() n aw answers="" unans="" h sn=""
     scratch="$(mktemp -d)" || { snote="note: the brief's sniff didn't run: can't create a temp folder"; return; }
-    sniff "$out" "$scratch/first"; s=$?; first=$s
-    if [ "$s" -eq 4 ]; then snote="note: the brief's sniff didn't run: $why"; return; fi
-    flags="$scratch/first"
-    if [ "$first" -eq 2 ]; then
+    sniff "$out" "$scratch/first" --session --author planner; s=$?
+    if [ "$s" -eq 4 ]; then  # the session didn't run: the mechanical sniff alone
+      sn="${why#sniff.sh exited 4: }"; sn="${sn#sniff: }"; sn="${sn#"the session didn't run: "}"
+      snote="note: the brief's sniff session didn't run: $sn"
+      sniff "$out" "$scratch/first"; s=$?
+      if [ "$s" -eq 4 ]; then snote="note: the brief's sniff didn't run: $why"; return; fi
+    fi
+    first=$s; flags="$scratch/first"
+    mapfile -t rq < <(grep -E '^Request [0-9]+ to planner: ' "$scratch/first")
+    if [ "$first" -eq 2 ] || [ "${#rq[@]}" -gt 0 ]; then
       while IFS= read -r l; do
         case "$l" in
           *" left out (line "*) want="a scope decision: name the file in Requirements (in scope) or in Out of scope (out)" ;;
@@ -480,7 +497,12 @@ if [ "$mode" = plan ]; then
           *) want="evidence: a file:line at $sha that shows it, or the reference fixed" ;;
         esac
         reqs+="- $l"$'\n'"  Wanted: $want"$'\n'
-      done < <(grep -E '^(hard|soft) ' "$scratch/first")
+      done < <(grep -E '^(hard|soft) ' "$scratch/first" | grep -v '^soft too good to be true (')
+      for l in "${rq[@]}"; do
+        n="${l#Request }"; n="${n%% *}"; aw="the evidence it asks for"
+        if [[ "$l" == *"| answer with: "* ]]; then aw="${l##*| answer with: }"; fi
+        reqs+="- $l"$'\n'"  Wanted: an \"Answer $n:\" block in the ## Answers section after the Verdict line, with $aw"$'\n'
+      done
       rid="$(python3 -I -c 'import json, sys
 d = json.load(open(sys.argv[1]))
 s = d.get("session_id") if isinstance(d, dict) else None
@@ -493,7 +515,15 @@ mechanically. Its requests are below, one per flag: the claim, where it is (the 
 which has a title line added above your text), and the answer wanted: evidence as a file:line, or a scope \
 decision. Answer each one in the brief itself. Add no new requirement or finding: change only what a request \
 needs. Then reply with the whole revised brief, in the same format, with the same sections and the Verdict line \
-last, and nothing else.
+last, and nothing else."
+        if [ "${#rq[@]}" -gt 0 ]; then
+          rprompt+=" The exception: a sniff session also read the brief, and each of its \"Request <n> to planner:\" \
+lines asks for evidence for a claim. Answer each one, not in the brief, but in an \"Answer <n>:\" block (the \
+evidence in the form it asks for: a file:line at $sha, a command and its output, or a measurement) in a section \
+\"## Answers\" after the Verdict line; that section is the only thing after it. A claim you can't back up: \
+change or drop it in the brief, and say so in its Answer block."
+        fi
+        rprompt+="
 
 Requests:
 $reqs"
@@ -526,28 +556,61 @@ print(b.get("result") or "")
         else
           body=""; if [[ "$res" == *$'\n'* ]]; then body="${res#*$'\n'}"; fi
           printf '# %s%s, %s at %s effort)\n\n%s\n' "$title" "${res%%$'\n'*}" "$model" "$effort" "$body" > "$scratch/answer.md"
-          m2="$(brief_missing "$scratch/answer.md")"
+          # The brief: the part before "## Answers" (all of it if no Request was sent), so its Verdict stays last.
+          cp "$scratch/answer.md" "$scratch/answer-brief.md"
+          if [ "${#rq[@]}" -gt 0 ]; then
+            h="$(grep -niE -m1 '^##[[:space:]]+Answers[[:space:]]*$' "$scratch/answer.md" | cut -d: -f1)"
+            if [ -n "$h" ]; then
+              head -n "$((h - 1))" "$scratch/answer.md" > "$scratch/answer-brief.md"
+              answers="$(tail -n +"$((h + 1))" "$scratch/answer.md" | sed '/./,$!d')"
+            fi
+          fi
+          m2="$(brief_missing "$scratch/answer-brief.md")"
           if [ -n "$m2" ]; then
             reason="the planner's answer has no ${m2#, }"
-          elif ! case "$(verdict "$scratch/answer.md")" in ready|questions) true ;; *) false ;; esac; then
+          elif ! case "$(verdict "$scratch/answer-brief.md")" in ready|questions) true ;; *) false ;; esac; then
             reason="the planner's answer has no verdict"
           else
-            sniff "$scratch/answer.md" "$scratch/second"; s=$?
+            # The brief's flags come from the brief part alone: a file named only in an Answer block is no
+            # scope decision. The whole answer, with its Answer blocks, is checked with --answer, and only
+            # its "unsupported after one round" flags are added.
+            sniff "$scratch/answer-brief.md" "$scratch/second"; s=$?
+            if [ "$s" -ne 4 ] && [ "${#rq[@]}" -gt 0 ]; then
+              sniff "$scratch/answer.md" "$scratch/answered" --answer "$scratch/first" --author planner; s=$?
+              grep '^hard unsupported after one round ' "$scratch/answered" >> "$scratch/second"
+            fi
             if [ "$s" -eq 4 ]; then reason="the sniff of the planner's answer didn't run: $why"
-            else cat "$scratch/answer.md" > "$out"; flags="$scratch/second"; fi
+            else
+              # The saved brief: the part before "## Answers", without the blank lines that end it.
+              sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$scratch/answer-brief.md" > "$out"; flags="$scratch/second"
+            fi
           fi
           if [ -n "$reason" ]; then  # the first brief stays, with the title of both calls
             { head -1 "$scratch/answer.md"; tail -n +2 "$out"; } > "$scratch/kept" && cat "$scratch/kept" > "$out"
           fi
         fi
       fi
-      sed -E 's/^hard ([^(]*[^ (]) \(line /hard \1, unanswered (line /' "$flags" > "$scratch/final"; flags="$scratch/final"
-      left="$(grep -c '^hard ' "$flags")"
-      if [ -n "$reason" ]; then snote="note: $reason; the brief's hard flags are unanswered"; fi
+      # A Request with no answer checked counts as a hard flag left.
+      if [ -n "$reason" ]; then
+        for l in "${rq[@]}"; do
+          n="${l#Request }"; n="${n%% *}"; l="${l#*to planner: }"
+          unans+="hard unsupported after one round, unanswered (request $n): ${l%% | *} — $reason"$'\n'
+        done
+      fi
+      { grep -vE '^(Request [0-9]+ to |Flags: )' "$flags" \
+          | sed -E 's/^hard ([^(]*[^ (]) \(line /hard \1, unanswered (line /'
+        printf '%s' "$unans"; } > "$scratch/final"
+      left="$(grep -c '^hard ' "$scratch/final")"
+      echo "Flags: $left hard, $(grep -c '^soft ' "$scratch/final") soft" >> "$scratch/final"; flags="$scratch/final"
+      if [ -n "$reason" ]; then
+        snote="${snote:+$snote$'\n'}note: $reason; the brief's hard flags are unanswered"
+      fi
     fi
     { printf '# Sniff of %s at %s\n\n## Requests sent to the planner\n\n' "$(basename "$out")" "$sha"
       if [ -n "$reqs" ]; then printf '%s' "$reqs"; else echo none; fi
+      if [ -n "$sn" ]; then printf '\nNote: the brief'"'"'s sniff session didn'"'"'t run: %s\n' "$sn"; fi
       if [ -n "$reason" ]; then printf '\nNote: %s\n' "$reason"; fi
+      if [ "${#rq[@]}" -gt 0 ]; then printf '\n## The planner'"'"'s answers\n\n%s\n' "${answers:-none}"; fi
       printf '\n## Flags\n\n'; cat "$flags"; } > "$scratch/sniff.md"
     sfile="${out%.md}-sniff.md"
     if ! cat "$scratch/sniff.md" 2>/dev/null >"$sfile"; then

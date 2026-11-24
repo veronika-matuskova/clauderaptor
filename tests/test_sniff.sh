@@ -527,6 +527,9 @@ RV="$TMP/rvrepo"; git init -q -b main "$RV"; echo base > "$RV/base.txt"; git -C 
 # cm <lines>: a commit off main whose diff has that many added lines; prints its sha
 cm() { git -C "$RV" checkout -q -B "b$1" main; seq "$1" > "$RV/f$1.txt"; git -C "$RV" add -A; git -C "$RV" commit -q -m "f$1"; git -C "$RV" rev-parse HEAD; git -C "$RV" checkout -q main; }
 C900="$(cm 900)"; C300="$(cm 300)"; C301="$(cm 301)"
+# CB: 300 lines and a binary file, which has no lines
+git -C "$RV" checkout -q -B bbin main; seq 300 > "$RV/t.txt"; printf '\0\1\2' > "$RV/b.bin"; git -C "$RV" add -A; git -C "$RV" commit -q -m bin
+CB="$(git -C "$RV" rev-parse HEAD)"; git -C "$RV" checkout -q main
 mkdir -p "$TMP/rv"
 printf 'max_diff_lines=300\ncode_min_seconds=30\ncode_min_cost=0.20\ncode_min_turns=5\ntests_min_seconds=30\ntests_min_cost=0.20\ntests_min_turns=5\n' > "$TMP/th.conf"
 export SNIFF_CONFIG="$TMP/th.conf"
@@ -564,6 +567,9 @@ sf "$(review "$C300" 30000 0.20 4)"
 assert_contains "A13: 4 turns: flagged" "$out" "\$0.20, 4 turns; thresholds"
 sf "$(review "$C900" 4000 0.05 3 "needs changes")"
 assert_contains "A13: a needs-changes review on 900 lines: not flagged" "$out" "Flags: 0 hard, 0 soft"
+sf "$(review "$CB" 30000 0.20 5)"
+assert_contains "a binary file in the diff counts no lines" "$out" "Flags: 0 hard, 0 soft"
+assert "a binary file: exit 0" test "$rc" = 0
 sf "$(review "$C300" 30000 0.123 1)"
 assert_contains "a cost with more digits, and 1 turn" "$out" "in 30 s, \$0.123, 1 turn;"
 sf "$(review "$C900" null null null)"
@@ -579,6 +585,9 @@ sf "$(review "$C900" 4000 0.05 3 ready code notes)"
 assert_contains "a file not named like a review: not checked" "$out" "Flags: 0 hard, 0 soft"
 sf "$(review "$C900" 4000 0.05 3 ready judge "feat-x-${C900:0:12}-judge")"
 assert_contains "a judge's file: not checked" "$out" "Flags: 0 hard, 0 soft"
+sf "$(review "$C900" 4000 0.05 3 ready judge "feat-x-${C900:0:12}-medium")"
+assert_contains "a review's name with a sidecar of another kind (judge): not checked" "$out" "Flags: 0 hard, 0 soft"
+assert "another kind: exit 0" test "$rc" = 0
 f="$(review "$C900" 4000 0.05 3 ready code "feat-x-${C900:0:12}-low-notests")"
 sf "$f"; assert_contains "a -notests review is checked" "$out" "900-line diff"
 echo '[1, 2]' > "${f%.md}.json"; sf "$f"
@@ -740,6 +749,7 @@ echo "-- a failed session"
 touch "$TMP/session-fail"; ss 'Plain.' --session --author reviewer; rm "$TMP/session-fail"
 assert_contains "A11: a failed session: the reason on stderr" "$err" "sniff: the session didn't run: claude -p failed (exit 1)"
 assert "A11: a failed session: exit 4" test "$rc" = 4
+assert_not_contains "A11: a failed session isn't an error in the sniff" "$err" "the sniff failed"
 assert "A11: a failed session: nothing on stdout" test -z "$out"
 assert "a failed session: no temp folder left" test -z "$(ls -A "$TMP/tmpd")"
 REVIEW_CONFIG="$TMP/none.conf" ss 'Plain.' --session --author reviewer
@@ -778,6 +788,9 @@ printf 'Answered 1: yes — ok\nAnswered 2: yes — ok\n' > "$TMP/session-result
 ss $'Answer 1: a.js:100.\nAnswer 2: a.js:500.' --answer "$TMP/earlier2.txt"
 assert_not_contains "a block ends at the next one: Answer 1 is clear" "$out" "(line 1): A."
 assert_contains "and Answer 2 has its own hard flag" "$out" "hard unsupported after one round (line 2): B. — Answer 2 has a hard flag (line 2)"
+printf 'Answered 1: yes — ok\n' > "$TMP/session-result"
+ss $'Answer 1: the measurement is below.\nIt is at a.js:500.' --answer "$TMP/earlier.txt"
+assert_contains "a hard flag on a later line of the block counts" "$out" "hard unsupported after one round (line 1): Made it 10x faster. — Answer 1 has a hard flag (line 2)"
 printf 'Answered 1: yes — ok\nRequest to reviewer: More? | missing: m | answer with: a file:line\n' > "$TMP/session-result"
 ss 'Answer 1: a.js:100.' --answer "$TMP/earlier.txt" --author developer
 assert_not_contains "A17: an answer run prints no Request line" "$out" "Request"

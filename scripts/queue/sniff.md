@@ -51,6 +51,8 @@ Then, for each claim with `found: no` or a too-good-to-be-true reason, print one
 
 Last, print one line `Claims: <n>`, the number of `Claim` lines you printed: `Claims: 0` when the text claims
 nothing. Without it, or with another number, sniff.sh takes your result as lost and the sniff as not run.
+Then print one line `Requests: <n>`, the number of `Request` lines you printed: `Requests: 0` when you asked
+for nothing. It is checked the same way.
 
 ## Mode: answer
 

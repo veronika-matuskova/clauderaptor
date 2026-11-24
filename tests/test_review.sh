@@ -1026,6 +1026,7 @@ assert_contains "--sniff: the prompt names the repo and the commit" "$prompt" "R
 assert_contains "--sniff: the session runs outside the repo, so the prompt says git -C <repo>" "$prompt" "git -C $SN show $SN1:<path>, git -C $SN grep <word> $SN1"
 assert_contains "--sniff: sniff.md's git commands name the repo" "$prompt" "\`git -C <repo> show <commit>:<path>\`"
 assert_contains "--sniff: the prompt asks for the Claims count line" "$prompt" "Last, print one line \`Claims: <n>\`, the number of \`Claim\` lines you printed"
+assert_contains "--sniff: the prompt asks for the Requests count line" "$prompt" "Then print one line \`Requests: <n>\`, the number of \`Request\` lines you printed"
 assert_contains "--sniff: the prompt asks for the Answered count line" "$prompt" "Last, print one line \`Answered: <n>\`, the number of \`Answered\` lines you printed"
 assert "--sniff: sniff.md has no git command without -C" test -z "$(grep -E '\`git (show|grep|log)' "$ROOT/scripts/queue/sniff.md")"
 assert_contains "--sniff: the input is in the prompt"    "$prompt" "BUNDLE-CANARY"

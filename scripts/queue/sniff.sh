@@ -52,8 +52,8 @@
 # finds too good to be true is a soft "too good to be true" flag; its evidence requests are printed as
 # "Request <n> to <author>: <claim> | missing: <...> | answer with: <...>" lines before the Flags line. Requests
 # don't change the exit code. The session's result ends with "Claims: <n>", the number of its Claim lines (0 for
-# a text with no claims): a result without that line (empty, or cut off) or with another number is taken as
-# lost, and the session as not run (exit 4). The author is --author, else from the input's sidecar (<input
+# a text with no claims), and "Requests: <n>", the number of its Request lines (numbered or not): a result
+# without either line (empty, or cut off) or with another number is taken as lost, and the session as not run (exit 4). The author is --author, else from the input's sidecar (<input
 # without .md>.json): kind code or tests is a reviewer, plan a planner. No author, or an unknown one, exits 4; so
 # does a session that didn't run ("sniff: the session didn't run: <reason>" on stderr).
 # One answer round (--answer <earlier output>): the input is the author's answer to the Request lines of an
@@ -874,7 +874,7 @@ review_check()
 # --- the session (--session, --answer): one review.sh --sniff ---
 CLAIM_RE_S = re.compile(r"^[\s>*_`\-]*(?:\d+[.)][\s*_`]*)?Claim \(line (\d+)\):\s*(.*)$")
 TOO_GOOD_RE = re.compile(r"\|\s*too good to be true:\s*(.*?)\s*[*_`]*$", re.I)
-REQ_OUT_RE = re.compile(r"^[\s>*_`\-]*(?:\d+[.)][\s*_`]*)?Request to [\w-]+:[\s*_`]*(.*?)[\s*_`]*$")
+REQ_OUT_RE = re.compile(r"^[\s>*_`\-]*(?:\d+[.)][\s*_`]*)?Request(?: \d+)? to [\w-]+:[\s*_`]*(.*?)[\s*_`]*$")
 ANSWERED_RE = re.compile(r"^[\s>*_`\-]*(?:\d+[.)][\s*_`]*)?Answered (\d+):[*_`\s]*(yes|no)\b[\s—–-]*(.*?)\s*$", re.I)
 ANSWER_RE = re.compile(r"^[\s>*_`\-]*Answer (\d+)\s*:")
 
@@ -924,6 +924,7 @@ out_requests = []
 if session and not answer_path:
     result = run_session(bundle_of("claims", lines, flag_lines()))
     check_count(result, "Claims", CLAIM_RE_S, "Claim")
+    check_count(result, "Requests", REQ_OUT_RE, "Request")
     for raw in result.splitlines():
         m = CLAIM_RE_S.match(raw)
         if m:

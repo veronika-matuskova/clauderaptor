@@ -1175,7 +1175,7 @@ SNIFF_CONFIG="$TMP/sniff2.conf" rv "$W" >/dev/null
 assert_contains "A15 (4a): the limit comes from SNIFF_CONFIG" "$(cat "$STUB/args")" "at most 2 such lines"
 for bad in 'max_sniff_requests=x' 'other=1' 'max_sniff_requests=-1'; do
   printf '%s\n' "$bad" > "$TMP/sniffbad.conf"; commit "sniffbad$bad"
-  SNIFF_CONFIG="$TMP/sniffbad.conf" rv "$W" >/dev/null
+  max_sniff_requests=3 SNIFF_CONFIG="$TMP/sniffbad.conf" rv "$W" >/dev/null   # only the file's value counts
   assert_not_contains "A15 (4a): $bad: not told to ask (the queue would run none)" "$(cat "$STUB/args")" "Sniff: <claim>"
 done
 commit sniffnoconf; SNIFF_CONFIG="$TMP/nope.conf" rv "$W" >/dev/null
@@ -1198,6 +1198,12 @@ assert_contains "A14 (4a): the test review gets them too" "$args" \
   "- Earlier sniff results on this branch, oldest first (read each with cat): $REVIEW_DIR/feat-notes-$p0-sniff.md $REVIEW_DIR/feat-notes-$p1-sniff.md."
 assert_not_contains "A14 (4a): the test review: not a commit off the branch" "$args" "$sside"
 rm "$sside" "$sother"
+# HEAD's own sniff file too (a review at another level of a commit the queue sniffed), last: it is the newest.
+commit sniff2b; printf 'Flags: 0 hard, 0 soft\n' > "$REVIEW_DIR/feat-notes-$sha-sniff.md"
+rv "$W" >/dev/null
+assert_contains "A14 (4a): the review gets HEAD's own sniff file too" "$(cat "$STUB/args")" \
+  "$REVIEW_DIR/feat-notes-$p1-sniff.md $REVIEW_DIR/feat-notes-$sha-sniff.md."
+rm "$REVIEW_DIR/feat-notes-$sha-sniff.md"
 # The judge: REVIEW_SNIFF gives it this commit's sniff file; it isn't told to ask, nor given earlier ones.
 printf 'Ruling.\nVerdict: ready\n' > "$STUB/result"
 cp "$REVIEW_DIR/feat-notes-$p1-sniff.md" "$REVIEW_DIR/feat-notes-$sha-sniff.md"

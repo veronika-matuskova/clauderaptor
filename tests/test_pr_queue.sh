@@ -1112,6 +1112,7 @@ assert "A4 (4a): no sniff session"                test -z "$(grep '^sniff ' "$TQ
 Q add "$TMP/wt-sniffref" fix "Sniff ref" >/dev/null; : > "$TQ/npm.log"; out="$(Q run)"
 assert_contains "A4 (4a): a re-queue of the commit: already sniffed" "$out" "sniff: sniffref.txt:99 holds the fix: already sniffed at"
 assert_not_contains "A4 (4a): a re-queue of the commit: no new sniff" "$out" "sniffing"
+assert_not_contains "A4 (4a): a re-queue of the commit: nothing to sniff is no error" "$out" "can't read the reviews' Sniff: lines"
 assert_contains "A4 (4a): a re-queue of the commit fails again on the earlier hard flag" "$out" \
   "FAILED fix/sniffref: the sniff of the reviews' requests has 1 hard flag(s) (sniff: $sf)"
 assert_contains "A4 (4a): a re-queue of the commit: job_failed review/sniff" "$(ev fix/sniffref 'failed()')" "review/sniff"
@@ -1126,6 +1127,30 @@ assert "A4 (4a): a second sniff at the commit: appended" test "$(grep -c '^Flags
 assert_contains "A4 (4a): the hard flags of both sniffs at the commit count" "$out" \
   "FAILED fix/sniffref: the sniff of the reviews' requests has 2 hard flag(s) (sniff: $sf)"
 assert "A2 (4a): one title in the sniff file, a block per sniff" test "$(grep -c '^# Sniff of' "$sf") $(grep -c '^## Requests of' "$sf")" = "1 2"
+# A run whose reviews ask for nothing (a code review at a new level, no Sniff: line; no test review) still fails
+# on the commit's earlier hard flags.
+rm -f "$TQ/code_sniff" "$TQ/tests_sniff"; : > "$TQ/npm.log"
+Q add --review xhigh --tests none "$TMP/wt-sniffref" fix "Sniff ref" >/dev/null; out="$(Q run)"
+assert_not_contains "A4 (4a): no Sniff: line in this run: nothing sniffed" "$out" "sniffing"
+assert_contains "A4 (4a): no Sniff: line in this run: the earlier hard flags still fail it" "$out" \
+  "FAILED fix/sniffref: the sniff of the reviews' requests has 2 hard flag(s) (sniff: $sf)"
+assert_contains "A4 (4a): no Sniff: line in this run: job_failed review/sniff" "$(ev fix/sniffref 'failed()')" "review/sniff"
+assert "A4 (4a): no Sniff: line in this run: no e2e" test ! -s "$TQ/npm.log"
+# Hard flags at a commit, then a sniff with none: they still add up, also on a re-queue that sniffs nothing new.
+reset_pr; mkwt sum4a; h="$(s12 sum4a)"; sf="$PR_QUEUE_DIR/reviews/fix-sum4a-$h-sniff.md"
+echo 'Sniff: sum4a.txt:99 is the fix | sum4a.txt:99 | one line' > "$TQ/code_sniff"
+Q add "$TMP/wt-sum4a" fix "Sum" >/dev/null; Q run >/dev/null
+echo 'Sniff: sum4a.txt:1 says sum4a | sum4a.txt:1 | check it' > "$TQ/code_sniff"
+Q add --review high "$TMP/wt-sum4a" fix "Sum" >/dev/null; out="$(Q run)"
+assert_contains "A4 (4a): a clean sniff after a hard one: the clean one ran" "$(cat "$sf")" "Flags: 0 hard, 0 soft"
+assert_contains "A4 (4a): a clean sniff after a hard one: the hard flag still counts" "$out" \
+  "FAILED fix/sum4a: the sniff of the reviews' requests has 1 hard flag(s) (sniff: $sf)"
+: > "$TQ/npm.log"; Q add "$TMP/wt-sum4a" fix "Sum" >/dev/null; out="$(Q run)"
+assert_contains "A4 (4a): a re-queue after the clean sniff: already sniffed" "$out" "sniff: sum4a.txt:1 says sum4a: already sniffed at"
+assert_contains "A4 (4a): a re-queue after the clean sniff: every block's hard flags add up" "$out" \
+  "FAILED fix/sum4a: the sniff of the reviews' requests has 1 hard flag(s) (sniff: $sf)"
+assert_contains "A4 (4a): a re-queue after the clean sniff: job_failed review/sniff" "$(ev fix/sum4a 'failed()')" "review/sniff"
+assert "A4 (4a): a re-queue after the clean sniff: no e2e" test ! -s "$TQ/npm.log"
 # With a judge that fails the job, the sniff's hard flags end its message; the judge gets the sniff file, and
 # its own Sniff: lines are never run.
 reset_pr; mkwt sniffjudge; echo "needs changes" > "$TQ/verdict"
@@ -1139,8 +1164,11 @@ assert_contains "A5 (4a): job_failed judge/judge" "$(ev fix/sniffjudge 'failed()
 assert_contains "A13 (4a): the judge gets the sniff file" "$(grep '^judge-sniff ' "$TQ/claude.log")" \
   "Sniff results on this commit (read with cat): $sf. Use them only"
 assert_not_contains "A12 (4a): the judge's Sniff: line isn't sniffed" "$(cat "$sf")" "judgeclaim"
-Q add "$TMP/wt-sniffjudge" fix "Sniff judge" >/dev/null; out="$(Q run)"
+: > "$TQ/claude.log"; Q add "$TMP/wt-sniffjudge" fix "Sniff judge" >/dev/null; out="$(Q run)"
 assert_contains "A12 (4a): a re-queue reads the reviews again" "$out" "already sniffed at"
+assert_not_contains "A13 (4a): an already-sniffed re-queue: nothing sniffed now" "$out" "sniffing"
+assert_contains "A13 (4a): an already-sniffed re-queue: the judge still gets the sniff file" "$(grep '^judge-sniff ' "$TQ/claude.log")" \
+  "Sniff results on this commit (read with cat): $sf. Use them only"
 assert_not_contains "A12 (4a): not the judge's file" "$(cat "$sf") $out" "judgeclaim"
 # A new commit, judged again with changes to make: the second round needs the user, with the sniff's flags.
 git -C "$TMP/wt-sniffjudge" commit -q --allow-empty -m again
@@ -1221,7 +1249,7 @@ assert_contains "A10 (4a): a cut-off block: its hard flag fails the job" "$out" 
 # <why> is no flag. The sniff's temp folder is removed after it ran.
 reset_pr; mkwt forms4a; h="$(s12 forms4a)"; sf="$PR_QUEUE_DIR/reviews/fix-forms4a-$h-sniff.md"
 rm -rf "$TQ/tmp4a"; mkdir -p "$TQ/tmp4a"
-printf '1. Sniff: forms4a.txt:1 numbered | forms4a.txt:1 | gone.txt:5 is only in why\n* Sniff: forms4a.txt:1 starred | forms4a.txt:1 | a\n+ Sniff: forms4a.txt:1 plussed | forms4a.txt:1 | b\n' > "$TQ/code_sniff"
+printf 'the docs say Sniff: forms4a.txt:1 prose | forms4a.txt:1 | z\n1. Sniff: forms4a.txt:1 numbered | forms4a.txt:1 | gone.txt:5 is only in why\n* Sniff: forms4a.txt:1 starred | forms4a.txt:1 | a\n+ Sniff: forms4a.txt:1 plussed | forms4a.txt:1 | b\n' > "$TQ/code_sniff"
 printf '__Sniff:__ forms4a.txt:1 underscored | forms4a.txt:1 | c__\n1) Sniff: forms4a.txt:1 paren | forms4a.txt:1 | d\n- Sniff: forms4a.txt:1 piped | forms4a.txt:1 | e | f, a pipe in why\n' > "$TQ/tests_sniff"
 printf '  - Sniff: forms4a.txt:1 indented | forms4a.txt:1 | g\n**Sniff**: forms4a.txt:1 bold label | forms4a.txt:1 | h\nSniff: forms4a.txt:1 glob | forms4a.txt:1 | matches *\nSniff: forms4a.txt:1 two parts | forms4a.txt:1\nSniff: forms4a.txt:1 no why | forms4a.txt:1 |\n' >> "$TQ/tests_sniff"
 printf 'max_sniff_requests=6\n' > "$TMP/limit6.conf"
@@ -1235,6 +1263,7 @@ assert_contains "A3 (4a): a 1) Sniff: line is sniffed" "$(cat "$sf")" "Sniffed 5
 assert_contains "A9 (4a): a | in <why> stays in it" "$(cat "$sf")" "Sniffed 6: forms4a.txt:1 piped | forms4a.txt:1 | e | f, a pipe in why
 "
 assert_contains "A2 (4a): <why> isn't sniffed: no flag for its reference" "$(cat "$sf")" "Flags: 0 hard, 0 soft"
+assert_not_contains "A3 (4a): a Sniff: in the middle of a line isn't a request" "$(cat "$sf")" "prose"
 assert_contains "A3 (4a): an indented Sniff: line is sniffed" "$(cat "$sf")" "Sniffed 7: forms4a.txt:1 indented | forms4a.txt:1 | g"
 assert_contains "A3 (4a): a **Sniff**: line is sniffed" "$(cat "$sf")" "Sniffed 8: forms4a.txt:1 bold label | forms4a.txt:1 | h"
 assert_contains "A3 (4a): a line without emphasis keeps its last *" "$(cat "$sf")" "Sniffed 9: forms4a.txt:1 glob | forms4a.txt:1 | matches *"
@@ -1345,7 +1374,7 @@ assert "A17 (4a): exit 4: no sniff file"          test -z "$(sniffs_of nested4a)
 reset_pr; mkwt limit4a; printf 'echo noise\nmax_sniff_requests=2\n' > "$TMP/limit2.conf"   # its output isn't read as the value
 printf 'Sniff: limit4a.txt:1 one | limit4a.txt:1 | a\nSniff: limit4a.txt:1 two | limit4a.txt:1 | b\nSniff: limit4a.txt:1 three | limit4a.txt:1 | c\n' > "$TQ/code_sniff"
 printf 'Sniff: only a claim\nSniff: limit4a.txt:1 four | limit4a.txt:1 | d\nSniff: limit4a.txt:1 five | | e\nSniff: limit4a.txt:1 six | limit4a.txt:1 | f\n' > "$TQ/tests_sniff"
-h="$(s12 limit4a)"; Q add "$TMP/wt-limit4a" fix "Limit" >/dev/null; out="$(SNIFF_CONFIG="$TMP/limit2.conf" Q run)"
+h="$(s12 limit4a)"; echo fail > "$TQ/checks_seq"; Q add "$TMP/wt-limit4a" fix "Limit" >/dev/null; out="$(SNIFF_CONFIG="$TMP/limit2.conf" Q run)"
 sf="$(sniffs_of limit4a)"
 assert_contains "A7 (4a): the third line is refused" "$out" \
   "sniff: $(revfile limit4a medium-notests.md): Sniff line 3 refused: over the limit of 2 per session"
@@ -1361,6 +1390,13 @@ assert_contains "A7 (4a): two well-formed lines of a review: both run" "$(cat "$
 assert_contains "A7 (4a): the refused lines don't count" "$(cat "$sf")" "Sniffed 4: limit4a.txt:1 six | limit4a.txt:1 | f"
 assert_not_contains "A7 (4a): the test review's lines aren't over the limit" "$out" "Sniff line 4 refused"
 assert_contains "A7 (4a): the input: one line per request" "$(cat "$sf")" "Flags: 0 hard, 0 soft"
+assert_contains "A7 (4a): the job goes on (to the checks)" "$out" "FAILED fix/limit4a: checks failed"
+# A re-queue of the commit: its already-sniffed lines still count toward the limit, so line 3 stays refused.
+rm -f "$TQ/checks_seq"; Q add "$TMP/wt-limit4a" fix "Limit" >/dev/null; out="$(SNIFF_CONFIG="$TMP/limit2.conf" Q run)"
+assert_contains "A7 (4a): a re-queue: the lines already sniffed" "$out" "sniff: limit4a.txt:1 two: already sniffed at"
+assert_contains "A7 (4a): a re-queue: they count, so line 3 is still refused" "$out" \
+  "sniff: $(revfile limit4a medium-notests.md): Sniff line 3 refused: over the limit of 2 per session"
+assert_not_contains "A7 (4a): a re-queue: nothing sniffed" "$out" "sniffing"
 assert_contains "A7 (4a): merged"                 "$out" "MERGED fix/limit4a"
 assert "A7 (4a): the committed limit is 3"        grep -qx 'max_sniff_requests=3' "$ROOT/scripts/queue/sniff.conf"
 reset_pr; mkwt zero4a; printf 'max_sniff_requests=0\n' > "$TMP/limit0.conf"
@@ -1368,6 +1404,7 @@ echo 'Sniff: zero4a.txt:99 one | zero4a.txt:1 | a' > "$TQ/code_sniff"
 Q add "$TMP/wt-zero4a" fix "Zero" >/dev/null; out="$(SNIFF_CONFIG="$TMP/limit0.conf" Q run)"
 assert_contains "A7 (4a): a limit of 0 refuses every line" "$out" "Sniff line 1 refused: over the limit of 0 per session"
 assert "A7 (4a): a limit of 0: no sniff file"    test -z "$(sniffs_of zero4a)"
+assert_not_contains "A7 (4a): a limit of 0: nothing to sniff is no error" "$out" "can't read the reviews' Sniff: lines"
 assert_contains "A7 (4a): a limit of 0: merged"  "$out" "MERGED fix/zero4a"
 # A missing or invalid limit: no line runs, the log says why, the job goes on.
 for c in nokey bad trail; do

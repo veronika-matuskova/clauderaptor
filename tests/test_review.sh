@@ -1206,7 +1206,12 @@ assert_contains "A14 (4a): the review gets HEAD's own sniff file too" "$(cat "$S
   "$REVIEW_DIR/feat-notes-$p1-sniff.md $REVIEW_DIR/feat-notes-$sha-sniff.md."
 rm "$REVIEW_DIR/feat-notes-$sha-sniff.md"
 # Two sniff files of the same second (stat's whole seconds): the older commit's first, whatever their paths'
-# order. The loop makes the newer commit's path sort first, so path order alone would put it first.
+# order. The loop makes the newer commit's path sort first, so path order alone would put it first. Empty
+# commits first bring the older one to 10^k - 1 commits and the newer one to 10^k or more (e.g. 99 and 100), so
+# their counts compare right only as numbers, not as text.
+d="$(git -C "$W" rev-list --count HEAD)"; edge=$(( 10 ** ${#d} - 2 ))
+if [ "$d" -gt "$edge" ]; then edge=$(( 10 ** (${#d} + 1) - 2 )); fi
+while [ "$(git -C "$W" rev-list --count HEAD)" -lt "$edge" ]; do git -C "$W" commit -q --allow-empty -m pad; done
 commit tie1; ta="$sha"; commit tie2; tb="$sha"
 while [[ "$tb" > "$ta" ]]; do commit tie2; tb="$sha"; done
 fa="$REVIEW_DIR/feat-notes-$ta-sniff.md"; fb="$REVIEW_DIR/feat-notes-$tb-sniff.md"

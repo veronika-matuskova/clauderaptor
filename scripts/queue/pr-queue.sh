@@ -44,6 +44,13 @@
 #      requests has <n> hard flag(s) (sniff: <file>)") if the judge lets it go on, and ends the message of any
 #      other failure of this step ("; the sniff has <n> hard flag(s) ..."); soft flags only add a line to the log,
 #      and a sniff that didn't run (sniff.sh exit 4) only "the sniff didn't run: <reason>". No Sniff: line: no sniff.
+#      Then, when a review needs changes and the judge runs, the queue checks each such review's file references
+#      (sniff.sh --findings, mechanically: a file or file:line that is neither at the reviewed commit nor at its
+#      base; not its Sniff: lines, nor the text after a "Fix:") and appends the marks, "reference not found", to
+#      the sniff file as "## References of the findings in <review file> ...", for the judge: a finding with a
+#      wrong reference is the review's mistake. A mark never fails the job, adds no hard flag, no Flags: line and
+#      no event; the log says "<n> reference(s) in the findings of <review file> not found at <sha> (sniff:
+#      <file>)", and a check that didn't run only "the reference check of <review file> didn't run: <reason>".
 #      A Ctrl-C of the runner, a hangup, or a TERM to its whole process group (kill -- -<pgid>), stops the
 #      reviews, the judge and their sessions; a kill of the runner's pid alone leaves its job running;
 #   3. if the repo has scripts/e2e-gate.mjs and the commit has no local pass: `npm run test:e2e:full`, under the lock.
@@ -411,8 +418,7 @@ sniff_reviews() {
     echo "   the sniff didn't run: ${reason:-sniff.sh exited $rc}" | tee -a "$LOG"
     rm -rf "$sniff_tmp"; sniff_tmp=""; return 0
   fi
-  local new=""; if [ ! -s "$sniff_file" ]; then new=1; fi
-  { if [ -n "$new" ]; then printf '# Sniff of the reviews'"'"' requests: %s at %s\n\n' "$BRANCH" "$sha"; fi
+  { sniff_title "$sha"
     printf '## Requests of %s (sniff.sh at %s)\n\n' "$(date '+%F %T')" "$sha"
     cat "$sniff_tmp/block"; printf '### Flags\n\n'; cat "$sniff_tmp/out"; echo; } >> "$sniff_file" 2>>"$LOG" ||
     echo "   can't write the sniff to $sniff_file; its flags still count for this job" | tee -a "$LOG"
@@ -420,6 +426,34 @@ sniff_reviews() {
   sniff_run_hard="$(sed -n 's/^Flags: \([0-9]*\) hard.*/\1/p' <<<"$flags")"; sniff_run_hard="${sniff_run_hard:-0}"
   sniff_soft="$(sed -n 's/.*, \([0-9]*\) soft$/\1/p' <<<"$flags")"; sniff_soft="${sniff_soft:-0}"
   rm -rf "$sniff_tmp"; sniff_tmp=""
+}
+# sniff_title <sha>: the sniff file's title line, if $sniff_file is new (or empty).
+sniff_title() {
+  if [ ! -s "$sniff_file" ]; then printf '# Sniff of the reviews'"'"' requests: %s at %s\n\n' "$BRANCH" "$1"; fi
+}
+# sniff_findings <sha> <review file>...: checks the file references of the reviews that need changes, at the
+# reviewed commit or its base (sniff.sh --findings, mechanical), before the judge. A review with marks gets a
+# block in $sniff_file: "## References of the findings in <review file> (...)" and the marks, never a Flags: line,
+# so the marks fail nothing and add no hard flag (sniff_hard_of, sniff_parse read the file as before). A mark is
+# the review's mistake, not the agent's: it only tells the judge. A check that didn't run only adds a log line.
+sniff_findings() {
+  local sha="$1" short f rc n reason; shift
+  short="$(git rev-parse --short "$sha")"
+  for f in "$@"; do
+    sniff_tmp="$(mktemp -d)" || { echo "   the reference check of $f didn't run: can't create a temp folder" | tee -a "$LOG"; continue; }
+    bash "$HERE/sniff.sh" "$f" --findings --repo "$PWD" --commit "$sha" </dev/null >"$sniff_tmp/out" 2>"$sniff_tmp/err"; rc=$?
+    if [ "$rc" -gt 1 ]; then
+      reason="$(head -1 "$sniff_tmp/err")"; reason="${reason#sniff: }"
+      echo "   the reference check of $f didn't run: ${reason:-sniff.sh exited $rc}" | tee -a "$LOG"
+    elif [ "$rc" -eq 1 ] && grep -v '^Flags: ' "$sniff_tmp/out" | grep . > "$sniff_tmp/marks"; then
+      n="$(wc -l < "$sniff_tmp/marks")"
+      { sniff_title "$sha"; printf '## References of the findings in %s (sniff.sh --findings at %s)\n\n' "$f" "$sha"
+        cat "$sniff_tmp/marks"; echo; } >> "$sniff_file" 2>>"$LOG" ||
+        echo "   can't write the reference check to $sniff_file" | tee -a "$LOG"
+      echo "   $n reference(s) in the findings of $f not found at $short (sniff: $sniff_file)" | tee -a "$LOG"
+    fi
+    rm -rf "$sniff_tmp"; sniff_tmp=""
+  done
 }
 # sniff_hard_of <sniff file>: the hard flags of every sniff in it (the sum of its Flags: lines), 0 without one.
 sniff_hard_of() {
@@ -556,6 +590,9 @@ process() {
       failjob review "$reason" "${findings#; }$stail" found:list="${found_kinds%$'\n'}"; return
     fi
     if [ ${#found[@]} -gt 0 ]; then
+      # The findings' file references that don't exist, marked for the judge in the sniff file.
+      sniff_findings "$reviewed" "${found[@]}"
+      if [ -f "$sniff_file" ]; then sniff_env=(REVIEW_SNIFF="$sniff_file"); fi
       echo "   judging the findings (review.sh --judge)" | tee -a "$LOG"
       emit review_started kind=judge level:opt=
       judge_out="$(mktemp)"

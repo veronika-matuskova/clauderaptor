@@ -56,7 +56,8 @@
 # findings that name a criterion, not to look for others. (The cache doesn't go by the brief: a commit reviewed
 # as ready without one isn't reviewed again with one.)
 # REVIEW_SNIFF=<file> gives a judge the commit's sniff file (pr-queue.sh's <branch>-<sha>-sniff.md: the reviews'
-# Sniff: requests and their flags), to use only for the findings it concerns; a missing file exits 2.
+# Sniff: requests and their flags, and the findings' file references that sniff.sh --findings marked
+# "reference not found"), to use only for the findings it concerns; a missing file exits 2.
 # A code or test review is told that it may ask for a sniff of a claim it doubts (in the brief, or in the code's
 # comments or docs), with at most max_sniff_requests lines "Sniff: <claim> | <where> | <why>" (sniff.conf, or
 # $SNIFF_CONFIG; not told without a valid value), which pr-queue.sh checks at the commit. It also gets the branch's

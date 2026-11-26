@@ -921,4 +921,146 @@ assert "--answer: a missing file: exit 4" test "$rc" = 4
 sn 'Plain.' --answer
 assert_contains "--answer with no value" "$out" "sniff: --answer needs the earlier sniff output"
 
+echo "-- findings mode (--findings): a review's file references, at the commit or its base"
+# FR: main has long.txt (10 lines), gone.txt (5) and keep.sh; the branch feat shortens long.txt to 4 lines,
+# deletes gone.txt and adds new.txt (2 lines). HEAD stays on main.
+FR="$TMP/frepo"; git init -q -b main "$FR"; seq 10 > "$FR/long.txt"; seq 5 > "$FR/gone.txt"; echo 'echo keep' > "$FR/keep.sh"
+git -C "$FR" add -A; git -C "$FR" commit -q -m base; FB="$(git -C "$FR" rev-parse --short=12 HEAD)"
+git -C "$FR" checkout -q -b feat; seq 4 > "$FR/long.txt"; git -C "$FR" rm -q gone.txt; seq 2 > "$FR/new.txt"
+git -C "$FR" add -A; git -C "$FR" commit -q -m feat; FC="$(git -C "$FR" rev-parse HEAD)"; FS="${FC:0:12}"; git -C "$FR" checkout -q main
+rm -f "$TMP/claude-calls" "$TMP/session-calls"
+# fs <text> [args...]: --findings on the text, at feat in FR (both stub claudes on PATH); out, rc, err (stderr)
+fs() {
+  local t="$1"; shift; printf '%s\n' "$t" > "$TMP/review.md"
+  out="$(PATH="$TMP/sbin:$PATH" bash "$S" "$TMP/review.md" --findings --repo "$FR" --commit feat "$@" 2>"$TMP/err")"; rc=$?; err="$(cat "$TMP/err")"
+}
+fs 'important: long.txt:20 is where the bug is.'
+assert "A1 (4b): past the end at both: the mark, with both lengths" test "$out" = \
+  "soft missing reference (line 1): long.txt:20 — reference not found: long.txt:20, but long.txt has 4 lines at $FS and 10 at the base $FB
+Flags: 0 hard, 1 soft"
+assert "A1 (4b): a mark: exit 1" test "$rc" = 1
+fs $'Intro.\nnew.txt:9 and gone.txt:9.'
+assert_contains "A1 (4b): a file only at the commit: isn't at the base" "$out" \
+  "soft missing reference (line 2): new.txt:9 — reference not found: new.txt:9, but new.txt has 2 lines at $FS and isn't at the base $FB"
+assert_contains "A1 (4b): a file only at the base: isn't at the commit" "$out" \
+  "soft missing reference (line 2): gone.txt:9 — reference not found: gone.txt:9, but gone.txt isn't at $FS and has 5 lines at the base $FB"
+assert_contains "A1 (4b): two marks, soft" "$out" "Flags: 0 hard, 2 soft"
+fs 'Last line new.txt:2, one past it new.txt:3.'
+assert_not_contains "A2 (4b): the last line at the commit isn't marked" "$out" "new.txt:2 —"
+assert_contains "A2 (4b): one past the last line is marked" "$out" \
+  "soft missing reference (line 1): new.txt:3 — reference not found: new.txt:3, but new.txt has 2 lines at $FS and isn't at the base $FB"
+assert_contains "A2 (4b): the line boundary: one mark" "$out" "Flags: 0 hard, 1 soft"
+fs 'Ranges new.txt:1-2 and new.txt:1-3.'
+assert_not_contains "A2 (4b): a range ending on the last line isn't marked" "$out" "new.txt:1-2 —"
+assert_contains "A2 (4b): a range ending one past it is marked" "$out" "soft missing reference (line 1): new.txt:1-3 — reference not found: new.txt:1-3, but new.txt has 2 lines at $FS"
+assert_contains "A2 (4b): ranges: one mark" "$out" "Flags: 0 hard, 1 soft"
+fs 'Columns new.txt:2:7 and new.txt:3:1.'
+assert_not_contains "A2 (4b): file:line:col on the last line isn't marked (the column isn't the line)" "$out" "new.txt:2:7 —"
+assert_contains "A2 (4b): file:line:col counts as its line" "$out" "soft missing reference (line 1): new.txt:3:1 — reference not found: new.txt:3:1, but new.txt has 2 lines at $FS"
+assert_contains "A2 (4b): columns: one mark" "$out" "Flags: 0 hard, 1 soft"
+fs 'At the base: long.txt:10, one past it long.txt:11.'
+assert_not_contains "A3 (4b): the base's last line isn't marked" "$out" "long.txt:10 —"
+assert_contains "A3 (4b): one past the base's last line is marked" "$out" "soft missing reference (line 1): long.txt:11 — reference not found: long.txt:11, but long.txt has 4 lines at $FS and 10 at the base $FB"
+fs 'The old side: long.txt:8, gone.txt:3, gone.txt and `gone.txt`.'
+assert "A3 (4b): a line or a file only on the old side isn't marked" test "$out" = "Flags: 0 hard, 0 soft"
+assert "A3 (4b): the old side: exit 0" test "$rc" = 0
+fs 'Neither: nothere.txt:1 and nothere.sh.'
+assert_contains "A3 (4b): a file:line at neither" "$out" "soft missing reference (line 1): nothere.txt:1 — reference not found: nothere.txt isn't in the tree at $FS or at the base $FB"
+assert_contains "A3 (4b): a file at neither" "$out" "soft missing reference (line 1): nothere.sh — reference not found: nothere.sh isn't in the tree at $FS or at the base $FB"
+fs $'important: x is broken. Fix: add missing4b.txt and gone4b.sh:3\nThen missing4b.txt is cited.'
+assert_not_contains "A4 (4b): a file after Fix: isn't checked" "$out" "(line 1)"
+assert_contains "A4 (4b): the same file before a Fix: (on another line) is marked" "$out" \
+  "soft missing reference (line 2): missing4b.txt — reference not found: missing4b.txt isn't in the tree at $FS or at the base $FB"
+assert_contains "A4 (4b): Fix: one mark" "$out" "Flags: 0 hard, 1 soft"
+fs 'See nothere.txt:1. suggested fix: create missing4b.txt'
+assert_contains "A4 (4b): the text before a fix: (any case) is checked" "$out" "(line 1): nothere.txt:1 —"
+assert_not_contains "A4 (4b): the text after a fix: (any case) isn't" "$out" "missing4b.txt"
+fs '- **Fix:** add missing4b.txt'
+assert "A4 (4b): a bold **Fix:** label" test "$out" = "Flags: 0 hard, 0 soft"
+fs 'The prefix: missing4b.txt'
+assert_contains "A4 (4b): fix: inside a word is no Fix:" "$out" "(line 1): missing4b.txt —"
+fs $'Sniff: x.txt:99 | x.txt:99 | y\n- **Sniff:** y.txt:9 | y.txt:9 | z\n1. Sniff: z.txt:9 | z.txt:9 | z'
+assert "A4 (4b): Sniff: request lines aren't checked" test "$out" = "Flags: 0 hard, 0 soft"
+fs 'the docs say Sniff: x.txt:99 | x.txt:99 | y'
+assert_contains "A4 (4b): a Sniff: in the middle of a line is no request: checked" "$out" "(line 1): x.txt:99 —"
+CLAIMS=$'Covered by test_nothere and `gone()`.\nAll tests pass, the e2e suite passed.\nProbably fixed now.'
+fs "$CLAIMS"
+assert "A4 (4b): test_<word>s, name()s, runs and weasel words aren't checked" test "$out" = "Flags: 0 hard, 0 soft"
+fs $'- A1: it works\n\nNot proven: none'
+assert "A4 (4b): proof (Not proven: none) isn't checked" test "$out" = "Flags: 0 hard, 0 soft"
+out="$(bash "$S" "$TMP/review.md" --repo "$FR" --commit feat 2>&1)"
+assert_contains "the same text in the default mode: Not proven: none" "$out" "hard missing proof (line 1): - A1: it works — Not proven: none (line 3)"
+fs "$CLAIMS"
+out="$(bash "$S" "$TMP/review.md" --repo "$FR" --commit feat 2>&1)"
+assert_contains "the same text in the default mode: test_nothere" "$out" "hard missing reference (line 1): test_nothere"
+assert_contains "the same text in the default mode: gone()" "$out" "hard missing reference (line 1): gone()"
+assert_contains "the same text in the default mode: the run" "$out" "soft run that didn't happen (line 2)"
+assert_contains "the same text in the default mode: the weasel word" "$out" "soft weasel words (line 3)"
+fs 'Logs in /tmp/x4b.txt and ~/x4b.md, the file `<branch>-<sha>-sniff.md`, $STATE/x4b.txt and ../x4b.sh.'
+assert "A4 (4b): absolute, ~/, placeholder, \$VAR and ../ paths aren't checked" test "$out" = "Flags: 0 hard, 0 soft"
+fs 'This adds a new file, nothere4b.sh.'
+assert_contains "A4 (4b): marker words don't leave a line alone" "$out" "(line 1): nothere4b.sh —"
+# A ready review with a sidecar past sniff.conf's thresholds: too good to be true in the default mode, not here.
+mkdir -p "$TMP/rv4b"; RVF="$TMP/rv4b/feat-$FS-high.md"; printf '# Review of feat\n\nNo findings.\n\nVerdict: ready\n' > "$RVF"
+printf '{"v": 1, "kind": "code", "sha": "%s", "duration_ms": 1000, "cost_usd": 0.01, "num_turns": 1, "verdict": "ready"}\n' "$FC" > "${RVF%.md}.json"
+out="$(SNIFF_CONFIG="$TMP/th.conf" bash "$S" "$RVF" --repo "$FR" --commit feat 2>&1)"
+assert_contains "the ready review in the default mode: too good to be true" "$out" "soft too good to be true (line 5)"
+out="$(SNIFF_CONFIG="$TMP/th.conf" PATH="$TMP/sbin:$PATH" bash "$S" "$RVF" --findings --repo "$FR" --commit feat 2>&1)"; rc=$?
+assert "A4 (4b): --findings ignores the sidecar: no too good to be true" test "$out" = "Flags: 0 hard, 0 soft"
+assert "A4 (4b): the sidecar ignored: exit 0" test "$rc" = 0
+out="$(SNIFF_CONFIG="$TMP/none.conf" bash "$S" "$RVF" --repo "$FR" --commit feat 2>&1)"
+assert_contains "the ready review in the default mode, with no sniff.conf: didn't run" "$out" "sniff: no thresholds file: $TMP/none.conf"
+out="$(SNIFF_CONFIG="$TMP/none.conf" bash "$S" "$RVF" --findings --repo "$FR" --commit feat 2>&1)"
+assert "--findings reads no sniff.conf" test "$out" = "Flags: 0 hard, 0 soft"
+# The events file isn't opened: a FIFO with no writer would block an open.
+mkfifo "$TMP/ev/fifo.jsonl"
+out="$(STATS_EVENTS_FILE="$TMP/ev/fifo.jsonl" timeout 20 bash "$S" "$RVF" --findings --repo "$FR" --commit feat 2>&1)"; rc=$?
+assert "--findings opens no events file" test "$rc $out" = "0 Flags: 0 hard, 0 soft"
+fs $'# Review of feat at x (/code-review high, cost $0.30, 1 s, opus at high effort)\n\nimportant: long.txt:4, new.txt:2, keep.sh and `long.txt:1-4`: broken\n\nVerdict: needs changes'
+assert "A5 (4b): only valid references: only the Flags line" test "$out" = "Flags: 0 hard, 0 soft"
+assert "A5 (4b): only valid references: exit 0" test "$rc" = 0
+# --commit and --repo arrive: without --commit, the checkout's HEAD (main), where new.txt isn't.
+printf '%s\n' 'See new.txt:1.' > "$TMP/review.md"
+out="$(cd "$FR" && bash "$S" "$TMP/review.md" --findings 2>&1)"
+assert_contains "no --commit: at HEAD, with HEAD as its own base" "$out" \
+  "soft missing reference (line 1): new.txt:1 — reference not found: new.txt isn't in the tree at $FB or at the base $FB"
+fs 'See new.txt:1.'
+assert "--commit feat: new.txt:1 is there" test "$out" = "Flags: 0 hard, 0 soft"
+# The guards.
+fs 'See long.txt:20.' --brief
+assert "A6 (4b): --findings --brief: exit 4" test "$rc" = 4
+assert "A6 (4b): --findings --brief: says why" test "$err" = "sniff: --findings takes no --brief, --session or --answer"
+fs 'See long.txt:20.' --session --author reviewer
+assert "A6 (4b): --findings --session: exit 4" test "$rc" = 4
+assert "A6 (4b): --findings --session: says why" test "$err" = "sniff: --findings takes no --brief, --session or --answer"
+assert "A6 (4b): --findings --session: nothing on stdout" test -z "$out"
+fs 'See long.txt:20.' --answer "$TMP/earlier.txt"
+assert "A6 (4b): --findings --answer: exit 4" test "$rc" = 4
+assert "A6 (4b): --findings --answer: says why" test "$err" = "sniff: --findings takes no --brief, --session or --answer"
+err="$(bash "$S" "$TMP/review.md" --session --findings --repo "$FR" 2>&1 >/dev/null)"; rc=$?
+assert "A6 (4b): --session before --findings: exit 4" test "$rc" = 4
+assert "A6 (4b): --session before --findings: says why" test "$err" = "sniff: --findings takes no --brief, --session or --answer"
+err="$(SNIFF_IN_SESSION=1 bash "$S" "$TMP/review.md" --findings --repo "$FR" 2>&1 >"$TMP/nested.out")"; rc=$?
+assert "A6 (4b): SNIFF_IN_SESSION=1 --findings: exit 4" test "$rc" = 4
+assert "A6 (4b): SNIFF_IN_SESSION=1 --findings: says why" test "$err" = "sniff: a sniff doesn't start another sniff"
+assert "A6 (4b): SNIFF_IN_SESSION=1 --findings: nothing printed" test ! -s "$TMP/nested.out"
+# No default branch (only trunk), then no merge-base (an unrelated main): the commit only.
+NB="$TMP/nobase"; git init -q -b trunk "$NB"; seq 3 > "$NB/one.txt"; git -C "$NB" add -A; git -C "$NB" commit -q -m one
+NS="$(git -C "$NB" rev-parse --short=12 HEAD)"
+printf '%s\n' 'See one.txt:3, one.txt:4 and gone.txt.' > "$TMP/review.md"
+out="$(bash "$S" "$TMP/review.md" --findings --repo "$NB" 2>&1)"; rc=$?
+assert_contains "A6 (4b): no default branch: a line past the end, at the commit only" "$out" \
+  "soft missing reference (line 1): one.txt:4 — reference not found: one.txt:4, but one.txt has 3 lines at $NS (no base: no default branch)"
+assert_contains "A6 (4b): no default branch: a file, at the commit only" "$out" \
+  "soft missing reference (line 1): gone.txt — reference not found: gone.txt isn't in the tree at $NS (no base: no default branch)"
+assert_not_contains "A6 (4b): no default branch: the last line isn't marked" "$out" "one.txt:3 —"
+assert_contains "A6 (4b): no default branch: two marks" "$out" "Flags: 0 hard, 2 soft"
+assert "A6 (4b): no default branch: exit 1" test "$rc" = 1
+git -C "$NB" checkout -q --orphan main; git -C "$NB" rm -rfq .; seq 9 > "$NB/one.txt"; git -C "$NB" add -A; git -C "$NB" commit -q -m unrelated
+out="$(bash "$S" "$TMP/review.md" --findings --repo "$NB" --commit trunk 2>&1)"
+assert_contains "no merge-base with main: at the commit only" "$out" \
+  "soft missing reference (line 1): one.txt:4 — reference not found: one.txt:4, but one.txt has 3 lines at $NS (no base: no default branch)"
+assert "A6 (4b): no --findings run called claude" test ! -e "$TMP/claude-calls"
+assert "A6 (4b): no --findings run called the session stub" test ! -e "$TMP/session-calls"
+
 finish

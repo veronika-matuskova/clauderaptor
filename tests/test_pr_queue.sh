@@ -160,6 +160,8 @@ printf '#!/usr/bin/env bash\n[ ! -f "$TQ/push_reject" ]\n' > "$TMP/origin.git/ho
 R="$TMP/repo"; git clone -q "$TMP/origin.git" "$R" 2>/dev/null
 RQ="$PR_QUEUE_DIR/repos/repo"   # the queue of R's repo
 mkdir -p "$R/scripts"; touch "$R/scripts/e2e-gate.mjs"
+# a.txt (one line): the stub claude's every result cites a.txt:1, a reference that must hold (sniff.sh --findings).
+echo a > "$R/a.txt"
 cat > "$R/scripts/create-pr.sh" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >> "$TQ/created.log"
@@ -1455,6 +1457,188 @@ assert "A10 (4a): a new commit has its own sniff file" test -n "$sf2" -a "$sf2" 
 assert_contains "A10 (4a): sniffed again there" "$(cat "$sf2")" "Sniffed 1: again4a.txt:1 says again4a | again4a.txt:1 | check it"
 assert_contains "A6 (4a): no flags: the sniff file says so" "$(cat "$sf2")" "Flags: 0 hard, 0 soft"
 assert_contains "A6 (4a): no flags: merged" "$out" "MERGED fix/again4a"
+
+# --- the findings' file references (sniff.sh --findings), before the judge: marked in the sniff file, fail nothing ---
+# base12: origin's main, 12 characters: the base of a branch that mkwt just made.
+base12() { git --git-dir="$TMP/origin.git" rev-parse --short=12 main; }
+# A code review that needs changes cites a line past the end of the job's one-line file; the judge is ready.
+reset_pr; mkwt refs4b; h="$(s12 refs4b)"; b="$(base12)"; full="$(git -C "$TMP/wt-refs4b" rev-parse HEAD)"
+short="$(git -C "$TMP/wt-refs4b" rev-parse --short HEAD)"; sf="$PR_QUEUE_DIR/reviews/fix-refs4b-$h-sniff.md"
+echo "needs changes" > "$TQ/verdict"; echo ready > "$TQ/judge_verdict"; echo 'important: refs4b.txt:500: broken' > "$TQ/code_sniff"
+rm -rf "$TQ/tmp4b"; mkdir -p "$TQ/tmp4b"
+Q add "$TMP/wt-refs4b" fix "Refs" >/dev/null; out="$(TMPDIR="$TQ/tmp4b" Q run)"
+assert_contains "A7 (4b): the sniff file has a block for the code review" "$(cat "$sf")" \
+  "## References of the findings in $(revfile refs4b medium-notests.md) (sniff.sh --findings at $full)
+
+soft missing reference (line 4): refs4b.txt:500 — reference not found: refs4b.txt:500, but refs4b.txt has 1 lines at $h and isn't at the base $b"
+assert_contains "A7 (4b): the mark names the reference" "$(cat "$sf")" "refs4b.txt:500 — reference not found:"
+assert "A7 (4b): a new sniff file gets 4a's title" test "$(head -1 "$sf")" = "# Sniff of the reviews' requests: fix/refs4b at $full"
+assert_contains "A7 (4b): the log line" "$(cat "$RQ/logs/fix/refs4b.log")" \
+  "   1 reference(s) in the findings of $(revfile refs4b medium-notests.md) not found at $short (sniff: $sf)"
+assert "A7 (4b): the judge gets the sniff file, with 4a's line" test "$(grep '^judge-sniff ' "$TQ/claude.log")" = \
+  "judge-sniff - Sniff results on this commit (read with cat): $sf. Use them only for the findings they concern."
+assert_contains "A7 (4b): the job goes on: merged" "$out" "MERGED fix/refs4b"
+assert "A7 (4b): no temp files left" test -z "$(ls -A "$TQ/tmp4b")"
+assert "A8 (4b): the references block has no Flags: line" test "$(grep -c '^Flags: ' "$sf")" = 0
+assert_not_contains "A8 (4b): a mark is no hard flag" "$out" "hard flag"
+refs_events="$(ev fix/refs4b 'names()')"
+# The same run with no bad reference: the review's only reference (the stub's a.txt:1) is valid, and no Sniff: line.
+reset_pr; mkwt refsok4b; echo "needs changes" > "$TQ/verdict"; echo ready > "$TQ/judge_verdict"
+Q add "$TMP/wt-refsok4b" fix "Refs ok" >/dev/null; out="$(Q run)"
+assert "A12 (4b): only valid references: no sniff file" test -z "$(sniffs_of refsok4b)"
+assert "A12 (4b): only valid references: the judge gets no sniff file" test -z "$(grep '^judge-sniff ' "$TQ/claude.log")"
+assert_contains "A12 (4b): only valid references: the judge ran" "$(judge_line)" "Reviews to judge (read each with cat): $PR_QUEUE_DIR/reviews/fix-refsok4b-"
+assert_not_contains "A12 (4b): only valid references: no log line" "$(cat "$RQ/logs/fix/refsok4b.log")" "reference"
+assert_contains "A12 (4b): only valid references: merged" "$out" "MERGED fix/refsok4b"
+assert "A15 (4b): a mark adds no event" test "$refs_events" = "$(ev fix/refsok4b 'names()')"
+assert_contains "A15 (4b): the events of a judged, merged job" "$refs_events" "review_finished review_started review_finished e2e_waiting"
+# A 4a Sniff: request with a hard flag and a marked finding: only the sniff's hard flag counts.
+reset_pr; mkwt hard4b; h="$(s12 hard4b)"; sf="$PR_QUEUE_DIR/reviews/fix-hard4b-$h-sniff.md"
+echo "needs changes" > "$TQ/verdict"; echo ready > "$TQ/judge_verdict"
+printf 'Sniff: hard4b.txt:99 is the fix | hard4b.txt:99 | one line\nimportant: hard4b.txt:77: broken\n' > "$TQ/code_sniff"
+Q add "$TMP/wt-hard4b" fix "Hard" >/dev/null; out="$(Q run)"
+assert_contains "A8 (4b): the 4a block, then the references block" "$(cat "$sf")" \
+  "Flags: 1 hard, 0 soft
+
+## References of the findings in $(revfile hard4b medium-notests.md)"
+assert_contains "A8 (4b): the finding is marked" "$(cat "$sf")" "(line 5): hard4b.txt:77 — reference not found:"
+assert_not_contains "A8 (4b): the Sniff: request isn't marked" "$(sed -n '/^## References of/,$p' "$sf")" "hard4b.txt:99"
+assert_contains "A8 (4b): the failure counts the sniff's hard flag only" "$out" \
+  "FAILED fix/hard4b: the sniff of the reviews' requests has 1 hard flag(s) (sniff: $sf)"
+assert_contains "A8 (4b): job_failed review/sniff" "$(ev fix/hard4b 'failed()')" "review/sniff"
+# A cut-off "## Requests of" block, then a references block this queue writes: the claim is still sniffed again.
+reset_pr; mkwt cut4b; h="$(s12 cut4b)"; sf="$PR_QUEUE_DIR/reviews/fix-cut4b-$h-sniff.md"
+mkdir -p "$PR_QUEUE_DIR/reviews"
+printf '## Requests of then (sniff.sh at x)\n\n### The code review: x.md\n\nSniffed 1: cut4b.txt:1 says cut4b | cut4b.txt:1 | x\n' > "$sf"
+echo "needs changes" > "$TQ/verdict"; echo ready > "$TQ/judge_verdict"; echo 'important: cut4b.txt:9: broken' > "$TQ/code_sniff"
+echo fail > "$TQ/checks_seq"; Q add "$TMP/wt-cut4b" fix "Cut" >/dev/null; out="$(Q run)"
+assert_contains "A8 (4b): the references block follows the cut-off one" "$(cat "$sf")" "Sniffed 1: cut4b.txt:1 says cut4b | cut4b.txt:1 | x
+## References of the findings in"
+assert_contains "A8 (4b): the first run fails at the checks" "$out" "FAILED fix/cut4b: checks failed"
+rm -f "$TQ/checks_seq"; echo 'Sniff: cut4b.txt:1 says cut4b | cut4b.txt:1 | x' > "$TQ/code_sniff"
+Q add "$TMP/wt-cut4b" fix "Cut" >/dev/null; out="$(Q run)"
+assert_not_contains "A8 (4b): the cut-off block isn't taken as sniffed" "$out" "already sniffed"
+assert_contains "A8 (4b): the claim is sniffed again" "$out" "sniffing 1 request(s) of the reviews"
+assert_contains "A8 (4b): and the job merges" "$out" "MERGED fix/cut4b"
+# The check is at the reviewed commit: a file that the merge of main brought in (not on the branch's commit).
+reset_pr; mkwt at4b; advance main4b.txt main
+echo "needs changes" > "$TQ/verdict"; echo ready > "$TQ/judge_verdict"; echo 'important: main4b.txt:1: broken' > "$TQ/code_sniff"
+Q add "$TMP/wt-at4b" fix "At" >/dev/null; out="$(Q run)"
+assert_contains "A9 (4b): main was merged in" "$out" "merged origin/main"
+assert "A9 (4b): a reference from the merged main isn't marked" test -z "$(sniffs_of at4b)"
+assert_not_contains "A9 (4b): no log line" "$out" "reference(s) in the findings"
+assert_contains "A9 (4b): merged" "$out" "MERGED fix/at4b"
+# Both reviews need changes: each one's marks under its own file, the code review's first.
+reset_pr; mkwt tests4b; h="$(s12 tests4b)"; b="$(base12)"; full="$(git -C "$TMP/wt-tests4b" rev-parse HEAD)"
+sf="$PR_QUEUE_DIR/reviews/fix-tests4b-$h-sniff.md"
+echo "needs changes" > "$TQ/verdict"; echo "needs changes" > "$TQ/tests_verdict"; echo ready > "$TQ/judge_verdict"
+printf 'important: tests4b.txt:2: broken\nminor: gone4b.sh is gone\n' > "$TQ/code_sniff"; echo '1. [must-fix] [mutation] gone4b.txt:3: x' > "$TQ/tests_sniff"
+Q add "$TMP/wt-tests4b" fix "Tests" >/dev/null; out="$(Q run)"
+assert_contains "A10 (4b): the code review's block" "$(cat "$sf")" "## References of the findings in $(revfile tests4b medium-notests.md) (sniff.sh --findings at $full)
+
+soft missing reference (line 4): tests4b.txt:2 — reference not found: tests4b.txt:2, but tests4b.txt has 1 lines at $h and isn't at the base $b
+soft missing reference (line 5): gone4b.sh — reference not found: gone4b.sh isn't in the tree at $h or at the base $b
+
+## References of the findings in $(revfile tests4b tests.md)"
+assert_contains "A10 (4b): the test review's block, with its mark" "$(cat "$sf")" "## References of the findings in $(revfile tests4b tests.md) (sniff.sh --findings at $full)
+
+soft missing reference (line 4): gone4b.txt:3 — reference not found: gone4b.txt isn't in the tree at $h or at the base $b"
+assert_contains "A10 (4b): the code review's log line counts its two marks" "$out" "   2 reference(s) in the findings of $(revfile tests4b medium-notests.md) not found at"
+assert_contains "A10 (4b): the test review's log line" "$out" "   1 reference(s) in the findings of $(revfile tests4b tests.md) not found at"
+assert_contains "A10 (4b): merged" "$out" "MERGED fix/tests4b"
+rm -f "$TQ/tests_verdict"
+# Nothing runs without a judge: every review ready, or PR_QUEUE_JUDGE=0.
+for c in ready nojudge; do
+  reset_pr; mkwt "none4b$c"; echo "important: none4b$c.txt:500: broken" > "$TQ/code_sniff"; jz=1
+  if [ "$c" = nojudge ]; then echo "needs changes" > "$TQ/verdict"; jz=0; fi
+  Q add "$TMP/wt-none4b$c" fix "None $c" >/dev/null; out="$(PR_QUEUE_JUDGE=$jz Q run)"
+  assert "A11 (4b): $c: no sniff file" test -z "$(sniffs_of "none4b$c")"
+  assert_not_contains "A11 (4b): $c: no references block" "$(cat "$PR_QUEUE_DIR"/reviews/*-sniff.md)" "fix-none4b$c-"
+  assert_not_contains "A11 (4b): $c: no log line" "$(cat "$RQ/logs/fix/none4b$c.log")" "reference(s) in the findings"
+  assert "A11 (4b): $c: no judge" test -z "$(judge_line)"
+done
+assert_contains "A11 (4b): every review ready: merged" "$(cat "$RQ/results.log")" "MERGED fix/none4bready"
+assert_contains "A11 (4b): PR_QUEUE_JUDGE=0: the review's failure" "$out" "FAILED fix/none4bnojudge: the review found changes to make"
+# A check that didn't run (inside a sniff session, SNIFF_IN_SESSION=1) only adds a log line: the judge runs.
+reset_pr; mkwt nested4b; h="$(s12 nested4b)"
+echo "needs changes" > "$TQ/verdict"; echo ready > "$TQ/judge_verdict"; echo 'important: nested4b.txt:500: broken' > "$TQ/code_sniff"
+Q add "$TMP/wt-nested4b" fix "Nested" >/dev/null; out="$(SNIFF_IN_SESSION=1 Q run)"
+assert_contains "A13 (4b): the check didn't run: says why" "$out" \
+  "   the reference check of $(revfile nested4b medium-notests.md) didn't run: a sniff doesn't start another sniff"
+assert "A13 (4b): the check didn't run: the judge ran" test -n "$(judge_line)"
+assert "A13 (4b): the check didn't run: no sniff file" test -z "$(sniffs_of nested4b)"
+assert_contains "A13 (4b): the check didn't run: merged" "$out" "MERGED fix/nested4b"
+# A sniff file that can't be written: says so, and the judge still runs, with the file.
+reset_pr; mkwt ro4b; h="$(s12 ro4b)"; sf="$PR_QUEUE_DIR/reviews/fix-ro4b-$h-sniff.md"
+mkdir -p "$PR_QUEUE_DIR/reviews"; printf '# Sniff of an earlier job\n' > "$sf"; chmod 444 "$sf"
+echo "needs changes" > "$TQ/verdict"; echo ready > "$TQ/judge_verdict"; echo 'important: ro4b.txt:500: broken' > "$TQ/code_sniff"
+Q add "$TMP/wt-ro4b" fix "Read-only" >/dev/null; out="$(Q run)"; chmod 644 "$sf"
+assert_contains "A13 (4b): a sniff file that can't be written: says so" "$out" "   can't write the reference check to $sf"
+assert "A13 (4b): a sniff file that can't be written: unchanged" test "$(cat "$sf")" = "# Sniff of an earlier job"
+assert_contains "A13 (4b): a sniff file that can't be written: the judge ran, with it" "$(grep '^judge-sniff ' "$TQ/claude.log")" \
+  "Sniff results on this commit (read with cat): $sf. Use them only"
+assert_contains "A13 (4b): a sniff file that can't be written: merged" "$out" "MERGED fix/ro4b"
+# No temp folder for the check: only a log line (4a's sniff says so too), and the judge runs.
+reset_pr; mkwt notmp4b; h="$(s12 notmp4b)"
+echo "needs changes" > "$TQ/verdict"; echo ready > "$TQ/judge_verdict"; echo 'important: notmp4b.txt:500: broken' > "$TQ/code_sniff"
+Q add "$TMP/wt-notmp4b" fix "No tmp" >/dev/null; out="$(PATH="$TQ/failtmp:$PATH" Q run)"
+assert_contains "the check without a temp folder: says so" "$out" \
+  "   the reference check of $(revfile notmp4b medium-notests.md) didn't run: can't create a temp folder"
+assert "the check without a temp folder: the judge ran" test -n "$(judge_line)"
+assert_contains "the check without a temp folder: merged" "$out" "MERGED fix/notmp4b"
+# Through a stub sniff.sh (it logs its arguments, and does what $TQ/findings_do says): the options arrive; exit 1
+# with only a Flags: line is no mark; any exit code above 1 is a check that didn't run; a TERM to the runner's
+# process group while it runs removes its temp folder.
+rm -rf "$TMP/qcopy4b"; mkdir -p "$TMP/qcopy4b"; cp -r "$ROOT/scripts/queue" "$TMP/qcopy4b/"; cp "$ROOT/scripts/capped.sh" "$TMP/qcopy4b/"
+cat > "$TMP/qcopy4b/queue/sniff.sh" <<'EOS'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >> "$TQ/findings.args"
+if [ -f "$TQ/findings_hang" ]; then dirname "$(readlink "/proc/$$/fd/1")" > "$TQ/findings.dir"; touch "$TQ/findings.started"; sleep 30; fi
+case "$(cat "$TQ/findings_do" 2>/dev/null)" in
+  flagsonly) echo "Flags: 0 hard, 0 soft"; exit 1 ;;
+  exit*) exit "$(sed 's/^exit//' "$TQ/findings_do")" ;;
+  *) echo "soft missing reference (line 4): stub4b.txt:9 — reference not found: stub"; echo "Flags: 0 hard, 1 soft"; exit 1 ;;
+esac
+EOS
+QC() { PATH="$TQ/bin:$PATH" bash "$TMP/qcopy4b/queue/pr-queue.sh" "$@" </dev/null 2>&1; }
+for c in marks flagsonly exit2 exit3; do
+  reset_pr; mkwt "stub4b$c"; h="$(s12 "stub4b$c")"; full="$(git -C "$TMP/wt-stub4b$c" rev-parse HEAD)"; sf="$PR_QUEUE_DIR/reviews/fix-stub4b$c-$h-sniff.md"
+  rm -f "$TQ/findings.args"; echo "$c" > "$TQ/findings_do"; echo "needs changes" > "$TQ/verdict"; echo ready > "$TQ/judge_verdict"
+  QC add "$TMP/wt-stub4b$c" fix "Stub $c" >/dev/null; out="$(QC run)"
+  case "$c" in
+    marks)
+      assert "the options reach sniff.sh: the review file, --findings, the worktree and the reviewed commit" \
+        test "$(cat "$TQ/findings.args")" = "$(printf '%s\n' "$(revfile stub4bmarks medium-notests.md)" --findings --repo "$TMP/wt-stub4bmarks" --commit "$full")"
+      assert "a stub's mark: its line, without its Flags: line" test "$(sed -n '/^## References of/,$p' "$sf")" = \
+        "## References of the findings in $(revfile stub4bmarks medium-notests.md) (sniff.sh --findings at $full)
+
+soft missing reference (line 4): stub4b.txt:9 — reference not found: stub" ;;
+    flagsonly)
+      assert "exit 1 with only a Flags: line: no sniff file" test -z "$(sniffs_of stub4bflagsonly)"
+      assert_not_contains "exit 1 with only a Flags: line: no log line" "$out" "reference(s) in the findings" ;;
+    exit*)
+      assert_contains "$c with no reason: the check didn't run" "$out" \
+        "   the reference check of $(revfile "stub4b$c" medium-notests.md) didn't run: sniff.sh exited ${c#exit}"
+      assert "$c: no sniff file" test -z "$(sniffs_of "stub4b$c")" ;;
+  esac
+  assert "$c: the judge ran" test -n "$(judge_line)"
+  assert_contains "$c: merged" "$out" "MERGED fix/stub4b$c"
+done
+reset_pr; mkwt stop4b; rm -rf "$TQ/tmps4b" "$TQ/findings.started" "$TQ/findings.dir"; mkdir -p "$TQ/tmps4b"
+echo "needs changes" > "$TQ/verdict"; echo ready > "$TQ/judge_verdict"; echo marks > "$TQ/findings_do"; touch "$TQ/findings_hang"
+QC add "$TMP/wt-stop4b" fix "Stop" >/dev/null
+PATH="$TQ/bin:$PATH" TMPDIR="$TQ/tmps4b" python3 -I -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+  bash "$TMP/qcopy4b/queue/pr-queue.sh" run </dev/null >/dev/null 2>&1 &
+rpid=$!
+for _ in $(seq 300); do [ -e "$TQ/findings.started" ] && break; sleep 0.1; done
+assert "stop: the check was running" test -e "$TQ/findings.started"
+assert "stop: in its temp folder" test -d "$(cat "$TQ/findings.dir")"
+kill -TERM -- "-$rpid"; { wait "$rpid"; } 2>/dev/null
+for _ in $(seq 100); do [ -z "$(ls -A "$TQ/tmps4b")" ] && flock -n "$RQ/run.lock" true && break; sleep 0.1; done
+assert "stop: the check's temp folder is removed" test ! -e "$(cat "$TQ/findings.dir")"
+assert "stop: no temp files left" test -z "$(ls -A "$TQ/tmps4b")"
+assert "stop: the judge didn't run" test -z "$(judge_line)"
+rm -f "$TQ/findings_hang" "$TQ/findings_do" "$TQ/verdict" "$TQ/judge_verdict" "$RQ"/running/*; rm -rf "$TMP/qcopy4b"
 
 # --- a job left in running/ by a dead runner goes to failed/ ---
 mkwt dead; printf 'worktree=%s\nbranch=fix/dead\n' "$TMP/wt-dead" > "$RQ/running/1-fix-dead.job"

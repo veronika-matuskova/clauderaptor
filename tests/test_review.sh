@@ -1200,10 +1200,24 @@ assert_not_contains "A14 (4a): the test review: not a commit off the branch" "$a
 rm "$sside" "$sother"
 # HEAD's own sniff file too (a review at another level of a commit the queue sniffed), last: it is the newest.
 commit sniff2b; printf 'Flags: 0 hard, 0 soft\n' > "$REVIEW_DIR/feat-notes-$sha-sniff.md"
+touch -d '1 minute ago' "$REVIEW_DIR/feat-notes-$p1-sniff.md"   # an older second than HEAD's file
 rv "$W" >/dev/null
 assert_contains "A14 (4a): the review gets HEAD's own sniff file too" "$(cat "$STUB/args")" \
   "$REVIEW_DIR/feat-notes-$p1-sniff.md $REVIEW_DIR/feat-notes-$sha-sniff.md."
 rm "$REVIEW_DIR/feat-notes-$sha-sniff.md"
+# Two sniff files of the same second (stat's whole seconds): the older commit's first, whatever their paths'
+# order. The loop makes the newer commit's path sort first, so path order alone would put it first.
+commit tie1; ta="$sha"; commit tie2; tb="$sha"
+while [[ "$tb" > "$ta" ]]; do commit tie2; tb="$sha"; done
+fa="$REVIEW_DIR/feat-notes-$ta-sniff.md"; fb="$REVIEW_DIR/feat-notes-$tb-sniff.md"
+printf 'Flags: 0 hard, 0 soft\n' | tee "$fa" > "$fb"; touch -d '@1700000000' "$fa" "$fb"
+commit tie3; rv "$W" >/dev/null
+assert_contains "A14 (4a): the same second: the older commit's file first" "$(cat "$STUB/args")" "$fa $fb "
+# Different seconds: the older file first, even when its commit is the newer one.
+touch -d '@1700000000' "$fb"; touch -d '@1700000060' "$fa"
+commit tie4; rv "$W" >/dev/null
+assert_contains "A14 (4a): different seconds: the older file first, whatever its commit" "$(cat "$STUB/args")" "$fb $fa "
+rm "$fa" "$fb"
 # The judge: REVIEW_SNIFF gives it this commit's sniff file; it isn't told to ask, nor given earlier ones.
 printf 'Ruling.\nVerdict: ready\n' > "$STUB/result"
 cp "$REVIEW_DIR/feat-notes-$p1-sniff.md" "$REVIEW_DIR/feat-notes-$sha-sniff.md"

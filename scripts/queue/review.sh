@@ -60,8 +60,9 @@
 # A code or test review is told that it may ask for a sniff of a claim it doubts (in the brief, or in the code's
 # comments or docs), with at most max_sniff_requests lines "Sniff: <claim> | <where> | <why>" (sniff.conf, or
 # $SNIFF_CONFIG; not told without a valid value), which pr-queue.sh checks at the commit. It also gets the branch's
-# earlier sniff files, <branch>-<sha>-sniff.md of commits HEAD descends from (HEAD's too), oldest first, found
-# like a judge's earlier rulings; none: no such line. The judge, plan and sniff prompts are told neither.
+# earlier sniff files, <branch>-<sha>-sniff.md of commits HEAD descends from (HEAD's too), oldest first (by the
+# file's time, of the same second the older commit's first), found like a judge's earlier rulings; none: no such
+# line. The judge, plan and sniff prompts are told neither.
 # A sniff session (--sniff) runs with SNIFF_IN_SESSION=1 in its environment: sniff.sh refuses to run in it, so a
 # sniff never starts another.
 # A plan (--plan) reads the request file and the checkout's HEAD, which may move meanwhile (only a note), and
@@ -216,8 +217,8 @@ if [ -n "${REVIEW_SNIFF:-}" ] && [ "$mode" = judge ]; then
   [ -f "$REVIEW_SNIFF" ] || die "no such sniff file: $REVIEW_SNIFF"
   sniffed="$(readlink -f "$REVIEW_SNIFF")"
 fi
-# earlier <suffix>: the branch's files <branch>-<sha><suffix> in $dir of commits HEAD descends from, oldest first,
-# one per line: not of another repo's branch of the same name, nor of an earlier branch of that name, merged
+# earlier <suffix>: the branch's files <branch>-<sha><suffix> in $dir of commits HEAD descends from, oldest first
+# (by the file's time; of the same second, the older commit's first), one per line: not of another repo's branch of the same name, nor of an earlier branch of that name, merged
 # (squashed) before. Leaves out $out.
 earlier_files() {
   local prefix="$dir/${branch//\//-}-" f rest list=""
@@ -225,9 +226,11 @@ earlier_files() {
     if [ ! -f "$f" ] || [ "$f" = "${out:-}" ]; then continue; fi
     rest="${f#"$prefix"}"; [[ "$rest" =~ ^([0-9a-f]{7,40})"$1"$ ]] || continue
     git -C "$wt" merge-base --is-ancestor "${BASH_REMATCH[1]}" HEAD 2>/dev/null || continue
-    list+="$(stat -c %Y "$f") $f"$'\n'
+    # The file's time (whole seconds), then its commit's place in the history (an ancestor has fewer commits
+    # than its descendant), so that two files of the same second come in commit order, not by their paths.
+    list+="$(stat -c %Y "$f") $(git -C "$wt" rev-list --count "${BASH_REMATCH[1]}") $f"$'\n'
   done
-  sort -n <<<"$list" | cut -d' ' -f2- | sed '/^$/d'
+  sort -k1,1n -k2,2n <<<"$list" | cut -d' ' -f3- | sed '/^$/d'
 }
 # asking: the paragraph that tells a code or test review how to ask for a sniff; empty when sniff.conf has no
 # valid max_sniff_requests (the queue would run none).

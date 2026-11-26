@@ -23,6 +23,8 @@
   session doesn't rule on findings itself.
   - "the judge confirmed changes to make": goes back to the branch's agent, like a failed test. Send it the judge's
     file (its To fix list), not the reviews.
+  - "the sniff of the reviews' requests has <n> hard flag(s)": goes back to the branch's agent, like a failed test.
+    Send it the sniff file (`<branch>-<sha>-sniff.md`) the failure names.
   - "needs your decision" (the judge rejected a finding that would be critical if real, or the branch needed
     changes in two judged rounds): goes to the user. Show them the judge's file and the reviews, with options, and
     wait. Only then send the agent what the user chose, or queue the branch with `--review none` / `--tests none`.

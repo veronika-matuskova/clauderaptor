@@ -101,8 +101,11 @@
 # input, then "Flags: <h> hard, <s> soft". Exit 0 = no flags, 1 = soft flags only, 2 = a hard flag,
 # 4 = the sniff didn't run (bad arguments, a missing file, not a checkout, an unknown commit, no author or a
 # failed session, a missing threshold, or an error in the sniff itself; the reason on stderr).
+# A sniff doesn't start another one: with SNIFF_IN_SESSION=1 (review.sh --sniff sets it for its session), it
+# exits 4 with "sniff: a sniff doesn't start another sniff" before it checks anything.
 set -uo pipefail
 die() { echo "sniff: $*" >&2; exit 4; }
+if [ "${SNIFF_IN_SESSION:-}" = 1 ]; then die "a sniff doesn't start another sniff"; fi
 usage="usage: sniff.sh <file or -> [--brief] [--repo <checkout>] [--commit <rev>] [--session] [--author planner|developer|reviewer] [--answer <earlier sniff output>]"
 
 input="" repo="" rev="" have_input="" brief=0 session=0 author="" answer=""

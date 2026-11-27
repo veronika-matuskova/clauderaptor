@@ -519,6 +519,21 @@ assert_contains "A17: README.md documents sniff.sh's exit codes" "$readme" "exit
 assert_contains "README.md documents --brief" "$readme" "With \`--brief\`, it sniffs a brief instead"
 assert_contains "README.md's Planner item names the brief's sniff" "$(grep -n "^- Planner:" "$ROOT/README.md")" "saved next to the brief as \`<brief>-sniff.md\`"
 assert_contains "the rule: show the sniff flags with the brief" "$(grep -n "sniff flags" "$ROOT/claude/rules/pr-queue.md")" "Show the user the brief, its open questions and its sniff flags"
+sniff_head="$(sed -n '2,/^set -uo pipefail/p' "$ROOT/scripts/queue/sniff.sh")"
+assert_contains "A17 (4b): the sniff.sh header: the --findings usage line" "$sniff_head" "sniff.sh <review file> --findings [--repo <checkout>] [--commit <rev>]"
+assert_contains "A17 (4b): the sniff.sh header: the --findings paragraph" "$sniff_head" "# Findings mode (--findings, for a code or test review that needs changes"
+assert_contains "A17 (4b): the sniff.sh header: the mark" "$sniff_head" '"<ref> — reference not found:'
+step2="$(sed -n '/^#   2\. /,/^#   3\. /p' "$ROOT/scripts/queue/pr-queue.sh")"
+assert_contains "A17 (4b): pr-queue.sh's step 2 header: sniff.sh --findings" "$step2" "(sniff.sh --findings, mechanically"
+assert_contains "A17 (4b): pr-queue.sh's step 2 header: the marks" "$step2" 'the marks, "reference not found", to'
+assert_contains "A17 (4b): README.md's queue line: --findings and the marks" "$(grep "^- Parallel agents:" "$ROOT/README.md")" \
+  "checks the file references of each review that needs changes with \`sniff.sh --findings\` and adds the ones that aren't at the reviewed commit or its base to that file, marked \`reference not found\`"
+assert_contains "A17 (4b): README.md's sniffer line: --findings" "$(grep "^- Sniffer:" "$ROOT/README.md")" \
+  "With \`--findings\`, for a review that needs changes, it checks only the file references"
+assert_contains "A17 (4b): README.md's sniffer line: the mark" "$(grep "^- Sniffer:" "$ROOT/README.md")" "as a soft \`reference not found\` flag"
+assert_contains "A17 (4b): review.sh's REVIEW_SNIFF comment" "$(grep -A2 '^# REVIEW_SNIFF=' "$ROOT/scripts/queue/review.sh")" \
+  'file references that sniff.sh --findings marked
+# "reference not found")'
 
 echo "-- no session, no transcripts, no changes"
 TEXT=$'See a.js:500, `save()`, later.sh.\n- A2: proven by test_foo\nFixed, should work.\nRan the e2e suite.'
@@ -922,11 +937,12 @@ sn 'Plain.' --answer
 assert_contains "--answer with no value" "$out" "sniff: --answer needs the earlier sniff output"
 
 echo "-- findings mode (--findings): a review's file references, at the commit or its base"
-# FR: main has long.txt (10 lines), gone.txt (5) and keep.sh; the branch feat shortens long.txt to 4 lines,
-# deletes gone.txt and adds new.txt (2 lines). HEAD stays on main.
+# FR: main has long.txt (10 lines), gone.txt (5), lib/old.js (5) and keep.sh; the branch feat shortens long.txt
+# to 4 lines, deletes gone.txt and lib/old.js and adds new.txt (2 lines). HEAD stays on main.
 FR="$TMP/frepo"; git init -q -b main "$FR"; seq 10 > "$FR/long.txt"; seq 5 > "$FR/gone.txt"; echo 'echo keep' > "$FR/keep.sh"
+mkdir -p "$FR/lib"; seq 5 > "$FR/lib/old.js"
 git -C "$FR" add -A; git -C "$FR" commit -q -m base; FB="$(git -C "$FR" rev-parse --short=12 HEAD)"
-git -C "$FR" checkout -q -b feat; seq 4 > "$FR/long.txt"; git -C "$FR" rm -q gone.txt; seq 2 > "$FR/new.txt"
+git -C "$FR" checkout -q -b feat; seq 4 > "$FR/long.txt"; git -C "$FR" rm -q gone.txt lib/old.js; seq 2 > "$FR/new.txt"
 git -C "$FR" add -A; git -C "$FR" commit -q -m feat; FC="$(git -C "$FR" rev-parse HEAD)"; FS="${FC:0:12}"; git -C "$FR" checkout -q main
 rm -f "$TMP/claude-calls" "$TMP/session-calls"
 # fs <text> [args...]: --findings on the text, at feat in FR (both stub claudes on PATH); out, rc, err (stderr)
@@ -964,6 +980,11 @@ assert_contains "A3 (4b): one past the base's last line is marked" "$out" "soft 
 fs 'The old side: long.txt:8, gone.txt:3, gone.txt and `gone.txt`.'
 assert "A3 (4b): a line or a file only on the old side isn't marked" test "$out" = "Flags: 0 hard, 0 soft"
 assert "A3 (4b): the old side: exit 0" test "$rc" = 0
+fs 'In a folder, only at the base: old.js, old.js:3 and lib/old.js:5.'
+assert "A3 (4b): a file in a folder, only at the base, by its base name or path: not marked" test "$out" = "Flags: 0 hard, 0 soft"
+fs 'Past its end at the base: old.js:6.'
+assert_contains "A3 (4b): a file in a folder, only at the base: past its end there is marked" "$out" \
+  "soft missing reference (line 1): old.js:6 — reference not found: old.js:6, but old.js isn't at $FS and has 5 lines at the base $FB"
 fs 'Neither: nothere.txt:1 and nothere.sh.'
 assert_contains "A3 (4b): a file:line at neither" "$out" "soft missing reference (line 1): nothere.txt:1 — reference not found: nothere.txt isn't in the tree at $FS or at the base $FB"
 assert_contains "A3 (4b): a file at neither" "$out" "soft missing reference (line 1): nothere.sh — reference not found: nothere.sh isn't in the tree at $FS or at the base $FB"
@@ -998,6 +1019,8 @@ assert_contains "the same text in the default mode: the run" "$out" "soft run th
 assert_contains "the same text in the default mode: the weasel word" "$out" "soft weasel words (line 3)"
 fs 'Logs in /tmp/x4b.txt and ~/x4b.md, the file `<branch>-<sha>-sniff.md`, $STATE/x4b.txt and ../x4b.sh.'
 assert "A4 (4b): absolute, ~/, placeholder, \$VAR and ../ paths aren't checked" test "$out" = "Flags: 0 hard, 0 soft"
+fs 'Served on localhost:3000 at 10:30, in step:4 of v1.2:3.'
+assert "A4 (4b): a word:<n> that isn't a file isn't checked" test "$out" = "Flags: 0 hard, 0 soft"
 fs 'This adds a new file, nothere4b.sh.'
 assert_contains "A4 (4b): marker words don't leave a line alone" "$out" "(line 1): nothere4b.sh —"
 # A ready review with a sidecar past sniff.conf's thresholds: too good to be true in the default mode, not here.
@@ -1026,6 +1049,13 @@ assert_contains "no --commit: at HEAD, with HEAD as its own base" "$out" \
   "soft missing reference (line 1): new.txt:1 — reference not found: new.txt isn't in the tree at $FB or at the base $FB"
 fs 'See new.txt:1.'
 assert "--commit feat: new.txt:1 is there" test "$out" = "Flags: 0 hard, 0 soft"
+# main moves on after feat branched (long.txt down to 2 lines): the base is still the merge-base, not main's tip.
+seq 2 > "$FR/long.txt"; git -C "$FR" commit -qam "main: shorter"; FM="$(git -C "$FR" rev-parse --short=12 main)"
+fs 'Old side: long.txt:10, past it long.txt:20.'
+assert_not_contains "A3 (4b): main moved: a line at the merge-base isn't marked" "$out" "long.txt:10 —"
+assert_contains "A3 (4b): main moved: the reason names the merge-base" "$out" \
+  "soft missing reference (line 1): long.txt:20 — reference not found: long.txt:20, but long.txt has 4 lines at $FS and 10 at the base $FB"
+assert_not_contains "A3 (4b): main moved: not main's tip" "$out" "$FM"
 # The guards.
 fs 'See long.txt:20.' --brief
 assert "A6 (4b): --findings --brief: exit 4" test "$rc" = 4

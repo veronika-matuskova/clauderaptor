@@ -1578,14 +1578,18 @@ assert "A13 (4b): a sniff file that can't be written: unchanged" test "$(cat "$s
 assert_contains "A13 (4b): a sniff file that can't be written: the judge ran, with it" "$(grep '^judge-sniff ' "$TQ/claude.log")" \
   "Sniff results on this commit (read with cat): $sf. Use them only"
 assert_contains "A13 (4b): a sniff file that can't be written: merged" "$out" "MERGED fix/ro4b"
-# No temp folder for the check: only a log line (4a's sniff says so too), and the judge runs.
+# No temp folder for the check: only a log line for each review (4a's sniff says so too), and the judge runs.
 reset_pr; mkwt notmp4b; h="$(s12 notmp4b)"
-echo "needs changes" > "$TQ/verdict"; echo ready > "$TQ/judge_verdict"; echo 'important: notmp4b.txt:500: broken' > "$TQ/code_sniff"
+echo "needs changes" > "$TQ/verdict"; echo "needs changes" > "$TQ/tests_verdict"; echo ready > "$TQ/judge_verdict"
+echo 'important: notmp4b.txt:500: broken' > "$TQ/code_sniff"
 Q add "$TMP/wt-notmp4b" fix "No tmp" >/dev/null; out="$(PATH="$TQ/failtmp:$PATH" Q run)"
 assert_contains "the check without a temp folder: says so" "$out" \
   "   the reference check of $(revfile notmp4b medium-notests.md) didn't run: can't create a temp folder"
+assert_contains "the check without a temp folder: the next review is still checked, and says so" "$out" \
+  "   the reference check of $(revfile notmp4b tests.md) didn't run: can't create a temp folder"
 assert "the check without a temp folder: the judge ran" test -n "$(judge_line)"
 assert_contains "the check without a temp folder: merged" "$out" "MERGED fix/notmp4b"
+rm -f "$TQ/tests_verdict"
 # Through a stub sniff.sh (it logs its arguments, and does what $TQ/findings_do says): the options arrive; exit 1
 # with only a Flags: line is no mark; any exit code above 1 is a check that didn't run; a TERM to the runner's
 # process group while it runs removes its temp folder.

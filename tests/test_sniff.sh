@@ -1099,6 +1099,19 @@ git -C "$NB" checkout -q --orphan main; git -C "$NB" rm -rfq .; seq 9 > "$NB/one
 out="$(bash "$S" "$TMP/review.md" --findings --repo "$NB" --commit trunk 2>&1)"
 assert_contains "no merge-base with main: at the commit only" "$out" \
   "soft missing reference (line 1): one.txt:4 — reference not found: one.txt:4, but one.txt has 3 lines at $NS (no base: no default branch)"
+# The base through the default branch: MR's only one is master (no main). The branch deletes old.txt and shortens
+# keep.txt (10 lines to 3); then master moves on, so its tip isn't the merge-base.
+MR="$TMP/masterrepo"; git init -q -b master "$MR"; seq 5 > "$MR/old.txt"; seq 10 > "$MR/keep.txt"
+git -C "$MR" add -A; git -C "$MR" commit -q -m base; MB="$(git -C "$MR" rev-parse --short=12 HEAD)"
+git -C "$MR" checkout -q -b feat; git -C "$MR" rm -q old.txt; seq 3 > "$MR/keep.txt"; git -C "$MR" commit -qam feat
+MF="$(git -C "$MR" rev-parse --short=12 HEAD)"; git -C "$MR" checkout -q master
+echo later > "$MR/later.txt"; git -C "$MR" add -A; git -C "$MR" commit -q -m later; MT="$(git -C "$MR" rev-parse --short=12 master)"
+printf '%s\n' 'Only at the base: old.txt, old.txt:4 and keep.txt:8. Past it: keep.txt:12.' > "$TMP/review.md"
+out="$(bash "$S" "$TMP/review.md" --findings --repo "$MR" --commit feat 2>&1)"
+assert "A3 (4b): master as the only default branch: a reference only at its merge-base isn't marked" test "$out" = \
+  "soft missing reference (line 1): keep.txt:12 — reference not found: keep.txt:12, but keep.txt has 3 lines at $MF and 10 at the base $MB
+Flags: 0 hard, 1 soft"
+assert_not_contains "A3 (4b): master as the only default branch: not master's tip" "$out" "$MT"
 assert "A6 (4b): no --findings run called claude" test ! -e "$TMP/claude-calls"
 assert "A6 (4b): no --findings run called the session stub" test ! -e "$TMP/session-calls"
 

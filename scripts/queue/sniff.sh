@@ -2,6 +2,7 @@
 # Sniffs a text (a PR body, an agent's report, a review, a brief) for claims that have no evidence at a commit:
 #   sniff.sh <file or -> [--brief] [--repo <checkout>] [--commit <rev>] [--session] [--author planner|developer|reviewer]
 #   sniff.sh <answer file> --answer <earlier sniff output> [--brief] [--repo <checkout>] [--commit <rev>] [--author ...]
+#   sniff.sh <review file> --findings [--repo <checkout>] [--commit <rev>]
 # It reads the text from the file, or from stdin for -. --repo defaults to the checkout of the current folder,
 # --commit to that checkout's HEAD (any rev that resolves to a commit). Without --session or --answer it is
 # mechanical only: it starts no claude session and reads only the text, the repo's git objects at that commit
@@ -97,6 +98,23 @@
 #   question to the planner ("`export()` is also called from `b.js:12`: in scope or out?"); at most 10 per
 #   brief, then a line "(<n> more left-out reference(s) not listed)".
 #
+# Findings mode (--findings, for a code or test review that needs changes; pr-queue.sh runs it before the judge):
+# a finding is the review's claim, so a reference it gets wrong is the review's mistake, not the agent's. It
+# checks only the file references above (a file, a file:line, a file:line:col as that line, a range by its end),
+# on every line of the review except a "Sniff:" request line (pr-queue.sh sniffs those) and, on a line, the text
+# from its first "Fix:" (any case) on, which may name a file to add. Its marker words ("new", "add", ...) don't
+# leave a line alone here. A reference is found if it holds at the commit or at its base: the merge-base with the
+# default branch (found as for a review's diff, above), so a line or file that is only on the old side of the
+# diff isn't marked. Each one found at neither is a soft "missing reference" flag, "<ref> — reference not found:
+# <why>": "<path> isn't in the tree at <short> or at the base <base short>", or for a file:line "<ref>, but <path>
+# has <n> lines at <short> and <m> at the base <base short>" ("... and isn't at the base <base short>", or "<ref>,
+# but <path> isn't at <short> and has <m> lines at the base <base short>", for a side the file isn't on). Without
+# a default branch or a merge-base it checks only the commit, and each <why> ends with " (no base: no default
+# branch)". It doesn't check test_<word>s, name()s, proof, runs, weasel words or "too good to be true", reads no
+# sidecar, sniff.conf or events, only the text and the repo's git objects at the commit and the base, and never
+# exits 2. With --brief, --session or --answer it exits 4 with "sniff: --findings takes no --brief, --session or
+# --answer".
+#
 # Output: one line per flag, "<hard|soft> <category> (line <n>): <the claim> — <why>", <n> the line in the
 # input, then "Flags: <h> hard, <s> soft". Exit 0 = no flags, 1 = soft flags only, 2 = a hard flag,
 # 4 = the sniff didn't run (bad arguments, a missing file, not a checkout, an unknown commit, no author or a
@@ -106,13 +124,14 @@
 set -uo pipefail
 die() { echo "sniff: $*" >&2; exit 4; }
 if [ "${SNIFF_IN_SESSION:-}" = 1 ]; then die "a sniff doesn't start another sniff"; fi
-usage="usage: sniff.sh <file or -> [--brief] [--repo <checkout>] [--commit <rev>] [--session] [--author planner|developer|reviewer] [--answer <earlier sniff output>]"
+usage="usage: sniff.sh <file or -> [--brief] [--repo <checkout>] [--commit <rev>] [--session] [--author planner|developer|reviewer] [--answer <earlier sniff output>] [--findings]"
 
-input="" repo="" rev="" have_input="" brief=0 session=0 author="" answer=""
+input="" repo="" rev="" have_input="" brief=0 session=0 author="" answer="" findings=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --brief) brief=1; shift ;;
     --session) session=1; shift ;;
+    --findings) findings=1; shift ;;
     --author)
       [ $# -ge 2 ] || die "--author needs planner, developer or reviewer. $usage"
       case "$2" in planner|developer|reviewer) author="$2" ;; *) die "unknown author '$2': --author takes planner, developer or reviewer" ;; esac
@@ -126,6 +145,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$have_input" ] || die "$usage"
+if [ "$findings" = 1 ] && { [ "$brief" = 1 ] || [ "$session" = 1 ] || [ -n "$answer" ]; }; then
+  die "--findings takes no --brief, --session or --answer"
+fi
 if [ "$input" != - ] && { [ ! -f "$input" ] || [ ! -r "$input" ]; }; then die "no such file: $input"; fi
 if [ -n "$answer" ] && { [ ! -f "$answer" ] || [ ! -r "$answer" ]; }; then die "no such file: $answer"; fi
 top="$(git -C "${repo:-.}" rev-parse --show-toplevel 2>/dev/null)" || die "not a git checkout: ${repo:-$PWD}"
@@ -147,6 +169,7 @@ sys.excepthook = crashed
 top, sha, events_file, input_path = sys.argv[1:5]
 brief = sys.argv[5] == "1"
 answer_path, here, conf_path = sys.argv[8], sys.argv[9], sys.argv[10]
+findings = sys.argv[11] == "1"
 session = sys.argv[6] == "1" or bool(answer_path)   # an answer round always runs one session
 author = sys.argv[7]
 short = sha[:12]
@@ -158,7 +181,8 @@ def stop(why):
     sys.exit(6)
 
 # The input's sidecar (<input without .md>.json, as review.sh writes it), if there is one that is a JSON object.
-sidecar_path = "" if input_path == "-" else (input_path[:-3] if input_path.endswith(".md") else input_path) + ".json"
+# --findings reads none.
+sidecar_path = "" if input_path == "-" or findings else (input_path[:-3] if input_path.endswith(".md") else input_path) + ".json"
 sidecar = None
 if sidecar_path and os.path.isfile(sidecar_path):
     try:
@@ -200,32 +224,40 @@ else:
         text = f.read().decode("utf-8", "replace")
 lines = text.splitlines()
 
-files = [p for p in git("ls-tree", "-r", "--name-only", "-z", sha).stdout.decode("utf-8", "replace").split("\0") if p]
-fileset = set(files)
-dirs = set()
-for p in files:
-    parts = p.split("/")
-    for i in range(1, len(parts)):
-        dirs.add("/".join(parts[:i]))
+def tree_at(rev):
+    """The files tracked at rev (a list and a set), and their folders."""
+    fs = [p for p in git("ls-tree", "-r", "--name-only", "-z", rev).stdout.decode("utf-8", "replace").split("\0") if p]
+    ds = set()
+    for p in fs:
+        parts = p.split("/")
+        for i in range(1, len(parts)):
+            ds.add("/".join(parts[:i]))
+    return fs, set(fs), ds
+
+files, fileset, dirs = tree_at(sha)
 top_entries = {p.split("/")[0] for p in files}
 
-def matches(path):
-    """The tracked files (or folders) that a reference names: the exact path, or one ending in /path."""
+def matches(path, tree=None):
+    """The tracked files (or folders) that a reference names: the exact path, or one ending in /path. At the
+    commit, or in another tree_at()."""
+    fs, fset, ds = tree or (files, fileset, dirs)
     path = path.rstrip("/")
-    if path in fileset or path in dirs:
+    if path in fset or path in ds:
         return [path]
     suffix = "/" + path
-    return [p for p in files if p.endswith(suffix)] + [d for d in dirs if d.endswith(suffix)]
+    return [p for p in fs if p.endswith(suffix)] + [d for d in ds if d.endswith(suffix)]
 
 line_counts = {}
-def count_lines(path):
-    if path not in line_counts:
-        data = git("cat-file", "blob", f"{sha}:{path}").stdout
+def count_lines(path, rev=None):
+    """The number of lines of a tracked file at the commit, or at rev."""
+    key = (rev or sha, path)
+    if key not in line_counts:
+        data = git("cat-file", "blob", f"{key[0]}:{path}").stdout
         n = data.count(b"\n")
         if data and not data.endswith(b"\n"):
             n += 1
-        line_counts[path] = n
-    return line_counts[path]
+        line_counts[key] = n
+    return line_counts[key]
 
 grep_cache = {}
 def found(word, fixed=False):
@@ -314,16 +346,22 @@ def words(line):
                 out.append((w, code))
     return out, spans
 
+def longest_at(path, tree=None, rev=None):
+    """The lines of the longest tracked file that a reference names, at the commit (or in tree_at(rev)); None
+    if it names none."""
+    tree = tree or (files, fileset, dirs)
+    cands = [p for p in matches(path, tree) if p in tree[1]]
+    return max(count_lines(p, rev) for p in cands) if cands else None
+
 def fileline_problem(w):
     """Why a file:line (a.js:120, a.js:10-20) is wrong at the commit, or "" if it is fine."""
     m = FILELINE_RE.match(w)
     path, last = m.group(1), int(m.group(3) or m.group(2))
-    cands = [p for p in matches(path) if p in fileset]
-    if not cands:
+    n = longest_at(path)
+    if n is None:
         return f"{path} isn't in the tree at {short}"
-    longest = max(cands, key=count_lines)
-    if last > count_lines(longest):
-        return f"{w}, but {path} has {count_lines(longest)} lines at {short}"
+    if last > n:
+        return f"{w}, but {path} has {n} lines at {short}"
     return ""
 
 def proofs_after(tail):
@@ -383,19 +421,20 @@ def claim_of(line):
     s = line.strip()
     return s if len(s) <= 120 else s[:117] + "..."
 
-# Run records at the commit, from the queue's events file (one JSON object per line).
+# Run records at the commit, from the queue's events file (one JSON object per line). --findings reads none.
 records = []
-try:
-    with open(events_file, encoding="utf-8", errors="replace") as f:
-        for raw in f:
-            try:
-                ev = json.loads(raw)
-            except ValueError:
-                continue
-            if isinstance(ev, dict) and ev.get("sha") == sha:
-                records.append(ev)
-except OSError:
-    pass
+if not findings:
+    try:
+        with open(events_file, encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                try:
+                    ev = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(ev, dict) and ev.get("sha") == sha:
+                    records.append(ev)
+    except OSError:
+        pass
 
 def e2e_state():
     for ev in records:
@@ -710,9 +749,65 @@ def brief_sniff():
         flag("hard", "left out", n, disp, why)
     return max(0, len(left) - LEFT_OUT_CAP)
 
-more = brief_sniff() if brief else 0
+def default_branch():
+    """The branch a change is measured against: origin/HEAD's, else origin/main, main, origin/master or master;
+    "" without one."""
+    head = git("symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD").stdout.decode().strip()
+    for c in (head, "origin/main", "main", "origin/master", "master"):
+        if c and git("rev-parse", "-q", "--verify", f"{c}^{{commit}}").returncode == 0:
+            return c
+    return ""
 
-for n, line in enumerate(lines if not brief else [], 1):
+# --- findings mode (--findings): a review's file references, at the commit or its base ---
+SNIFF_REQUEST_RE = re.compile(r"^\s*(?:[-*+]\s+|[0-9]+[.)]\s+)?[*_]*Sniff[*_]*:")   # as pr-queue.sh reads them
+FIX_RE = re.compile(r"\bfix[*_`]*:", re.I)
+
+def findings_sniff():
+    """A soft missing reference for each file or file:line of the review that holds neither at the commit nor
+    at its base (the merge-base with the default branch)."""
+    against = default_branch()
+    mb = git("merge-base", against, sha) if against else None
+    base = mb.stdout.decode().strip() if mb and mb.returncode == 0 else ""
+    btree, bshort, nobase = (tree_at(base) if base else None), base[:12], " (no base: no default branch)"
+    for n, line in enumerate(lines, 1):
+        if SNIFF_REQUEST_RE.match(line):
+            continue
+        fix = FIX_RE.search(line)   # a fix may name a file to add
+        ws, _ = words(line[:fix.start()] if fix else line)
+        for w, _ in ws:
+            if skipped(w):
+                continue
+            m = FILELINE_RE.match(w)
+            if m and file_like(m.group(1)):
+                why = fileline_problem(w)
+                if not why:
+                    continue
+                if not base:
+                    why += nobase
+                else:
+                    path, last = m.group(1), int(m.group(3) or m.group(2))
+                    there, here = longest_at(path, btree, base), longest_at(path)
+                    if there is not None and last <= there:
+                        continue
+                    if here is None and there is None:
+                        why = f"{path} isn't in the tree at {short} or at the base {bshort}"
+                    elif there is None:
+                        why = f"{w}, but {path} has {here} lines at {short} and isn't at the base {bshort}"
+                    elif here is None:
+                        why = f"{w}, but {path} isn't at {short} and has {there} lines at the base {bshort}"
+                    else:
+                        why = f"{w}, but {path} has {here} lines at {short} and {there} at the base {bshort}"
+            elif file_like(w) and not matches(w) and not (base and matches(w, btree)):
+                why = f"{w} isn't in the tree at {short}" + (f" or at the base {bshort}" if base else nobase)
+            else:
+                continue
+            flag("soft", "missing reference", n, w, f"reference not found: {why}")
+
+more = brief_sniff() if brief else 0
+if findings:
+    findings_sniff()
+
+for n, line in enumerate(lines if not (brief or findings) else [], 1):
     # The marker words count in the prose only: not in code spans or paths (scripts/new.sh isn't "new").
     prose = re.sub(r"\S*[./]\w\S*", " ", re.sub(r"`[^`]*`", " ", line))
     leave = bool(NEW_RE.search(prose) or ELSEWHERE_RE.search(prose))
@@ -781,7 +876,7 @@ for n, line in enumerate(lines if not brief else [], 1):
         flag("soft", "weasel words", n, claim_of(line), f'"{wm.group(1)}" in a claim that something is done')
 
 # "Not proven: none" while a criterion names no proof
-if not_proven_none and not brief:
+if not_proven_none and not (brief or findings):
     for crit, start, block in crit_blocks:
         if not has_evidence(block):
             flag("hard", "missing proof", start + 1, claim_of(block[0]),
@@ -841,12 +936,7 @@ def review_check():
     if full.returncode != 0:
         stop(f"the review's commit isn't in {top}: {rsha} (from {sidecar_path})")
     rsha = full.stdout.decode().strip()
-    against = ""
-    head = git("symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD").stdout.decode().strip()
-    for c in (head, "origin/main", "main", "origin/master", "master"):
-        if c and git("rev-parse", "-q", "--verify", f"{c}^{{commit}}").returncode == 0:
-            against = c
-            break
+    against = default_branch()
     if not against:
         stop(f"no default branch (origin/HEAD, main or master) in {top} to measure the review's diff against")
     mb = git("merge-base", against, rsha)
@@ -993,7 +1083,7 @@ sys.exit(2 if hard else 1 if soft else 0)
 PY
 )"
 python3 -I -c "$code" "$top" "$sha" "$events" "$input" "$brief" "$session" "$author" "$answer" "$HERE" \
-  "${SNIFF_CONFIG:-$HERE/sniff.conf}"
+  "${SNIFF_CONFIG:-$HERE/sniff.conf}" "$findings"
 rc=$?
 # 6: the sniff didn't run, and it said why on stderr
 case "$rc" in 0|1|2) exit "$rc" ;; 6) exit 4 ;; *) die "the sniff failed (python exit $rc)" ;; esac

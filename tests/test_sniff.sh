@@ -977,6 +977,11 @@ assert_contains "A2 (4b): columns: one mark" "$out" "Flags: 0 hard, 1 soft"
 fs 'At the base: long.txt:10, one past it long.txt:11.'
 assert_not_contains "A3 (4b): the base's last line isn't marked" "$out" "long.txt:10 —"
 assert_contains "A3 (4b): one past the base's last line is marked" "$out" "soft missing reference (line 1): long.txt:11 — reference not found: long.txt:11, but long.txt has 4 lines at $FS and 10 at the base $FB"
+fs 'Ranges at the base: long.txt:8-10 and long.txt:8-11.'
+assert_not_contains "A3 (4b): a range ending on the base's last line isn't marked" "$out" "long.txt:8-10 —"
+assert_contains "A3 (4b): a range ending one past the base's last line is marked, by its end" "$out" \
+  "soft missing reference (line 1): long.txt:8-11 — reference not found: long.txt:8-11, but long.txt has 4 lines at $FS and 10 at the base $FB"
+assert_contains "A3 (4b): ranges at the base: one mark" "$out" "Flags: 0 hard, 1 soft"
 fs 'The old side: long.txt:8, gone.txt:3, gone.txt and `gone.txt`.'
 assert "A3 (4b): a line or a file only on the old side isn't marked" test "$out" = "Flags: 0 hard, 0 soft"
 assert "A3 (4b): the old side: exit 0" test "$rc" = 0
@@ -998,6 +1003,10 @@ assert_contains "A4 (4b): the text before a fix: (any case) is checked" "$out" "
 assert_not_contains "A4 (4b): the text after a fix: (any case) isn't" "$out" "missing4b.txt"
 fs '- **Fix:** add missing4b.txt'
 assert "A4 (4b): a bold **Fix:** label" test "$out" = "Flags: 0 hard, 0 soft"
+fs '- **Fix**: add missing4b.txt'
+assert "A4 (4b): a bold **Fix**: label, the colon outside" test "$out" = "Flags: 0 hard, 0 soft"
+fs '- `Fix`: add missing4b.txt'
+assert "A4 (4b): a Fix label in a code span" test "$out" = "Flags: 0 hard, 0 soft"
 fs 'The prefix: missing4b.txt'
 assert_contains "A4 (4b): fix: inside a word is no Fix:" "$out" "(line 1): missing4b.txt —"
 fs $'Sniff: x.txt:99 | x.txt:99 | y\n- **Sniff:** y.txt:9 | y.txt:9 | z\n1. Sniff: z.txt:9 | z.txt:9 | z'
